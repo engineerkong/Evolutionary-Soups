@@ -2,5 +2,6 @@ logs/
 *.log
 models/
 wandb/
+results/
 __pycache__/
 *.pyc

@@ -25,18 +25,18 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 
 @dataclass
 class ScriptArguments:
-    save_directory: Optional[str] = field(default='./logs_trl')
-    base_model_name: Optional[str] = field(default='./huggingface_models/Llama-2-7b-hf')
-    wandb_name: Optional[str] = field(default='evalnew_assistant_pretrained_harmless_helpful', metadata={"help": "Name for this experiment"})
+    save_directory: Optional[str] = field(default='./results/sft/')
+    sft_model_name: Optional[str] = field(default='./models/sft/')
+    wandb_name: Optional[str] = field(default='assistant_sft_eval', metadata={"help": "Name for this experiment"})
     reward_names:Optional[str] = field(default='harmless,helpful') 
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 exp_type = script_args.exp_type
-base_model_name = script_args.base_model_name
-tokenizer_name = script_args.base_model_name
-print('base model: ', base_model_name)
+sft_model_name = script_args.sft_model_name
+tokenizer_name = script_args.sft_model_name
+print('base model: ', sft_model_name)
 
 process_id = Accelerator().local_process_index 
 gpu_id = process_id 
@@ -67,14 +67,14 @@ os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), ex
 set_seed(8888)
 tokenizer = load_main_tokenizer(tokenizer_name)
 model = AutoModelForCausalLM.from_pretrained(
-    base_model_name, 
+    sft_model_name, 
     torch_dtype=torch.bfloat16,  # faster inference than 8bit
     device_map=gpu_id, 
 )
 ############# very important for padding
 model.resize_token_embeddings(len(tokenizer))
-if check_lora_in_model_path(model, base_model_name):
-    model = PeftModel.from_pretrained(model, base_model_name)
+if check_lora_in_model_path(model, sft_model_name):
+    model = PeftModel.from_pretrained(model, sft_model_name)
 if hasattr(model, 'merge_and_unload'):
     model = model.merge_and_unload()
 
@@ -132,7 +132,7 @@ queries_responses = [
 ]
 
 if hasattr(instructions, 'get_post'):
-    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False)
+    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False) # no normalization during eval
 else:
     rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=False)
 

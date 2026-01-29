@@ -23,19 +23,21 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 @dataclass
 class ScriptArguments:
     log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: Optional[str] = field(default='./logs_ppo_assistant')
+    save_directory: Optional[str] = field(default='./results/ppo/')
     batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
-    wandb_name: Optional[str] = field(default='eval_morlhf_kl0.2_multirew0.2_gen128_harmless_helpful', metadata={"help": "Name for this experiment"})
+    wandb_name: Optional[str] = field(default='assistant_ppo_eval', metadata={"help": "Name for this experiment"})
     reward_names:Optional[str] = field(default='harmless,helpful') 
-    base_model_name: Optional[str] = field(default='./logs_ppo_prefnew/ppo_llamma2_klreg0.2_harmless_helpful_preference0.5_0.5/batch_207')
+    ppo_model_name: Optional[str] = field(default='./models/ppo/')
+    sft_model_name: Optional[str] = field(default='./models/sft/model/')
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 exp_type = script_args.exp_type
-base_model_name = script_args.base_model_name
-tokenier_name = script_args.base_model_name
-print('base model: ', base_model_name)
+ppo_model_name = script_args.ppo_model_name
+sft_model_name = script_args.sft_model_name
+print('ppo model: ', ppo_model_name)
+print('sft model: ', sft_model_name)
 
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 num_rewards = len(reward_names)
@@ -72,14 +74,14 @@ current_device = Accelerator().local_process_index
 print(current_device)
 
 
-tokenizer = load_main_tokenizer(tokenier_name)
+tokenizer = load_main_tokenizer(ppo_model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    './models/sft/model/', 
+    sft_model_name, 
     torch_dtype=torch.bfloat16,  # fast inference
     device_map=gpu_id, 
 )
 model.resize_token_embeddings(len(tokenizer))
-model = merge_lora_weight(model, base_model_name)
+model = merge_lora_weight(model, ppo_model_name)
 
 generation_kwargs = {
     "max_new_tokens": 128 if exp_type == 'assistant' else 48, 
@@ -151,7 +153,7 @@ queries_responses = [
 
 
 if hasattr(instructions, 'get_post'):
-    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=None)
+    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=None) # no normalization during eval
 else:
     rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=None)
 

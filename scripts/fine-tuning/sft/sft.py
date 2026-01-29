@@ -5,7 +5,7 @@ from accelerate import Accelerator
 import torch
 from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, TrainingArguments
+from transformers import AutoModelForCausalLM, HfArgumentParser, TrainingArguments
 from trl import SFTTrainer, set_seed, DataCollatorForCompletionOnlyLM
 from peft import LoraConfig
 import numpy as np
@@ -22,13 +22,13 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 @dataclass
 class ScriptArguments:
     log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: Optional[str] = field(default='./logs_trl/')
+    save_directory: Optional[str] = field(default='./models/sft/')
     learning_rate: Optional[float] = field(default=1.4e-4, metadata={"help": "the learning rate"})
     batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
     gradient_accumulation_steps: Optional[int] = field(default=1, metadata={"help": "the number of gradient accumulation steps"})
-    load_in_8bit: Optional[bool] = field(default=True, metadata={"help": "loading model in 8 bit or bfloat16"})
-    wandb_name: Optional[str] = field(default='summary_sft_all_bs1_lora64', metadata={"help": "Name for this experiment"})
-    exp_type: Optional[str] = field(default='summary', metadata={"help": "exp type, 'summary' or 'assistant' "})
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
+    wandb_name: Optional[str] = field(default='assistant_sft', metadata={"help": "Name for this experiment"})
+    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
 
 parser = HfArgumentParser(ScriptArguments)
@@ -71,9 +71,9 @@ current_device = Accelerator().local_process_index
 print(current_device)
 
 lora_config = LoraConfig(
-    r=32, 
-    lora_alpha=64, 
-    target_modules=["gate_proj", "up_proj", "down_proj"],
+    r=64, 
+    lora_alpha=128, 
+    target_modules=["gate_proj", "up_proj", "down_proj"], # FFN layers in Llama2
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",

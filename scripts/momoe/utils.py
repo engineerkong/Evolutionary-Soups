@@ -128,7 +128,6 @@ def build_dataset_eval(path, tokenizer, rm_tokenizers_list, split='test', size=N
     if size is not None:
         ds = ds.select(range(size))
     ds = ds.select(range(0, len(ds), 4))  
-
     rm_tokenizer1, rm_tokenizer2 = rm_tokenizers_list[:2]
     def tokenize(sample):
         sample['text'] = sample['chosen'] 
@@ -222,15 +221,15 @@ def load_main_tokenizer(tokenizer_name):
 
 def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_position=0):
     rewards = []
-    print('log: reward model forwarding ...')
+    # print('log: reward model forwarding ...')
     with torch.no_grad():
-        pbar = tqdm(total=len(texts_for_rewards))
+        # pbar = tqdm(total=len(texts_for_rewards))
         for inputs in texts_for_rewards:
             if sub_position != 0: # for multiple output
                 rewards.append(reward_model(**(inputs.to(reward_model.device))).logits[0][sub_position])
             else:
                 rewards.append(reward_model(**(inputs.to(reward_model.device))).logits[0])
-            pbar.update(1)
+            # pbar.update(1)
     
     if reward_mean_std is None:
         rewards = [np.round(r.cpu().detach().item(), 1) for r in rewards]

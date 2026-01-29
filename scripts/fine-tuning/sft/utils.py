@@ -63,6 +63,7 @@ def load_reward_model(reward_peft_path, gpu_id):
         reward_model = reward_model.merge_and_unload() # merge lora weights
     return reward_model.to(gpu_id)
 
+# load main tokenizer without adding new special tokens
 def load_main_tokenizer(tokenizer_name):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token is None:
