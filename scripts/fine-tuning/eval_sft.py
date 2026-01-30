@@ -1,18 +1,16 @@
 import os
-import copy
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, HfArgumentParser, DataCollatorWithPadding
-from peft import PeftModel
 from trl import set_seed
+from peft import PeftModel
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
+
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import load_main_tokenizer, check_lora_in_model_path, Instructions, Instructions_summary, \
                     build_dataset_eval_sft, build_dataset_summary_eval_sft, get_clean_data_sft
@@ -22,28 +20,31 @@ tqdm.pandas()
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
 
-
+# define script arguments
 @dataclass
 class ScriptArguments:
-    save_directory: Optional[str] = field(default='./results/sft/')
     sft_model_name: Optional[str] = field(default='./models/sft/')
-    wandb_name: Optional[str] = field(default='assistant_sft_eval', metadata={"help": "Name for this experiment"})
-    reward_names:Optional[str] = field(default='harmless,helpful') 
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
+    reward_names:Optional[str] = field(default='harmless,helpful') 
+    save_directory: Optional[str] = field(default='./results/sft/')
+    wandb_name: Optional[str] = field(default='assistant_sft_eval', metadata={"help": "Name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-exp_type = script_args.exp_type
-sft_model_name = script_args.sft_model_name
-tokenizer_name = script_args.sft_model_name
-print('base model: ', sft_model_name)
 
+print('sft model: ', script_args.sft_model_name)
+output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
+print('output dir: ', output_dir)
+os.makedirs(output_dir, exist_ok=True)
+
+set_seed(8888)
 process_id = Accelerator().local_process_index 
 gpu_id = process_id 
 print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
+# load reward models
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
-print(reward_names)
+print('reward names:', reward_names)
 reward_path_tokenizer_dict = {
     'harmless': ['Ray2333/gpt2-large-harmless-reward_model'],
     'helpful': ['Ray2333/gpt2-large-helpful-reward_model'],
@@ -59,39 +60,33 @@ for name in reward_names:
         raise NotImplementedError
     reward_model_path_list.append(reward_path_tokenizer_dict[name][0])
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
+reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id)
 
-reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id) #, reward_stats_path) 
-os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), exist_ok=True)
-
-
-set_seed(8888)
-tokenizer = load_main_tokenizer(tokenizer_name)
+# load sft model and tokenizer
+tokenizer = load_main_tokenizer(script_args.sft_model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    sft_model_name, 
-    torch_dtype=torch.bfloat16,  # faster inference than 8bit
+    script_args.sft_model_name, 
+    torch_dtype=torch.bfloat16,
     device_map=gpu_id, 
 )
-############# very important for padding
 model.resize_token_embeddings(len(tokenizer))
-if check_lora_in_model_path(model, sft_model_name):
-    model = PeftModel.from_pretrained(model, sft_model_name)
+if check_lora_in_model_path(model, script_args.sft_model_name):
+    model = PeftModel.from_pretrained(model, script_args.sft_model_name)
 if hasattr(model, 'merge_and_unload'):
     model = model.merge_and_unload()
 
+# define generation kwargs
 generation_kwargs = {
-    "max_new_tokens": 128 if exp_type == 'assistant' else 48, 
+    "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48, 
     "min_length": -1,
     "top_k": 0.0,
     "top_p": 0.9, 
     "do_sample": True,
 }
-
-
-### for evaluation
-print('evaluation........')
 tokenizer.padding_side = "left"
 
-if exp_type == 'assistant':
+# prepare evaluation dataset and dataloader
+if script_args.exp_type == 'assistant':
     valid_dataset = build_dataset_eval_sft(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test') 
     instructions = Instructions()
 else:
@@ -111,6 +106,8 @@ valid_data_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, drop_
 accelerator = Accelerator()
 model, valid_data_loader = accelerator.prepare(model, valid_data_loader)
 
+# start evaluation
+print('evaluation........')
 full_response_tensors = []
 full_prompts = []
 
@@ -125,7 +122,7 @@ with torch.no_grad():
 full_prompts = tokenizer.batch_decode(full_prompts)
 full_responses = tokenizer.batch_decode(full_response_tensors)
 full_responses = get_clean_data_sft(full_responses, full_prompts)
-# Compute score
+
 queries_responses = [
     (instructions.get_input(text),  instructions.get_response(text))
     for text in full_responses
@@ -136,16 +133,14 @@ if hasattr(instructions, 'get_post'):
 else:
     rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=False)
 
-### merge data
-### error here may because of old version of transformers/accelerate/peft
 all_rewards = []
 for i in range(reward_models.num_rewards):
     all_rewards.append(accelerator.gather_for_metrics(rewards_list[i]))
 all_full_prompts = accelerator.gather_for_metrics(full_prompts)
 all_full_responses = accelerator.gather_for_metrics(full_responses)
 
-
 if process_id == 0:
+    print('Saving evaluation results')
     evaluation_result = {
         'prompt': all_full_prompts,
         'response': all_full_responses,

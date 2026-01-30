@@ -3,72 +3,62 @@ from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, HfArgumentParser, TrainingArguments
-from trl import SFTTrainer, set_seed, DataCollatorForCompletionOnlyLM
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM, set_seed
 from peft import LoraConfig
-import numpy as np
-import pandas as pd
-from scripts.utils.utils import load_main_tokenizer, Instructions_summary, build_dataset_summary_sft, Instructions, build_dataset_sft
-tqdm.pandas()
 
+from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_sft, build_dataset_summary_sft, load_main_tokenizer
+tqdm.pandas()
 
 # define paths for two datasets
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
 
-
+# define script arguments
 @dataclass
 class ScriptArguments:
-    log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: Optional[str] = field(default='./models/sft/')
-    learning_rate: Optional[float] = field(default=1.4e-4, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
-    gradient_accumulation_steps: Optional[int] = field(default=1, metadata={"help": "the number of gradient accumulation steps"})
-    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
-    wandb_name: Optional[str] = field(default='assistant_sft', metadata={"help": "Name for this experiment"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
+    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant'"})
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
+    log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
+    save_directory: Optional[str] = field(default='./models/sft/', metadata={"help": "Directory to save the model"})
+    wandb_name: Optional[str] = field(default='assistant_sft', metadata={"help": "Name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-exp_type = script_args.exp_type
-base_model_name = script_args.base_model_name
-tokenier_name = base_model_name # we use the same tokenizer for the base model
-print('base model: ', base_model_name)
-os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), exist_ok=True)
 
+print('base model: ', script_args.base_model_name)
+output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
+print('output dir: ', output_dir)
+os.makedirs(output_dir, exist_ok=True)
+
+set_seed(8888)
+process_id = Accelerator().local_process_index 
+gpu_id = process_id 
+print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
+
+# define training and lora arguments
 training_args = TrainingArguments(
         max_steps=20000,  
-        output_dir=os.path.join(script_args.save_directory, script_args.wandb_name),
+        output_dir=output_dir,
         dataloader_drop_last=True,
         eval_steps=30000,
         save_steps=10000,
         logging_steps=10,
         save_strategy='steps',
-        per_device_train_batch_size=script_args.batch_size,
-        per_device_eval_batch_size=script_args.batch_size,
-        learning_rate=script_args.learning_rate,
+        per_device_train_batch_size=64,
+        per_device_eval_batch_size=64,
+        learning_rate=1.4e-4,
         lr_scheduler_type="linear",
         warmup_steps=0,
-        gradient_accumulation_steps=script_args.gradient_accumulation_steps,
+        gradient_accumulation_steps=1,
         gradient_checkpointing=False,
         weight_decay=0.01,
         run_name=script_args.wandb_name,
-        report_to='none',
+        report_to=script_args.log_with,
         ddp_find_unused_parameters=False,
     )
-
-process_id = Accelerator().local_process_index 
-gpu_id = process_id 
-print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
-
-
-# set seed before initializing value head for deterministic eval
-set_seed(8888)
-current_device = Accelerator().local_process_index
-print(current_device)
 
 lora_config = LoraConfig(
     r=64, 
@@ -79,22 +69,24 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
-tokenizer = load_main_tokenizer(tokenier_name)
+# load model and tokenizer
+tokenizer = load_main_tokenizer(script_args.base_model_name)
 if script_args.load_in_8bit:
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, 
+        script_args.base_model_name, 
         load_in_8bit=True, 
         device_map=gpu_id, 
     )
 else:
     model = AutoModelForCausalLM.from_pretrained(
-        base_model_name, 
+        script_args.base_model_name, 
         torch_dtype=torch.bfloat16,
         device_map=gpu_id, 
     )
 model.resize_token_embeddings(len(tokenizer))
 
-if exp_type == 'assistant':
+# prepare dataset and data collator
+if script_args.exp_type == 'assistant':
     dataset = build_dataset_sft(hhrlhf_dataset_path, tokenizer, split='train') 
     response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]  
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
@@ -105,6 +97,7 @@ else:
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}")
 
+# define trainer and verify trainable parameters
 trainer = SFTTrainer(
     model=model,
     args=training_args,
@@ -125,6 +118,7 @@ if process_id == 0:
     print(f"Total params: {total:,}")
     print(f"Trainable %: {100 * trainable / total:.6f}%")
     
+# start training
 print("Training........")
 trainer.train()
 

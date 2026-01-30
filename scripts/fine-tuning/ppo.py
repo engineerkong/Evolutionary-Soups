@@ -5,15 +5,16 @@ from accelerate import Accelerator
 import torch
 from tqdm import tqdm
 from transformers import HfArgumentParser
-from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
+from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead, set_seed
+from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
 import numpy as np
 import pandas as pd
-from scripts.utils.utils import print_trainable_parameters, load_main_tokenizer, Instructions, Instructions_summary, \
-                  build_dataset_ppo, build_dataset_summary_ppo                  
+import matplotlib.pyplot as plt
+
+from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_ppo, build_dataset_summary_ppo, load_main_tokenizer, print_trainable_parameters                
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-import matplotlib.pyplot as plt
+
 
 # define paths for two datasets
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'

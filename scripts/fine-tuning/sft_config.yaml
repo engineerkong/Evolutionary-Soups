@@ -1,0 +1,20 @@
+# sft_config.yaml
+
+# Dataset paths
+hhrlhf_dataset_path: 'Anthropic/hh-rlhf'
+summary_dataset_path: 'openai/summarize_from_feedback'
+
+# Model
+base_model_name: 'meta-llama/Llama-2-7b-hf'
+load_in_8bit: false
+
+# Training parameters
+learning_rate: 1.4e-4
+batch_size: 64
+gradient_accumulation_steps: 1
+
+# Evaluation
+reward_names: 'harmless,helpful'
+
+# Logging
+log_with: 'wandb'
