@@ -18,11 +18,11 @@ from moe_architecture import (
     AttentionGatingNetwork,
     MoEGatingTrainer
 )
-from utils import (
+from scripts.utils.utils import (
     print_trainable_parameters, 
     load_main_tokenizer, 
-    build_dataset, 
-    build_dataset_summary,
+    build_dataset_ppo, 
+    build_dataset_summary_ppo,
     Instructions,
     Instructions_summary
 )
@@ -311,7 +311,7 @@ def main():
     print("=" * 70)
     
     if args.exp_type == 'assistant':
-        dataset = build_dataset(
+        dataset = build_dataset_ppo(
             hhrlhf_dataset_path,
             tokenizer,
             rm_tokenizer,
@@ -319,7 +319,7 @@ def main():
         )
         instructions = Instructions()
     else:
-        dataset = build_dataset_summary(
+        dataset = build_dataset_summary_ppo(
             summary_dataset_path,
             tokenizer,
             rm_tokenizer,

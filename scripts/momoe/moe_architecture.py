@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 import numpy as np
 from pymoo.indicators.hv import HV
-from utils import load_reward_model, get_rewards
+from scripts.utils.utils import load_reward_model, get_rewards
 
 
 # ==================== LoRA Expert Embedding 提取 ====================

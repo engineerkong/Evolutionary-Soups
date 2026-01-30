@@ -13,9 +13,9 @@ from torch.utils.data import DataLoader
 from trl import set_seed
 import numpy as np
 import pandas as pd
-from utils import get_clean_data, load_main_tokenizer, save_configs, print_trainable_parameters, \
-                  merge_weights_with_preference, Instructions, Instructions_summary, build_dataset_eval, build_dataset_summary_eval
-from multi_reward_models import RewardModels
+from scripts.utils.utils import get_clean_data_ppo, load_main_tokenizer, save_configs, print_trainable_parameters, \
+                  merge_weights_with_preference, Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo
+from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
 
 
@@ -87,10 +87,10 @@ print(current_device)
 
 tokenizer = load_main_tokenizer(tokenier_name)
 if exp_type == 'assistant':
-    valid_dataset = build_dataset_eval(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test') 
+    valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test') 
     instructions = Instructions()
 else:
-    valid_dataset = build_dataset_summary_eval(summary_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test')
+    valid_dataset = build_dataset_summary_eval_ppo(summary_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
 print(f"Size of the validation set: {len(valid_dataset)}")
 
@@ -144,7 +144,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
     full_responses = tokenizer.batch_decode(full_responses)
     full_prompts = tokenizer.batch_decode(full_prompts)
     # clean data
-    full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
+    full_prompts, full_responses = get_clean_data_ppo(full_responses, full_prompts)
 
     queries_responses = [
         (instructions.get_input(text), instructions.get_response(text))

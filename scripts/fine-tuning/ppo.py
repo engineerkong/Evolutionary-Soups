@@ -8,9 +8,9 @@ from transformers import HfArgumentParser
 from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_seed
 import numpy as np
 import pandas as pd
-from utils import print_trainable_parameters, load_main_tokenizer, Instructions, Instructions_summary, \
-                  build_dataset, build_dataset_summary                  
-from multi_reward_models import RewardModels
+from scripts.utils.utils import print_trainable_parameters, load_main_tokenizer, Instructions, Instructions_summary, \
+                  build_dataset_ppo, build_dataset_summary_ppo                  
+from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 import matplotlib.pyplot as plt
@@ -121,10 +121,10 @@ lora_config = LoraConfig(
 
 tokenizer = load_main_tokenizer(sft_model_name)
 if exp_type == 'assistant':
-    dataset = build_dataset(hhrlhf_dataset_path, tokenizer, rm_tokenizer, split='train')
+    dataset = build_dataset_ppo(hhrlhf_dataset_path, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions()
 else:
-    dataset = build_dataset_summary(summary_dataset_path, tokenizer, rm_tokenizer, split='train')
+    dataset = build_dataset_summary_ppo(summary_dataset_path, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions_summary()
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}.")

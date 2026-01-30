@@ -2,6 +2,7 @@ logs/
 *.log
 models/
 wandb/
+tmp/
 results/
 __pycache__/
 *.pyc

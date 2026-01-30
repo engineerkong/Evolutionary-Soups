@@ -10,7 +10,7 @@ from trl import SFTTrainer, set_seed, DataCollatorForCompletionOnlyLM
 from peft import LoraConfig
 import numpy as np
 import pandas as pd
-from utils import load_main_tokenizer, Instructions_summary, build_dataset_summary, Instructions, build_dataset
+from scripts.utils.utils import load_main_tokenizer, Instructions_summary, build_dataset_summary_sft, Instructions, build_dataset_sft
 tqdm.pandas()
 
 
@@ -95,11 +95,11 @@ else:
 model.resize_token_embeddings(len(tokenizer))
 
 if exp_type == 'assistant':
-    dataset = build_dataset(hhrlhf_dataset_path, tokenizer, split='train') 
+    dataset = build_dataset_sft(hhrlhf_dataset_path, tokenizer, split='train') 
     response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]  
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 else:
-    dataset = build_dataset_summary(summary_dataset_path, tokenizer, split='train')
+    dataset = build_dataset_summary_sft(summary_dataset_path, tokenizer, split='train')
     response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]  
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 train_dataset = dataset.shuffle()

@@ -1,7 +1,5 @@
 from transformers import AutoTokenizer
-import torch
 import numpy as np
-import pandas as pd
 from utils import load_reward_model, get_rewards
 
 class RewardModels():
@@ -21,7 +19,7 @@ class RewardModels():
             self.reward_models.append(load_reward_model(self.reward_model_path_list[i], gpu_id_list[i]))
             self.rm_tokenizers.append(AutoTokenizer.from_pretrained(self.rm_tokenizer_path_list[i]))
     
-        
+    # add normalize_rewards flag to control reward normalization
     def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True):
         texts_for_rewards = []
         for i in range(self.num_rewards):

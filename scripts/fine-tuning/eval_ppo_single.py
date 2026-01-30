@@ -10,9 +10,8 @@ from trl import set_seed
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
-from utils import load_main_tokenizer
-from multi_reward_models import RewardModels
-from utils import Instructions, Instructions_summary, build_dataset_eval, build_dataset_summary_eval, check_lora_in_model_path, merge_lora_weight
+from scripts.utils.multi_reward_models import RewardModels
+from scripts.utils.utils import load_main_tokenizer, Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo, check_lora_in_model_path, merge_lora_weight
 from peft import get_peft_model
 tqdm.pandas()
 
@@ -113,10 +112,10 @@ def get_clean_data(full_responses, full_prompts):
 print('evaluation........')
 tokenizer.padding_side = "left"
 if exp_type == 'assistant':
-    valid_dataset = build_dataset_eval(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers,  split='test')
+    valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers,  split='test')
     instructions = Instructions()
 else:
-    valid_dataset = build_dataset_summary_eval(summary_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test')
+    valid_dataset = build_dataset_summary_eval_ppo(summary_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
 print(f"Size of the validation set: {len(valid_dataset)}")
 
@@ -144,7 +143,7 @@ with torch.no_grad():
 
 full_prompts = tokenizer.batch_decode(full_prompts)
 full_responses = tokenizer.batch_decode(full_response_tensors)
-full_responses = get_clean_data(full_responses, full_prompts)
+full_responses = get_clean_data(full_responses, full_prompts) # get_clean_data_ppo
 # Compute score
 queries_responses = [
     (instructions.get_input(text),  instructions.get_response(text))

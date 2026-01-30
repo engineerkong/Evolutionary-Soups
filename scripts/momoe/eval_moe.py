@@ -10,12 +10,12 @@ from trl import set_seed
 from accelerate import Accelerator
 from moe_architecture import RewardModels, MoEGatingTrainer
 from train_moe import convert_to_moe_model, load_moe_gating_weights
-from utils import (
+from scripts.utils.utils import (
     load_main_tokenizer, 
     Instructions, 
     Instructions_summary,
-    build_dataset_eval,
-    build_dataset_summary_eval
+    build_dataset_eval_ppo,
+    build_dataset_summary_eval_ppo
 )
 
 # Dataset paths
@@ -192,12 +192,12 @@ def main():
     # =========================================================================
     print("Loading dataset...")
     if args.exp_type == 'assistant':
-        valid_dataset = build_dataset_eval(
+        valid_dataset = build_dataset_eval_ppo(
             HHRLHF_DATASET_PATH, tokenizer, reward_model.rm_tokenizers, split='test'
         )
         instructions = Instructions()
     else:
-        valid_dataset = build_dataset_summary_eval(
+        valid_dataset = build_dataset_summary_eval_ppo(
             SUMMARY_DATASET_PATH, tokenizer, reward_model.rm_tokenizers, split='test'
         )
         instructions = Instructions_summary()
