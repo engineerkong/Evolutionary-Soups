@@ -1,6 +1,6 @@
 from transformers import AutoTokenizer
 import numpy as np
-from utils import load_reward_model, get_rewards
+from .utils import load_reward_model, get_rewards
 
 class RewardModels():
     def __init__(self, reward_model_path_list, rm_tokenizer_path_list, gpu_id_list, reward_stats_path=None):

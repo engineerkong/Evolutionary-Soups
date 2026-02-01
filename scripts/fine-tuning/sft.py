@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -8,22 +10,25 @@ from transformers import AutoModelForCausalLM, HfArgumentParser, TrainingArgumen
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM, set_seed
 from peft import LoraConfig
 
+script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
+project_root = script_dir.parent.parent       # project/
+sys.path.insert(0, str(project_root))
 from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_sft, build_dataset_summary_sft, load_main_tokenizer
 tqdm.pandas()
 
-# define paths for two datasets
+# ========== define paths for two datasets ==========
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
 
-# define script arguments
+# ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant'"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
     log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: Optional[str] = field(default='./models/sft/', metadata={"help": "Directory to save the model"})
-    wandb_name: Optional[str] = field(default='assistant_sft', metadata={"help": "Name for this experiment"})
+    save_directory: Optional[str] = field(default='./models/sft/', metadata={"help": "directory to save the model"})
+    wandb_name: Optional[str] = field(default='assistant_sft', metadata={"help": "name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
@@ -38,7 +43,7 @@ process_id = Accelerator().local_process_index
 gpu_id = process_id 
 print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
-# define training and lora arguments
+# ========== define training and lora configurations ==========
 training_args = TrainingArguments(
         max_steps=20000,  
         output_dir=output_dir,
@@ -47,8 +52,8 @@ training_args = TrainingArguments(
         save_steps=10000,
         logging_steps=10,
         save_strategy='steps',
-        per_device_train_batch_size=64,
-        per_device_eval_batch_size=64,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
         learning_rate=1.4e-4,
         lr_scheduler_type="linear",
         warmup_steps=0,
@@ -69,7 +74,7 @@ lora_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
-# load model and tokenizer
+# ========== load model and tokenizer ==========
 tokenizer = load_main_tokenizer(script_args.base_model_name)
 if script_args.load_in_8bit:
     model = AutoModelForCausalLM.from_pretrained(
@@ -85,7 +90,7 @@ else:
     )
 model.resize_token_embeddings(len(tokenizer))
 
-# prepare dataset and data collator
+# ========== prepare dataset and data collator ==========
 if script_args.exp_type == 'assistant':
     dataset = build_dataset_sft(hhrlhf_dataset_path, tokenizer, split='train') 
     response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]  
@@ -97,7 +102,7 @@ else:
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}")
 
-# define trainer and verify trainable parameters
+# ========== define trainer and verify trainable parameters ==========
 trainer = SFTTrainer(
     model=model,
     args=training_args,
@@ -118,7 +123,7 @@ if process_id == 0:
     print(f"Total params: {total:,}")
     print(f"Trainable %: {100 * trainable / total:.6f}%")
     
-# start training
+# ========== start training ==========
 print("Training........")
 trainer.train()
 

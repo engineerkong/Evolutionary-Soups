@@ -1,46 +1,55 @@
+import sys
+from pathlib import Path
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
 import torch
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, HfArgumentParser
-from transformers import DataCollatorWithPadding
+from transformers import AutoModelForCausalLM, HfArgumentParser, DataCollatorWithPadding
 from trl import set_seed
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
+
+script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
+project_root = script_dir.parent.parent       # project/
+sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import load_main_tokenizer, Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo, check_lora_in_model_path, merge_lora_weight
-from peft import get_peft_model
+from scripts.utils.utils import load_main_tokenizer, merge_lora_weight, Instructions, Instructions_summary, \
+                                build_dataset_eval_ppo, build_dataset_summary_eval_ppo
 tqdm.pandas()
 
-# define paths for two datasets
+# ========== define paths for two datasets ==========
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
 
+# ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: Optional[str] = field(default='./results/ppo/')
-    batch_size: Optional[int] = field(default=1, metadata={"help": "the batch size"})
-    wandb_name: Optional[str] = field(default='assistant_ppo_eval', metadata={"help": "Name for this experiment"})
-    reward_names:Optional[str] = field(default='harmless,helpful') 
-    ppo_model_name: Optional[str] = field(default='./models/ppo/')
-    sft_model_name: Optional[str] = field(default='./models/sft/model/')
+    sft_model_name: Optional[str] = field(default='./models/sft/model/', metadata={'help':"the path to the sft model; need to merge if using lora"})
+    ppo_model_name: Optional[str] = field(default='./models/ppo/', metadata={'help':"the path to the ppo model"})
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
+    reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
+    save_directory: Optional[str] = field(default='./results/ppo/', metadata={"help": "directory to save results"})
+    wandb_name: Optional[str] = field(default='assistant_ppo_eval', metadata={"help": "Name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-exp_type = script_args.exp_type
-ppo_model_name = script_args.ppo_model_name
-sft_model_name = script_args.sft_model_name
-print('ppo model: ', ppo_model_name)
-print('sft model: ', sft_model_name)
+print('sft model: ', script_args.sft_model_name)
+print('ppo model: ', script_args.ppo_model_name)
+output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
+print('output dir: ', output_dir)
+os.makedirs(output_dir, exist_ok=True)
 
+set_seed(8888)
+process_id = Accelerator().local_process_index 
+gpu_id = process_id
+print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
+
+# ========== load reward models ==========
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
-num_rewards = len(reward_names)
-print('number of rewards: {}'.format(num_rewards))
+print('reward names:', reward_names)
 reward_path_tokenizer_dict = {
     'harmless': ['Ray2333/gpt2-large-harmless-reward_model'],
     'helpful': ['Ray2333/gpt2-large-helpful-reward_model'],
@@ -56,41 +65,29 @@ for name in reward_names:
         raise NotImplementedError
     reward_model_path_list.append(reward_path_tokenizer_dict[name][0])
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
-os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), exist_ok=True)
+reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id)
 
-
-process_id = Accelerator().local_process_index 
-gpu_id = process_id
-print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
-  
-
-##############
-rm_gpu_id = gpu_id
-reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, rm_gpu_id)
-
-set_seed(8888)
-current_device = Accelerator().local_process_index
-print(current_device)
-
-
-tokenizer = load_main_tokenizer(ppo_model_name)
+# ========== load ppo model and tokenizer ==========
+tokenizer = load_main_tokenizer(script_args.ppo_model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    sft_model_name, 
+    script_args.sft_model_name, 
     torch_dtype=torch.bfloat16,  # fast inference
     device_map=gpu_id, 
 )
 model.resize_token_embeddings(len(tokenizer))
-model = merge_lora_weight(model, ppo_model_name)
+model = merge_lora_weight(model, script_args.ppo_model_name)
 
+# ========== define generation kwargs ==========
 generation_kwargs = {
-    "max_new_tokens": 128 if exp_type == 'assistant' else 48, 
+    "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48, 
     "min_length": -1,
     "top_k": 0.0,
     "top_p": 0.9, 
     "do_sample": True,
 }
+tokenizer.padding_side = "left"
 
-
+# ========== define function to clean data ==========
 def get_clean_data(full_responses, full_prompts):
     full_responses_clean = []
     for i, response in enumerate(full_responses):
@@ -107,11 +104,8 @@ def get_clean_data(full_responses, full_prompts):
         full_responses_clean.append(full_prompts[i] + ' ' + temp_resp)
     return full_responses_clean
 
-
-### for evaluation
-print('evaluation........')
-tokenizer.padding_side = "left"
-if exp_type == 'assistant':
+# ========== prepare evaluation dataset and dataloader ==========
+if script_args.exp_type == 'assistant':
     valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers,  split='test')
     instructions = Instructions()
 else:
@@ -120,8 +114,7 @@ else:
 print(f"Size of the validation set: {len(valid_dataset)}")
 
 valid_batch_size = 1
-# valid_dataset = valid_dataset.remove_columns(['prompt', 'query']) # EDITED
-for key in ['key', 'text', 'response']:
+for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)
 
@@ -130,6 +123,8 @@ valid_data_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, drop_
 accelerator = Accelerator()
 model, valid_data_loader = accelerator.prepare(model, valid_data_loader)
 
+# ========== start evaluation ==========
+print('evaluation........')
 full_response_tensors = []
 full_prompts = []
 
@@ -143,13 +138,12 @@ with torch.no_grad():
 
 full_prompts = tokenizer.batch_decode(full_prompts)
 full_responses = tokenizer.batch_decode(full_response_tensors)
-full_responses = get_clean_data(full_responses, full_prompts) # get_clean_data_ppo
-# Compute score
+full_responses = get_clean_data(full_responses, full_prompts)
+
 queries_responses = [
     (instructions.get_input(text),  instructions.get_response(text))
     for text in full_responses
 ]
-
 
 if hasattr(instructions, 'get_post'):
     rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=None) # no normalization during eval
@@ -159,13 +153,11 @@ else:
 all_rewards = []
 for i in range(reward_models.num_rewards):
     all_rewards.append(accelerator.gather_for_metrics(rewards_list[i]))
-### merge data
-### error here may because of old version of transformers/accelerate/peft
 all_full_prompts = accelerator.gather_for_metrics(full_prompts)
 all_full_responses = accelerator.gather_for_metrics(full_responses)
 
-
 if process_id == 0:
+    print('Saving evaluation results')
     evaluation_result = {
         'prompt':all_full_prompts,
         'response': all_full_responses,
@@ -175,5 +167,5 @@ if process_id == 0:
         print('total average obtained score {}: {}'.format(i+1, np.mean(evaluation_result['obtained_score{}'.format(i+1)])))
 
     dataframe = pd.DataFrame(evaluation_result)
-    dataframe.to_csv(os.path.join(script_args.save_directory, script_args.wandb_name,'eval_data.csv'))
+    dataframe.to_csv(os.path.join(output_dir,'eval_data.csv'))
 

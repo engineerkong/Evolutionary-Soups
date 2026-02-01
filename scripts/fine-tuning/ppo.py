@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -6,52 +8,51 @@ import torch
 from tqdm import tqdm
 from transformers import HfArgumentParser
 from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead, set_seed
-from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, PeftConfig, prepare_model_for_kbit_training
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
+project_root = script_dir.parent.parent       # project/
+sys.path.insert(0, str(project_root))
 from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_ppo, build_dataset_summary_ppo, load_main_tokenizer, print_trainable_parameters                
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
 
-
-# define paths for two datasets
+# ========== define paths for two datasets ==========
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
-base_model_name = 'meta-llama/Llama-2-7b-hf'
 
+# ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    disable_wandb: Optional[str] = field(default=True, metadata={'help': 'Whether to disable wandb or not.'})
-    save_directory: Optional[str] = field(default='./models/ppo/')
-    epochs: Optional[int] = field(default=1, metadata={'help': "Number of training epoches"})
-    learning_rate: Optional[float] = field(default=1e-5, metadata={"help": "the learning rate"})
-    mini_batch_size: Optional[int] = field(default=1, metadata={"help": "the PPO minibatch size"})
-    batch_size: Optional[int] = field(default=64, metadata={"help": "the batch size"})
-    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
-    gradient_accumulation_steps: Optional[int] = field(default=1, metadata={"help": "the number of gradient accumulation steps"})
-    early_stopping: Optional[bool] = field(default=True, metadata={"help": "whether to early stop"})
-    target: Optional[float] = field(default=3, metadata={"help": "target kl divergence of adaptive control"})
-    init_kl_coef: Optional[float] = field(default=0.2,metadata={"help": "Initial KL penalty coefficient (used for adaptive and linear control)"},)
-    max_grad_norm: Optional[float] = field(default=0.5, metadata={"help": "Maximum gradient norm for gradient clipping"})
-    wandb_name: Optional[str] = field(default='assistant_ppo', metadata={"help": "Name for this experiment"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type: 'assistant" or 'summary'}) 
+    base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
+    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type: 'summary" or 'assistant'}) 
     reward_name: Optional[str] = field(default='harmless', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor'"})
+    epochs: Optional[int] = field(default=1, metadata={'help': "Number of training epoches"})
+    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
+    log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
+    save_directory: Optional[str] = field(default='./models/ppo/', metadata={"help": "directory to save the model"})
+    wandb_name: Optional[str] = field(default='assistant_ppo', metadata={"help": "name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-exp_type = script_args.exp_type
-# Remember to use a merged sft model if using lora 
-sft_model_name = script_args.sft_model_name
-print('sft model: ', sft_model_name)
-print('base model: ', base_model_name)
 
-if script_args.disable_wandb: # if you don't need the wandb log
-    os.environ['WANDB_DISABLED'] = 'true' 
+print('base model: ', script_args.base_model_name)
+print('sft model: ', script_args.sft_model_name)
+output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
+print('output dir: ', output_dir)
+os.makedirs(output_dir, exist_ok=True)
 
+set_seed(8888)
+accelerator = Accelerator()
+process_id = accelerator.local_process_index 
+gpu_id = process_id
+print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
+
+# ========== load reward model ==========
 reward_name = script_args.reward_name
 if reward_name == 'summary':
     reward_peft_path = 'Tristan/gpt2_reward_summarization'
@@ -68,60 +69,73 @@ elif reward_name == 'humor':
 else:
     raise NotImplementedError
 rm_tokenizer_path = reward_peft_path
-os.makedirs(os.path.join(script_args.save_directory, script_args.wandb_name), exist_ok=True)
-
-
-config = PPOConfig(
-    model_name=sft_model_name,
-    learning_rate=script_args.learning_rate,
-    log_with=script_args.log_with,
-    mini_batch_size=script_args.mini_batch_size,
-    batch_size=script_args.batch_size,
-    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
-    early_stopping=script_args.early_stopping,
-    target=script_args.target,
-    max_grad_norm=script_args.max_grad_norm,
-    optimize_cuda_cache=True,
-    init_kl_coef=script_args.init_kl_coef,
-    tracker_project_name='ppo',
-    tracker_kwargs={"wandb":{"name":script_args.wandb_name}},
-)
-
-accelerator = Accelerator()
-process_id = Accelerator().local_process_index 
-gpu_id = process_id
-print('process: {}'.format(process_id))
 reward_model = RewardModels([reward_peft_path], [rm_tokenizer_path], gpu_id)
 rm_tokenizer = reward_model.rm_tokenizers[0] 
 
+# ========== define training and lora configurations ==========
+config = PPOConfig(
+    model_name=script_args.sft_model_name,
+    learning_rate=1e-5,
+    log_with=script_args.log_with if script_args.log_with != 'none' else None,
+    mini_batch_size=1,
+    batch_size=64,
+    gradient_accumulation_steps=1,
+    early_stopping=True,
+    target=3,
+    max_grad_norm=0.5,
+    optimize_cuda_cache=True,
+    init_kl_coef=0.2,
+    tracker_project_name='ppo',
+    tracker_kwargs={"wandb":{"name":script_args.wandb_name if script_args.log_with != 'none' else None}},
+)
 
-# set seed before initializing value head for deterministic eval
-set_seed(8888)
-current_device = Accelerator().local_process_index
-print(current_device)
-
-from peft import PeftConfig
-sft_config = PeftConfig.from_pretrained(sft_model_name)
+sft_config = PeftConfig.from_pretrained(script_args.sft_model_name)
 print("=" * 70)
 print("SFT LoRA Configuration:")
 print(f"  r: {sft_config.r}")
 print(f"  lora_alpha: {sft_config.lora_alpha}")
 print(f"  target_modules: {sft_config.target_modules}")
-print(f"  lora_dropout: {sft_config.lora_dropout}")
 print("=" * 70)
 
-# use the config from SFT, must be consistent
 lora_config = LoraConfig(
     r=sft_config.r,  
     lora_alpha=sft_config.lora_alpha,
     lora_dropout=sft_config.lora_dropout,
     target_modules=sft_config.target_modules,
-    bias="none",
-    task_type="CAUSAL_LM",
+    bias=sft_config.bias,
+    task_type=sft_config.task_type,
 )
 
-tokenizer = load_main_tokenizer(sft_model_name)
-if exp_type == 'assistant':
+# ========== load model and tokenizer ==========
+tokenizer = load_main_tokenizer(script_args.sft_model_name)
+if script_args.load_in_8bit:
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        script_args.base_model_name,
+        load_in_8bit=True,
+        device_map=gpu_id,
+    )
+    model.pretrained_model = prepare_model_for_kbit_training(model.pretrained_model)
+    model.pretrained_model = PeftModel.from_pretrained(
+        model.pretrained_model,
+        script_args.sft_model_name,
+        is_trainable=True
+    )
+else:
+    model = AutoModelForCausalLMWithValueHead.from_pretrained(
+        script_args.base_model_name,
+        torch_dtype=torch.bfloat16,
+        device_map=gpu_id,
+    )
+    model.pretrained_model = PeftModel.from_pretrained(
+        model.pretrained_model,
+        script_args.sft_model_name,
+        is_trainable=True
+    )
+print_trainable_parameters(model)
+model.pretrained_model.resize_token_embeddings(len(tokenizer))
+
+# ========== prepare dataset and dataloader ==========
+if script_args.exp_type == 'assistant':
     dataset = build_dataset_ppo(hhrlhf_dataset_path, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions()
 else:
@@ -129,46 +143,17 @@ else:
     instructions = Instructions_summary()
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}.")
-
-if script_args.load_in_8bit:
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        base_model_name,
-        load_in_8bit=True,
-        device_map=gpu_id,
-    )
-    model.pretrained_model = prepare_model_for_kbit_training(model.pretrained_model)
-    model.pretrained_model = PeftModel.from_pretrained(
-        model.pretrained_model,
-        sft_model_name,
-        is_trainable=True
-    )
-else:
-    model = AutoModelForCausalLMWithValueHead.from_pretrained(
-        base_model_name,
-        torch_dtype=torch.bfloat16,
-        device_map=gpu_id,
-    )
-    model.pretrained_model = PeftModel.from_pretrained(
-        model.pretrained_model,
-        sft_model_name,
-        is_trainable=True
-    )
-
-print("After loading SFT LoRA:")
-print_trainable_parameters(model)
-
-
-model.pretrained_model.resize_token_embeddings(len(tokenizer))
-optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.learning_rate)
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
 
+# ========== define ppo trainer and generation kwargs ==========
+optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.learning_rate)
 ppo_trainer = PPOTrainer(
     config, model, tokenizer=tokenizer, dataset=dataset, data_collator=collator, optimizer=optimizer
 )
 
 generation_kwargs = {
-    "max_new_tokens": 128 if exp_type == 'assistant' else 48,
+    "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48,
     'min_length': -1, 
     "top_k": 0.0,
     "top_p": 1.0, 
@@ -178,6 +163,7 @@ generation_kwargs = {
     "begin_suppress_tokens": [tokenizer.eos_token_id],
 }
 
+# ========== start training ==========
 print("Training........")
 model.gradient_checkpointing_disable()
 model.pretrained_model.config.use_cache = True
@@ -194,7 +180,7 @@ save_data = {
 }
 
 for epoch in range(epochs):
-    pbar = tqdm(total=len(train_dataset) // script_args.batch_size // accelerator.num_processes)
+    pbar = tqdm(total=len(train_dataset) // ppo_trainer.config.batch_size // accelerator.num_processes)
 
     # save initial parameters for comparison
     print("Saving initial parameters for comparison...")
@@ -214,14 +200,7 @@ for epoch in range(epochs):
         model.pretrained_model.config.use_cache = True
 
         with torch.no_grad():
-            response_tensors = ppo_trainer.generate(query_tensors, return_prompt=False, **generation_kwargs) 
-
-        # decoded_responses = tokenizer.batch_decode(
-        #     response_tensors,
-        #     skip_special_tokens=True
-        # )
-        # decoded_responses = [r.strip() for r in decoded_responses]
-        # batch["response"] = decoded_responses
+            response_tensors = ppo_trainer.generate(query_tensors, return_prompt=False, **generation_kwargs)
         
         full_responses = tokenizer.batch_decode(response_tensors)
         full_responses_clean = []
@@ -244,7 +223,7 @@ for epoch in range(epochs):
         response_tensors = [response_tensors[j][:np.max([lengths[j], 2])] for j in range(len(response_tensors))]
         batch['response'] = clean_texts
 
-        # Compute rewards
+        # compute rewards
         texts_merge = [q + r for q, r in zip(batch['query'], batch['response'])]
         queries_responses = [
             (instructions.get_input(text), instructions.get_response(text))
@@ -260,9 +239,9 @@ for epoch in range(epochs):
         model.gradient_checkpointing_enable()
         model.pretrained_model.config.use_cache = False
 
-        # ========== First batch diagnostics ==========
+        # first batch diagnostics
         if i == 0:
-            # Register gradient hooks
+            # register gradient hooks
             gradient_info = {}
             def grad_hook(name):
                 def hook(grad):
@@ -273,22 +252,21 @@ for epoch in range(epochs):
             for name, param in model.named_parameters():
                 if param.requires_grad:
                     param.register_hook(grad_hook(name))
-        # =============================================
 
-        # PPO step - This will compute gradients and update parameters
+        # PPO step - this will compute gradients and update parameters
         ppo_trainer.config.batch_size = len(query_tensors)
         stats = ppo_trainer.step(query_tensors, response_tensors, rewards_tensor)
         
-        # Log stats
+        # log stats
         ppo_trainer.log_stats(stats, batch, rewards)
         policy_kl = [stats["objective/kl"]]
 
-        # ========== First batch diagnostics ==========
+        # first batch diagnostics
         if i == 0:
             print("\n" + "=" * 70)
             print("First Batch Diagnostics:")
             
-            # Check gradients
+            # check gradients
             if gradient_info:
                 nonzero_grads = sum(1 for v in gradient_info.values() if v > 1e-8)
                 if nonzero_grads:
@@ -296,7 +274,7 @@ for epoch in range(epochs):
                 else:
                     print("  ❌ NO GRADIENTS CAPTURED!")
             
-            # Check parameter updates
+            # check parameter updates
             params_changed = any(
                 (param - initial_params[name]).abs().max().item() > 1e-8
                 for name, param in model.named_parameters()
@@ -304,7 +282,6 @@ for epoch in range(epochs):
             )
             print(f"  {'✓' if params_changed else '❌'} Parameters {'updated' if params_changed else 'NOT updated'}")
             print("=" * 70 + "\n")
-        # =============================================
 
         all_rewards = accelerator.gather_for_metrics(rewards)
         all_policy_kl = accelerator.gather_for_metrics(policy_kl)
