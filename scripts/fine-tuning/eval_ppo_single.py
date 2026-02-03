@@ -113,13 +113,13 @@ else:
     instructions = Instructions_summary()
 print(f"Size of the validation set: {len(valid_dataset)}")
 
-valid_batch_size = 1
+mini_batch_size = 8
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-valid_data_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, drop_last=True, collate_fn=data_collator)
+valid_data_loader = DataLoader(valid_dataset, batch_size=mini_batch_size, drop_last=True, collate_fn=data_collator)
 accelerator = Accelerator()
 model, valid_data_loader = accelerator.prepare(model, valid_data_loader)
 
@@ -128,7 +128,7 @@ print('evaluation........')
 full_response_tensors = []
 full_prompts = []
 
-pbar = tqdm(total=len(valid_dataset) // valid_batch_size // accelerator.num_processes)
+pbar = tqdm(total=len(valid_dataset) // mini_batch_size // accelerator.num_processes)
 with torch.no_grad():
     for i, batch in enumerate(valid_data_loader):
         response_tensors = accelerator.unwrap_model(model).generate(batch['input_ids'], attention_mask=batch['attention_mask'], **generation_kwargs)

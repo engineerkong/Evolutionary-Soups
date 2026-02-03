@@ -29,9 +29,9 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
-    ppo_model_path1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
-    ppo_model_path2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
-    ppo_model_path3: Optional[str]=field(default='')
+    ppo_model_name1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
+    ppo_model_name2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
+    ppo_model_name3: Optional[str]=field(default='')
     reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
     save_directory: Optional[str] = field(default='./results/ppo_rs/', metadata={"help": "directory to save results"})
@@ -71,9 +71,9 @@ for name in reward_names:
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
 
 save_info = {
-    'ppo_model_path1': script_args.ppo_model_path1,
-    'ppo_model_path2': script_args.ppo_model_path2,
-    'ppo_model_path3': script_args.ppo_model_path3,
+    'ppo_model_name1': script_args.ppo_model_name1,
+    'ppo_model_name2': script_args.ppo_model_name2,
+    'ppo_model_name3': script_args.ppo_model_name3,
     'reward_peft_path1': reward_model_path_list[0],
     'reward_peft_path2': reward_model_path_list[1],
     'tokenizer_name': script_args.base_model_name,
@@ -99,7 +99,7 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
 
 # ========== evaluation function ==========
 def evaluate_model(temp_save_path, tokenizer, valid_dataset):
-    mini_batch_size = 1
+    mini_batch_size = 8
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     valid_data_loader = DataLoader(valid_dataset, mini_batch_size, drop_last=True, collate_fn=data_collator)
     # load_merged_model
@@ -162,19 +162,19 @@ print("evaluating........")
 # preference list
 if reward_models.num_rewards == 3:
     preferences = np.array([
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0],
-        [0.1, 0.1, 0.8],
-        [0.1, 0.8, 0.1],
-        [0.2, 0.2, 0.6],
-        [0.2, 0.4, 0.4],
-        [0.2, 0.6, 0.2],
+        # [0.0, 0.0, 1.0],
+        # [0.0, 1.0, 0.0],
+        # [0.1, 0.1, 0.8],
+        # [0.1, 0.8, 0.1],
+        # [0.2, 0.2, 0.6],
+        # [0.2, 0.4, 0.4],
+        # [0.2, 0.6, 0.2],
         [0.33, 0.33, 0.33],
-        [0.4, 0.4, 0.2],
-        [0.4, 0.2, 0.4], 
-        [0.6, 0.2, 0.2],
-        [0.8, 0.1, 0.1], 
-        [1.0, 0.0, 0.0], 
+        # [0.4, 0.4, 0.2],
+        # [0.4, 0.2, 0.4], 
+        # [0.6, 0.2, 0.2],
+        # [0.8, 0.1, 0.1], 
+        # [1.0, 0.0, 0.0], 
         ])
 elif reward_models.num_rewards == 2:
     # # orginal code for two rewards
@@ -194,9 +194,9 @@ for k in range(0, len(preferences)):
     temp_save_path = output_dir + '/temp_merged_model_pref_{}_{}'.format('_'.join([str(p) for p in preference]), k)
     if process_id == 0:
         if len(preference) == 3:
-            ppo_model_list = [script_args.ppo_model_path1, script_args.ppo_model_path2, script_args.ppo_model_path3]
+            ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2, script_args.ppo_model_name3]
         else:
-            ppo_model_list = [script_args.ppo_model_path1, script_args.ppo_model_path2]
+            ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2]
         merge_weights_with_preference(ppo_model_list, preference, temp_save_path)
         print("merged model saved to {}".format(temp_save_path))
 
