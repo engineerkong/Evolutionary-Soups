@@ -13,7 +13,7 @@ from peft import LoraConfig
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_sft, build_dataset_summary_sft, load_main_tokenizer
+from scripts.utils.utils import load_config, Instructions, Instructions_summary, build_dataset_sft, build_dataset_summary_sft, load_main_tokenizer
 tqdm.pandas()
 
 # ========== define paths for two datasets ==========
@@ -32,8 +32,10 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
+cfg = load_config('config.yaml')['sft']
+print(f"Script arguments: {script_args}")
+print(f"Training config: {cfg}")
 
-print('base model: ', script_args.base_model_name)
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 print('output dir: ', output_dir)
 os.makedirs(output_dir, exist_ok=True)
@@ -45,24 +47,10 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== define training and lora configurations ==========
 training_args = TrainingArguments(
-        max_steps=20000,  
+        **cfg,
         output_dir=output_dir,
-        dataloader_drop_last=True,
-        eval_steps=30000,
-        save_steps=10000,
-        logging_steps=10,
-        save_strategy='steps',
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        learning_rate=1.4e-4,
-        lr_scheduler_type="linear",
-        warmup_steps=0,
-        gradient_accumulation_steps=1,
-        gradient_checkpointing=False,
-        weight_decay=0.01,
         run_name=script_args.wandb_name,
         report_to=script_args.log_with,
-        ddp_find_unused_parameters=False,
     )
 
 lora_config = LoraConfig(

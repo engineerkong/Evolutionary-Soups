@@ -16,6 +16,6 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_mo
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/summary_sft/model/' --exp_type 'summary' --reward_name 'summary' --wandb_name 'summary_ppo_summary' 2>&1 | tee ./logs/ppo_summary.log
 
 # PPO OBJECTIVE-SPECIFIC EVALUATION (--main_process_port 29601)
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/assistant_sft/model/' --ppo_model_name './models/ppo/assistant_ppo_harmless/batch_832/' --reward_name 'harmless,helpful' --wandb_name 'assistant_ppo_harmless_eval' 2>&1 | tee ./logs/ppo_harmless_eval.log
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/summary_sft/model/' --ppo_model_name './models/ppo/summary_ppo_summary/batch_832/' --reward_name 'summary,faithful,deberta' --wandb_name 'summary_ppo_summary_eval' 2>&1 | tee ./logs/ppo_summary_eval.log
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/assistant_sft/model/' --ppo_model_name './models/ppo/assistant_ppo_harmless/batch_832/' --exp_type 'assistant' --reward_name 'harmless,helpful' --wandb_name 'assistant_ppo_harmless_eval' 2>&1 | tee ./logs/ppo_harmless_eval.log
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/summary_sft/model/' --ppo_model_name './models/ppo/summary_ppo_faithful/batch_307/' --exp_type 'summary' --reward_name 'summary,faithful,deberta' --wandb_name 'summary_ppo_summary_eval' 2>&1 | tee ./logs/ppo_summary_eval.log
 ```

@@ -10,6 +10,10 @@ from datasets import load_dataset, disable_caching
 import numpy as np
 disable_caching()
 
+def load_config(config_path: str):
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+    
 def clean_gpu_memory():
     gc.collect()
     torch.cuda.empty_cache()

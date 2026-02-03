@@ -39,9 +39,8 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-print('ppo model 1: ', script_args.ppo_model_path1)
-print('ppo model 2: ', script_args.ppo_model_path2)
-print('ppo model 3: ', script_args.ppo_model_path3)
+print(script_args)
+
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 print('output dir: ', output_dir)
 os.makedirs(output_dir, exist_ok=True)

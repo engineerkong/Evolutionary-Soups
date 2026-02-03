@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import Instructions, Instructions_summary, build_dataset_ppo, build_dataset_summary_ppo, load_main_tokenizer, print_trainable_parameters                
+from scripts.utils.utils import load_config, Instructions, Instructions_summary, build_dataset_ppo, build_dataset_summary_ppo, load_main_tokenizer, print_trainable_parameters                
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
 
@@ -29,7 +29,7 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type: 'summary" or 'assistant'}) 
+    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type: 'summary' or 'assistant'"}) 
     reward_name: Optional[str] = field(default='harmless', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor'"})
     epochs: Optional[int] = field(default=1, metadata={'help': "Number of training epoches"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
@@ -39,9 +39,10 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
+cfg = load_config('config.yaml')['ppo_{}'.format(script_args.exp_type)]
+print(f"Script arguments: {script_args}")
+print(f"Training config: {cfg}")
 
-print('base model: ', script_args.base_model_name)
-print('sft model: ', script_args.sft_model_name)
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 print('output dir: ', output_dir)
 os.makedirs(output_dir, exist_ok=True)
@@ -75,17 +76,8 @@ rm_tokenizer = reward_model.rm_tokenizers[0]
 # ========== define training and lora configurations ==========
 config = PPOConfig(
     model_name=script_args.sft_model_name,
-    learning_rate=1e-5,
+    **cfg,
     log_with=script_args.log_with if script_args.log_with != 'none' else None,
-    mini_batch_size=1,
-    batch_size=64,
-    gradient_accumulation_steps=1,
-    early_stopping=True,
-    target=3,
-    max_grad_norm=0.5,
-    optimize_cuda_cache=True,
-    init_kl_coef=0.2,
-    tracker_project_name='ppo',
     tracker_kwargs={"wandb":{"name":script_args.wandb_name if script_args.log_with != 'none' else None}},
 )
 
@@ -168,7 +160,7 @@ print("Training........")
 model.gradient_checkpointing_disable()
 model.pretrained_model.config.use_cache = True
 
-epochs = script_args.epochs
+epochs = cfg['epochs']
 mean_scores = []
 std_scores = []
 save_data = {
@@ -179,6 +171,7 @@ save_data = {
     'text_sample':[],
 }
 
+global_step = 0
 for epoch in range(epochs):
     pbar = tqdm(total=len(train_dataset) // ppo_trainer.config.batch_size // accelerator.num_processes)
 
@@ -193,7 +186,7 @@ for epoch in range(epochs):
     first_batch_checked = False
 
     for i, batch in enumerate(ppo_trainer.dataloader):
-        print('epoch {}, batch {}'.format(epoch, i))
+        print('epoch {}, batch {}, global_step {}'.format(epoch, i, global_step))
         query_tensors = batch["input_ids"]
 
         model.gradient_checkpointing_disable()
@@ -234,13 +227,13 @@ for epoch in range(epochs):
         else:
             rewards = reward_model.get_reward_model_scores(queries_responses)[0]
         rewards_tensor = [torch.tensor(r).to(gpu_id) for r in rewards]
-        print("iter {}, batch {}: mean score: {}".format(epoch, i, torch.mean(torch.tensor(rewards)).item()))
+        print("epoch {}, batch {}, global_step {}: mean score: {:.4f}".format(epoch, i, global_step, torch.mean(torch.tensor(rewards)).item()))
 
         model.gradient_checkpointing_enable()
         model.pretrained_model.config.use_cache = False
 
-        # first batch diagnostics
-        if i == 0:
+        # first batch diagnostics (only on first batch of first epoch)
+        if global_step == 0:
             # register gradient hooks
             gradient_info = {}
             def grad_hook(name):
@@ -254,15 +247,25 @@ for epoch in range(epochs):
                     param.register_hook(grad_hook(name))
 
         # PPO step - this will compute gradients and update parameters
-        ppo_trainer.config.batch_size = len(query_tensors)
         stats = ppo_trainer.step(query_tensors, response_tensors, rewards_tensor)
-        
+
+        # print stats after PPO step
+        print(f"  Raw reward: mean={np.mean(rewards):.3f}, std={np.std(rewards):.3f}")
+        print(f"  KL: {stats['objective/kl']:.4f}")
+        print(f"  Policy loss: {stats.get('ppo/loss/policy', 'N/A')}")
+        print(f"  Value loss: {stats.get('ppo/loss/value', 'N/A')}")
+        print(f"  Entropy: {stats.get('ppo/policy/entropy', 'N/A')}")
+
+        # warn if KL is too high
+        if stats['objective/kl'] > 1.0:
+            print("⚠️ WARNING: KL divergence is high!")
+
         # log stats
         ppo_trainer.log_stats(stats, batch, rewards)
         policy_kl = [stats["objective/kl"]]
 
-        # first batch diagnostics
-        if i == 0:
+        # first batch diagnostics (only on first batch of first epoch)
+        if global_step == 0:
             print("\n" + "=" * 70)
             print("First Batch Diagnostics:")
             
@@ -290,7 +293,9 @@ for epoch in range(epochs):
             mean_scores.append(torch.mean(torch.tensor(rewards)).item())
             std_scores.append(torch.std(torch.tensor(rewards)).item())
 
+            # save plot
             save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'scores.png')
+            plt.clf()  # Clear figure to avoid overlapping plots
             plt.plot(mean_scores)
             plt.fill_between(
                 np.arange(len(mean_scores)),
@@ -298,8 +303,12 @@ for epoch in range(epochs):
                 np.array(mean_scores) + np.array(std_scores),
                 alpha=0.5
             )
+            plt.xlabel('Global Step')
+            plt.ylabel('Reward')
+            plt.title('Training Progress')
             plt.savefig(save_path)
 
+            # save data
             save_data['kl_mean'].append(np.mean(all_policy_kl))
             save_data['kl_std'].append(np.std(all_policy_kl))
             save_data['reward_mean'] = mean_scores
@@ -307,24 +316,46 @@ for epoch in range(epochs):
             save_data['text_sample'].append(texts_merge[0])
 
             dataframe = pd.DataFrame(save_data)
-            if accelerator.is_main_process:
-                dataframe.to_csv(os.path.join(script_args.save_directory, script_args.wandb_name, 'data.csv'), escapechar='\\')
-            print("iter {}, batch {}: log finish".format(epoch, i))
+            dataframe.to_csv(
+                os.path.join(script_args.save_directory, script_args.wandb_name, 'data.csv'), 
+                escapechar='\\'
+            )
+            print("epoch {}, batch {}, global_step {}: log saved".format(epoch, i, global_step))
 
         # wait for the main process
         accelerator.wait_for_everyone()
         pbar.update(1)
 
-        # save model
-        if ppo_trainer.accelerator.is_main_process and i % 100 == 0 and i != 0:
-            save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'batch_{}'.format(i))
+        # save model checkpoint every 100 steps
+        if ppo_trainer.accelerator.is_main_process and global_step % 100 == 0 and global_step != 0:
+            save_path = os.path.join(
+                script_args.save_directory, 
+                script_args.wandb_name, 
+                'step_{}'.format(global_step)
+            )
             ppo_trainer.save_pretrained(save_path)
-            print("iter {}, batch {}: model saved".format(epoch, i))
+            print("epoch {}, batch {}, global_step {}: checkpoint saved".format(epoch, i, global_step))
 
-    # save model
+        global_step += 1
+
+    # save model at end of each epoch
     if ppo_trainer.accelerator.is_main_process:
-        save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'batch_{}'.format(i))
+        save_path = os.path.join(
+            script_args.save_directory, 
+            script_args.wandb_name, 
+            'epoch_{}_final'.format(epoch)
+        )
         ppo_trainer.save_pretrained(save_path)
-        print("iter {}, batch {}: model saved".format(epoch, i))
+        print("epoch {} complete, global_step {}: epoch checkpoint saved".format(epoch, global_step))
+
+# save final model
+if ppo_trainer.accelerator.is_main_process:
+    save_path = os.path.join(
+        script_args.save_directory, 
+        script_args.wandb_name, 
+        'final'
+    )
+    ppo_trainer.save_pretrained(save_path)
+    print("Training complete! Final model saved at global_step {}".format(global_step))
 
             

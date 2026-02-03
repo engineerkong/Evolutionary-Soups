@@ -1,0 +1,48 @@
+# config.yaml
+sft:
+  max_steps: 20000
+  eval_steps: 30000
+  save_steps: 10000
+  logging_steps: 100
+  save_strategy: "steps"
+
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 1
+  dataloader_drop_last: true
+
+  learning_rate: 1.4e-4
+  lr_scheduler_type: "linear"
+  warmup_steps: 0
+  weight_decay: 0.01
+
+  gradient_checkpointing: false
+  ddp_find_unused_parameters: false
+
+ppo_summary:
+  epochs: 3
+  learning_rate: 5e-6
+  mini_batch_size: 8
+  batch_size: 64
+  gradient_accumulation_steps: 8
+  early_stopping: false
+  target: 6
+  max_grad_norm: 0.5
+  optimize_cuda_cache: true
+  init_kl_coef: 0.05
+  adap_kl_ctrl: true
+  tracker_project_name: "ppo-summary"
+
+ppo_assistant:
+  epochs: 1
+  learning_rate: 1e-5
+  mini_batch_size: 8
+  batch_size: 64
+  gradient_accumulation_steps: 8
+  early_stopping: false
+  target: 3
+  max_grad_norm: 0.5
+  optimize_cuda_cache: true
+  init_kl_coef: 0.2
+  adap_kl_ctrl: true
+  tracker_project_name: "ppo-assistant"
