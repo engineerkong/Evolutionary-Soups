@@ -18,7 +18,7 @@ project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import load_main_tokenizer, check_lora_in_model_path, Instructions, Instructions_summary, \
-                    build_dataset_eval_sft, build_dataset_summary_eval_sft, get_clean_data_sft
+                    build_dataset_eval_sft, build_dataset_summary_eval_sft, get_clean_data
 tqdm.pandas()
 
 # ========== define paths for two datasets ==========
@@ -124,7 +124,7 @@ with torch.no_grad():
 
 full_prompts = tokenizer.batch_decode(full_prompts)
 full_responses = tokenizer.batch_decode(full_response_tensors)
-full_responses = get_clean_data_sft(full_responses, full_prompts)
+full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
 
 queries_responses = [
     (instructions.get_input(text),  instructions.get_response(text))

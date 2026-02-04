@@ -16,8 +16,8 @@ script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import load_main_tokenizer, merge_lora_weight, Instructions, Instructions_summary, \
-                                build_dataset_eval_ppo, build_dataset_summary_eval_ppo
+from scripts.utils.utils import load_main_tokenizer, merge_lora_weight, build_dataset_eval_ppo, build_dataset_summary_eval_ppo, \
+                                get_clean_data, Instructions, Instructions_summary
 tqdm.pandas()
 
 # ========== define paths for two datasets ==========
@@ -87,23 +87,6 @@ generation_kwargs = {
 }
 tokenizer.padding_side = "left"
 
-# ========== define function to clean data ==========
-def get_clean_data(full_responses, full_prompts):
-    full_responses_clean = []
-    for i, response in enumerate(full_responses):
-        full_prompts[i] = full_prompts[i].strip('[PAD] ')
-        response = response.strip('[PAD] ')
-        temp_resp = response.replace(full_prompts[i], '').strip('<s>').strip('</s>')
-        if '</s>' in temp_resp:
-            temp_resp = temp_resp[:temp_resp.rindex('</s>')]
-        temp_resp = temp_resp.split('\n\nHuman:')[0].strip()
-        temp_resp = temp_resp.split('\nHuman:')[0].strip()
-        temp_resp = temp_resp.split('\n\nAssistant:')[0].strip()
-        temp_resp = temp_resp.split('\nAssistant:')[0].strip()
-        temp_resp = temp_resp.split('\n\n\n')[0].strip()
-        full_responses_clean.append(full_prompts[i] + ' ' + temp_resp)
-    return full_responses_clean
-
 # ========== prepare evaluation dataset and dataloader ==========
 if script_args.exp_type == 'assistant':
     valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers,  split='test')
@@ -138,7 +121,7 @@ with torch.no_grad():
 
 full_prompts = tokenizer.batch_decode(full_prompts)
 full_responses = tokenizer.batch_decode(full_response_tensors)
-full_responses = get_clean_data(full_responses, full_prompts)
+full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
 
 queries_responses = [
     (instructions.get_input(text),  instructions.get_response(text))
@@ -146,9 +129,9 @@ queries_responses = [
 ]
 
 if hasattr(instructions, 'get_post'):
-    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=None) # no normalization during eval
+    rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False) # no normalization during eval
 else:
-    rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=None)
+    rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=False)
 
 all_rewards = []
 for i in range(reward_models.num_rewards):

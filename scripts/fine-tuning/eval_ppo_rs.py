@@ -17,7 +17,7 @@ script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import get_clean_data_ppo, load_main_tokenizer, save_configs, merge_weights_with_preference, \
+from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, merge_weights_with_preference, \
                                 Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo
 tqdm.pandas()
 
@@ -28,7 +28,7 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
+    sft_model_name: Optional[str] = field(default="./models/sft/model/", metadata={"help": "local path to the base model or the huggingface id"})
     ppo_model_name1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
     ppo_model_name2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
     ppo_model_name3: Optional[str]=field(default='')
@@ -71,12 +71,12 @@ for name in reward_names:
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
 
 save_info = {
+    'tokenizer_name': script_args.sft_model_name,
     'ppo_model_name1': script_args.ppo_model_name1,
     'ppo_model_name2': script_args.ppo_model_name2,
     'ppo_model_name3': script_args.ppo_model_name3,
     'reward_peft_path1': reward_model_path_list[0],
     'reward_peft_path2': reward_model_path_list[1],
-    'tokenizer_name': script_args.base_model_name,
 }
 for i in range(len(reward_model_path_list)):
     save_info['reward_peft_path{}'.format(i+1)] = reward_model_path_list[i]
@@ -84,7 +84,7 @@ save_configs(save_info, output_dir)
 reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id) 
 
 # ========== prepare evaluation dataset and dataloader ==========
-tokenizer = load_main_tokenizer(script_args.base_model_name)
+tokenizer = load_main_tokenizer(script_args.sft_model_name)
 if script_args.exp_type == 'assistant':
     valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test') 
     instructions = Instructions()
@@ -129,7 +129,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
     pbar = tqdm(total=len(valid_dataset) // mini_batch_size // accelerator.num_processes)
     with torch.no_grad():
         for i, batch in enumerate(valid_data_loader):
-            response_tensors = accelerator.unwrap_model(model).generate(batch["input_ids"], **generation_kwargs) #length_sampler=output_length_sampler, 
+            response_tensors = accelerator.unwrap_model(model).generate(batch["input_ids"], attention_mask=batch['attention_mask'], **generation_kwargs) #length_sampler=output_length_sampler, 
             full_responses.extend(response_tensors)
             full_prompts.extend(batch['input_ids'])
             pbar.update(1)
@@ -137,7 +137,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
     full_responses = tokenizer.batch_decode(full_responses)
     full_prompts = tokenizer.batch_decode(full_prompts)
     # clean data
-    full_prompts, full_responses = get_clean_data_ppo(full_responses, full_prompts)
+    full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
 
     queries_responses = [
         (instructions.get_input(text), instructions.get_response(text))
@@ -162,29 +162,21 @@ print("evaluating........")
 # preference list
 if reward_models.num_rewards == 3:
     preferences = np.array([
-        # [0.0, 0.0, 1.0],
-        # [0.0, 1.0, 0.0],
-        # [0.1, 0.1, 0.8],
-        # [0.1, 0.8, 0.1],
-        # [0.2, 0.2, 0.6],
-        # [0.2, 0.4, 0.4],
-        # [0.2, 0.6, 0.2],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [0.2, 0.2, 0.6],
+        [0.2, 0.6, 0.2],
         [0.33, 0.33, 0.33],
-        # [0.4, 0.4, 0.2],
-        # [0.4, 0.2, 0.4], 
-        # [0.6, 0.2, 0.2],
-        # [0.8, 0.1, 0.1], 
-        # [1.0, 0.0, 0.0], 
+        [0.6, 0.2, 0.2],
+        [1.0, 0.0, 0.0], 
         ])
 elif reward_models.num_rewards == 2:
-    # # orginal code for two rewards
-    # M = 10
-    # preferences = np.zeros((M+1, 2))
-    # preferences[:, 0] = np.arange(0,1+ 1/M,1 / M)
-    # preferences[:, 1] = 1 - preferences[:, 0]
-    # preferences = np.round(preferences, 1)
     preferences = np.array([
-        [0.5, 0.5]
+        [0.0, 1.0],
+        [0.25, 0.75],
+        [0.5, 0.5],
+        [0.75, 0.25],
+        [1.0, 0.0],
         ])
 else:
     raise NotImplementedError
@@ -219,9 +211,9 @@ for k in range(0, len(preferences)):
 
         dataframe = pd.DataFrame(evaluation_result)
         if len(preference) == 2:
-            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}.csv'.format(preference[0], preference[1])))
+            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}.csv'.format(preference[0], preference[1])), escapechar='\\')
         else:
-            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}_{}.csv'.format(preference[0], preference[1], preference[2])))
+            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}_{}.csv'.format(preference[0], preference[1], preference[2])), escapechar='\\')
 
 
 

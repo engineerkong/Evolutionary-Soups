@@ -96,7 +96,7 @@ def build_dataset_sft(path, tokenizer, split='train', size=None):
     return ds_concat
 
 
-def build_dataset_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
+def build_dataset_ppo(path, tokenizer, rm_tokenizer=None, split='train', size=None):
     ds = load_dataset(path, split=split)
     if size is not None:
         ds = ds.select(range(size))
@@ -110,7 +110,8 @@ def build_dataset_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
         sample['prompt'] = '\n\nAssistant:'.join(split_text[:-1]) + ' ' + '\n\nAssistant:'
         sample["input_ids"] = tokenizer.encode(sample["prompt"])
         sample["query"] = tokenizer.decode(sample["input_ids"])
-        sample['reward_ids'] = rm_tokenizer.encode(sample['text']) # for data filter
+        if rm_tokenizer is not None:
+            sample['reward_ids'] = rm_tokenizer.encode(sample['text']) # for data filter
         return sample
 
     ds_concat = ds.map(tokenize, batched=False, fn_kwargs={"reject": False}, num_proc=30)
@@ -297,6 +298,7 @@ def build_dataset_summary_eval_ppo(path, tokenizer, rm_tokenizers, split='test',
     ds.set_format(type="torch")
     return ds
 
+
 def check_lora_in_model_path(model, path):
     if os.path.exists(path):
         dirnames = os.listdir(path)
@@ -408,25 +410,7 @@ def merge_lora_weight(model, path):
     return model
 
 
-def get_clean_data_sft(full_responses, full_prompts):
-    full_responses_clean = []
-    for i, response in enumerate(full_responses):
-        full_prompts[i] = full_prompts[i].strip('[PAD] ')
-        response = response.strip('[PAD] ')
-        temp_resp = response.replace(full_prompts[i], '').strip('<s>').strip('</s>')
-        if '</s>' in temp_resp:
-            temp_resp = temp_resp[:temp_resp.rindex('</s>')]
-        temp_resp = temp_resp.split('\n\nHuman:')[0].strip()
-        temp_resp = temp_resp.split('\nHuman:')[0].strip()
-        temp_resp = temp_resp.split('\n\nAssistant:')[0].strip()
-        temp_resp = temp_resp.split('\nAssistant:')[0].strip()
-        temp_resp = temp_resp.split('###')[0].strip()
-        temp_resp = temp_resp.split('\n\n\n')[0].strip()
-        full_responses_clean.append(full_prompts[i] + ' ' + temp_resp)
-    return full_responses_clean
-
-
-def get_clean_data_ppo(full_responses, full_prompts, remove_bad=False):
+def get_clean_data(full_responses, full_prompts, remove_bad=False):
     full_prompts_clean = []
     full_responses_clean = []
     for i, response in enumerate(full_responses):
