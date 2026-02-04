@@ -3,12 +3,55 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
 from peft import PeftModel
-
+import numpy as np
+from pymoo.indicators.hv import HV
 from moe_architecture import (
     LoRAExpertFFNComplete,
     MoEFFNLayer,
     AttentionGatingNetwork
 )
+
+# ==================== hypervolume calculation ====================
+
+def compute_hypervolume(reward_vectors):
+    """
+    Compute hypervolume of reward vectors.
+    
+    Args:
+        reward_vectors: list of [num_rewards] arrays
+    Returns:
+        hv_value: hypervolume (higher is better)
+    """
+    if len(reward_vectors) == 0:
+        return 0.0
+    
+    # Stack and negate (pymoo expects minimization)
+    points = -np.array(reward_vectors)
+    
+    # Reference point (negated since we negated objectives)
+    ref_point = np.ones(len(reward_vectors[0])) * 4.0
+    
+    hv_indicator = HV(ref_point=ref_point)
+    hv_value = hv_indicator(points)
+    
+    return hv_value
+
+# ==================== preference sampling ====================
+
+def sample_preferences_uniform(num_rewards, num_samples):
+    """Sample preferences uniformly from the simplex."""
+    preferences = []
+    for i in range(num_samples):
+        # Uniform sampling on simplex
+        if num_rewards == 2:
+            # For 2D, use evenly spaced points
+            w = i / (num_samples - 1) if num_samples > 1 else 0.5
+            preferences.append([w, 1 - w])
+        else:
+            # For higher dimensions, use Dirichlet
+            pref = np.random.dirichlet(np.ones(num_rewards))
+            preferences.append(pref.tolist())
+    return preferences
 
 # ==================== key function: convert architectures ====================
 

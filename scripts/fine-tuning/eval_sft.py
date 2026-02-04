@@ -99,7 +99,7 @@ else:
     instructions = Instructions_summary()
 print(f"Size of the validation set: {len(valid_dataset)}")
 
-valid_batch_size = 1
+valid_batch_size = 8
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)

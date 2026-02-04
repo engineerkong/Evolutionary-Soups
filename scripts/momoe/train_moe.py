@@ -12,10 +12,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-from moe_architecture import (
-    RewardModels,
-    MoEGatingTrainer
-)
+from moe_architecture import MoEGatingTrainer
 from moe_utils import (
     convert_to_moe_model,
     save_moe_gating_weights
@@ -33,6 +30,7 @@ from scripts.utils.utils import (
     Instructions,
     Instructions_summary
 )
+from scripts.utils.multi_reward_models import RewardModels
 
 # ========== define paths for two datasets ==========
 hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
@@ -41,7 +39,7 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 # ==================== define script arguments ====================
 @dataclass
 class ScriptArguments:
-    base_model_name: str = field(default="meta-llama/Llama-2-7b-hf")
+    base_model_name: str = field(default="./models/sft/model/")
     lora_expert_paths: List[str] = field(default_factory=lambda: [])
     num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input during training"})
     reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
@@ -52,7 +50,7 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-cfg = load_config('config.yaml')
+cfg = load_config(script_dir / 'config.yaml')
 print(f"Script arguments: {script_args}")
 print(f"Training config: {cfg}")
 
@@ -85,15 +83,15 @@ for name in reward_names:
     reward_model_path_list.append(reward_path_tokenizer_dict[name][0])
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
 
-reward_model = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id)
+reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id)
 rm_tokenizer = AutoTokenizer.from_pretrained(rm_tokenizer_path_list[0])
 
 # ========== convert to MoE model ==========
 moe_model = convert_to_moe_model(
     base_model_name=script_args.base_model_name,
     lora_expert_paths=script_args.lora_expert_paths,
-    subspace_rank=cfg.subspace_rank,
-    d_model=cfg.d_model,
+    subspace_rank=cfg['subspace_rank'],
+    d_model=cfg['d_model'],
     num_rewards=len(reward_names),
     target_device=f"cuda:{gpu_id}"
 )
@@ -118,18 +116,17 @@ else:
     instructions = Instructions_summary()
 print(f"Dataset size: {len(dataset)}")
 
-# ========== create trainer ========== 
+# ========== start training ==========
 trainer = MoEGatingTrainer(
     moe_model=moe_model,
-    reward_model=reward_model,
+    reward_models=reward_models,
     instructions=instructions,
-    learning_rate=cfg.learning_rate,
+    learning_rate=float(cfg['learning_rate']),
     num_rewards=len(reward_names),
     num_pref_samples=script_args.num_pref_samples
 )
 print_trainable_parameters(moe_model)
 
-# ========== start training ==========
 stats = {
     'rewards': [],
     'balance_losses': [],
@@ -142,22 +139,22 @@ stats = {
     'reward_std': [],
 }
 
-epochs = cfg.epochs
+epochs = cfg['epochs']
 for epoch in range(epochs):
     print(f"\nEpoch {epoch + 1}/{epochs}")
     
     dataset_shuffled = dataset.shuffle(seed=epoch)
-    pbar = tqdm(total=len(dataset_shuffled) // cfg.batch_size)
+    pbar = tqdm(total=len(dataset_shuffled) // cfg['batch_size'])
     
-    for i in range(0, len(dataset_shuffled), cfg.batch_size):
-        batch_data = dataset_shuffled[i:i+cfg.batch_size]
+    for i in range(0, len(dataset_shuffled), cfg['batch_size']):
+        batch_data = dataset_shuffled[i:i+cfg['batch_size']]
         
         losses = trainer.train_step_reinforce(
             batch_data,
             tokenizer,
-            alpha_balance=cfg.alpha_balance,
-            alpha_entropy=cfg.alpha_entropy,
-            alpha_hypervolume=cfg.alpha_hypervolume
+            alpha_balance=cfg['alpha_balance'],
+            alpha_entropy=cfg['alpha_entropy'],
+            alpha_hypervolume=cfg['alpha_hypervolume']
         )
         
         # record stats
@@ -173,7 +170,7 @@ for epoch in range(epochs):
         
         # print
         if i % 100 == 0:
-            print(f"\nBatch {i // cfg.batch_size}: "
+            print(f"\nBatch {i // cfg['batch_size']}: "
                     f"Reward: {losses['mean_reward']:.4f}, "
                     f"Balance: {losses['balance_loss']:.4f}, "
                     f"Policy: {losses.get('policy_loss', 0.0):.4f}, "
@@ -187,8 +184,8 @@ for epoch in range(epochs):
         # Regular checkpoint
         if i > 0 and i % 1000 == 0:
             save_path = os.path.join(
-                cfg.save_directory,
-                cfg.wandb_name,
+                script_args.save_directory,
+                script_args.wandb_name,
                 f'batch_{i}'
             )
             os.makedirs(save_path, exist_ok=True)

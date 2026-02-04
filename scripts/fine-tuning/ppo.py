@@ -39,7 +39,7 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-cfg = load_config('config.yaml')['ppo_{}'.format(script_args.exp_type)]
+cfg = load_config(script_dir / 'config.yaml')['ppo_{}'.format(script_args.exp_type)]
 print(f"Script arguments: {script_args}")
 print(f"Training config: {cfg}")
 

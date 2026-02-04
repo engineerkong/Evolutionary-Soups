@@ -25,3 +25,6 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_rs.py 
 ```
 
 ### Multi-Objective Mixture-of-Experts (MOMoE)
+```
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/momoe/train_moe.py --base_model_name './models/sft/summary_sft/model/' --lora_expert_paths './models/ppo/summary_ppo_summary_0302/batch_307/' './models/ppo/summary_ppo_faithful_0302/batch_307/' './models/ppo/summary_ppo_deberta_0302/batch_307/' --reward_names 'summary,faithful,deberta' --num_pref_samples 3 --exp_type 'summary' 2>&1 | tee ./logs/momoe.log
+```

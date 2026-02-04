@@ -1,46 +1,39 @@
-"""
-Additions to moe_architecture.py for preference-conditioned MoE training with hypervolume loss.
-
-These classes should be added to your existing moe_architecture.py file.
-The existing classes (LoRAExpertFFNComplete, AttentionGatingNetwork, MoEFFNLayer, 
-RewardModels, MoEGatingTrainer) should remain unchanged.
-
-Key design decisions:
-1. Expert embeddings are computed EXACTLY as in original (using LoRAExpertEmbedding.extract_ffn_embedding)
-2. No subspace projection - hidden states go directly to query_proj as in original
-3. Preference is concatenated with hidden states before query projection
-"""
-
+import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 import numpy as np
 from pymoo.indicators.hv import HV
-from scripts.utils.utils import load_reward_model, get_rewards
+
+script_dir = Path(__file__).resolve().parent  # project/scripts/momoe
+project_root = script_dir.parent.parent       # project/
+sys.path.insert(0, str(project_root))
+from scripts.utils.utils import load_reward_model, get_rewards, get_clean_data
 
 
-# ==================== LoRA Expert Embedding 提取 ====================
+# ==================== LoRA Expert Embedding extraction ====================
 
 class LoRAExpertEmbedding:
-    """从 LoRA 参数提取 expert embedding"""
+    """Extract expert embedding from LoRA parameters"""
     
     @staticmethod
     def extract_ffn_embedding(gate_lora, up_lora, down_lora, subspace_rank=8):
         """
-        从 FFN 三个投影提取完整 embedding
-        模拟 down(gate * up) 的数据流
+        Extract complete embedding from the three FFN projections
+        Simulate the data flow of down(gate * up)
         
         Args:
             gate_lora: gate_proj LoRA layer
             up_lora: up_proj LoRA layer  
             down_lora: down_proj LoRA layer
-            subspace_rank: 提取的主方向数量
+            subspace_rank: number of principal directions to extract
         
         Returns:
             expert_embedding: [subspace_rank * hidden_dim]
         """
-        # 提取 LoRA 矩阵
+        # Extract LoRA matrices
         gate_A = gate_lora.lora_A['default'].weight  # [rank, 4096]
         gate_B = gate_lora.lora_B['default'].weight  # [11008, rank]
         gate_full = (gate_B @ gate_A).float()  # [11008, 4096], convert to float32 for SVD
@@ -53,14 +46,14 @@ class LoRAExpertEmbedding:
         down_B = down_lora.lora_B['default'].weight  # [4096, rank]
         down_full = (down_B @ down_A).float()  # [4096, 11008]
         
-        # SVD 提取主方向
+        # SVD to extract principal directions
         U_gate, S_gate, _ = torch.svd(gate_full)
         U_up, S_up, _ = torch.svd(up_full)
         
         gate_principal = U_gate[:, :subspace_rank]  # [11008, rank]
         up_principal = U_up[:, :subspace_rank]
         
-        # Gate 和 Up 的交互, Down 投影及展平
+        # Interaction of Gate and Up, projection by Down and flatten
         gate_up_interaction = gate_principal * up_principal  # [11008, rank]
         final_representation = down_full @ gate_up_interaction  # [4096, rank]
         expert_embedding = final_representation.flatten()
@@ -72,8 +65,8 @@ class LoRAExpertEmbedding:
     
 class LoRAExpertFFNComplete(nn.Module):
     """
-    计算完整的 FFN 输出（base + LoRA）
-    在 MoEFFNLayer 中会减去 base_output 得到增量
+    Complete FFN output (base + LoRA)
+    The increment is obtained by subtracting base_output in MoEFFNLayer
     """
     def __init__(self, base_gate_proj, base_up_proj, base_down_proj,
                  gate_proj_lora, up_proj_lora, down_proj_lora, act_fn):
@@ -90,8 +83,8 @@ class LoRAExpertFFNComplete(nn.Module):
     
     def forward(self, x):
         """
-        完整的 FFN: FFN(x) = down(SiLU(gate(x)) * up(x))
-        其中 gate, up, down 都是 base + LoRA
+        Complete FFN: FFN(x) = down(SiLU(gate(x)) * up(x))
+        where gate, up, down are all base + LoRA
         """
         # Gate: base + LoRA -> activate
         gate = self.base_gate_proj(x) + self.gate_proj_lora(x)
@@ -107,71 +100,6 @@ class LoRAExpertFFNComplete(nn.Module):
         output = self.base_down_proj(intermediate) + self.down_proj_lora(intermediate)
         
         return output
-    
-
-# ==================== Reward Model ====================
-
-class RewardModels():
-    def __init__(self, reward_model_path_list, rm_tokenizer_path_list, gpu_id_list, reward_stats_path=None):
-        assert len(reward_model_path_list) == len(rm_tokenizer_path_list)
-        self.reward_model_path_list = reward_model_path_list
-        self.rm_tokenizer_path_list = rm_tokenizer_path_list
-        self.num_rewards = len(reward_model_path_list)
-        self.reward_stats = np.load(reward_stats_path) if reward_stats_path is not None else None
-        self.reward_models = []
-        self.rm_tokenizers = []
-        if type(gpu_id_list) != list:
-            gpu_id_list = [gpu_id_list, gpu_id_list, gpu_id_list]
-    
-        print('Loading reward models .....')
-        for i in range(self.num_rewards):
-            self.reward_models.append(load_reward_model(self.reward_model_path_list[i], gpu_id_list[i]))
-            self.rm_tokenizers.append(AutoTokenizer.from_pretrained(self.rm_tokenizer_path_list[i]))
-    
-        
-    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True):
-        texts_for_rewards = []
-        for i in range(self.num_rewards):
-            if i >= 1 and self.rm_tokenizer_path_list[i] == self.rm_tokenizer_path_list[i-1]:
-                texts_for_rewards.append(texts_for_rewards[-1])
-            elif 'faithful' in self.reward_model_path_list[i]:
-                max_length = min(self.rm_tokenizers[i].model_max_length, 1024)
-                temp_encoded_texts = [self.rm_tokenizers[i](text=r, text_pair=summary_fun(q), return_tensors='pt', truncation=True, max_length=max_length) for q, r in queries_responses]
-                texts_for_rewards.append(temp_encoded_texts)
-            elif 'summary' in self.reward_model_path_list[i] or 'summarization' in self.reward_model_path_list[i]: # reverse prompt and response
-                max_length = min(self.rm_tokenizers[i].model_max_length, 1024)
-                temp_encoded_texts = [self.rm_tokenizers[i](r + " " + self.rm_tokenizers[i].bos_token + " " + summary_fun(q), return_tensors='pt', truncation=True, max_length=max_length) for q, r in queries_responses]
-                texts_for_rewards.append(temp_encoded_texts)
-            elif 'humor' in self.reward_model_path_list[i]: # use only response
-                max_length = min(self.rm_tokenizers[i].model_max_length, 1024)
-                temp_encoded_texts = [self.rm_tokenizers[i](r, return_tensors='pt', truncation=True, max_length=max_length) for q, r in queries_responses]
-                texts_for_rewards.append(temp_encoded_texts)
-            else:
-                max_length = min(self.rm_tokenizers[i].model_max_length, 1024)
-                temp_encoded_texts = [self.rm_tokenizers[i](q, r, return_tensors='pt', truncation=True, max_length=max_length) for q, r in queries_responses]
-                texts_for_rewards.append(temp_encoded_texts)
-
-        # normalize reward
-        rewards = []
-        for i in range(self.num_rewards):
-            if self.reward_stats is not None:
-                if type(self.reward_stats) == list or len(self.reward_stats) == 2 * self.num_rewards:
-                    reward_mean_std = (self.reward_stats[2*i], self.reward_stats[2*i+1])
-                else:
-                    reward_mean_std = self.reward_stats[i]
-            else:
-                reward_mean_std = None
-
-            if not normalize_rewards:
-                reward_mean_std = None
-
-            if 'humor' in self.reward_model_path_list[i] or 'faithful' in self.reward_model_path_list[i]:
-                temp_reward = get_rewards(self.reward_models[i], texts_for_rewards[i], reward_mean_std=reward_mean_std, sub_position=1)
-            else:
-                temp_reward = get_rewards(self.reward_models[i], texts_for_rewards[i], reward_mean_std=reward_mean_std)
-            rewards.append(temp_reward)
-        return rewards
-    
 
 # ==================== Preference-Conditioned Gating Network ====================
 
@@ -190,23 +118,23 @@ class AttentionGatingNetwork(nn.Module):
         self.d_model = d_model
         self.num_rewards = num_rewards
         
-        # === Expert embeddings ===
+        # Expert embeddings
         expert_emb_dim = subspace_rank * hidden_dim
         self.register_buffer(
             'expert_embeddings',
             torch.zeros(num_lora_experts, expert_emb_dim)
         )
         
-        # === Preference projection to hidden_dim ===
+        # Preference projection to hidden_dim
         self.preference_proj = nn.Linear(num_rewards, hidden_dim)
         
-        # === Query projection takes hidden_dim + hidden_dim (hidden + preference) ===
+        # Query projection takes hidden_dim + hidden_dim (hidden + preference)
         self.query_proj = nn.Linear(hidden_dim + hidden_dim, d_model)
         
-        # === Key projection ===
+        # Key projection
         self.key_proj = nn.Linear(expert_emb_dim, d_model)
         
-        # === Temperature ===
+        # Temperature
         self.temperature = nn.Parameter(torch.tensor(1.0))
         
         # Store current preference
@@ -222,7 +150,7 @@ class AttentionGatingNetwork(nn.Module):
     
     def load_expert_embedding(self, expert_idx, gate_lora, up_lora, down_lora):
         """
-        从 LoRA 提取 expert embedding
+        From LoRA extract expert embedding
         """
         with torch.no_grad():
             expert_emb = LoRAExpertEmbedding.extract_ffn_embedding(
@@ -348,10 +276,11 @@ class MoEGatingTrainer:
     3. Hypervolume loss to push towards Pareto front
     """
     
-    def __init__(self, moe_model, reward_model, instructions, learning_rate=1e-5,
+    def __init__(self, moe_model, reward_models, instructions, learning_rate=1e-5,
                  num_rewards=2, num_pref_samples=10): # preference=None
         self.model = moe_model
-        self.reward_model = reward_model
+        self.model.gradient_checkpointing_enable()
+        self.reward_models = reward_models
         self.instructions = instructions
         self.num_rewards = num_rewards
         # self.preference = preference if preference is not None else [1.0 / num_rewards] * num_rewards
@@ -363,17 +292,17 @@ class MoEGatingTrainer:
         
         # Collect gating parameters
         gating_params = []
-        for layer in moe_model.model.layers:
+        for layer in self.model.model.layers:
             if hasattr(layer.mlp, 'gate'):
                 gating_params.extend(layer.mlp.gate.parameters())
         
         self.optimizer = torch.optim.AdamW(gating_params, lr=learning_rate)
         
         # Freeze other parameters
-        for param in moe_model.parameters():
+        for param in self.model.parameters():
             param.requires_grad = False
         
-        for layer in moe_model.model.layers:
+        for layer in self.model.model.layers:
             if hasattr(layer.mlp, 'gate'):
                 for param in layer.mlp.gate.parameters():
                     param.requires_grad = True
@@ -383,9 +312,6 @@ class MoEGatingTrainer:
         # Baseline for variance reduction
         self.reward_baseline = 0.0
         self.baseline_momentum = 0.9
-        
-        # Reference point for hypervolume (assuming rewards in roughly [-2, 2] range)
-        self.hv_reference_point = np.ones(num_rewards) * (-3.0)  # Worse than worst expected
     
     def sample_preferences(self):
         """Sample preferences from Dirichlet distribution (uniform on simplex)."""
@@ -418,13 +344,32 @@ class MoEGatingTrainer:
         points = -np.array(reward_vectors)
         
         # Reference point (negated since we negated objectives)
-        ref_point = -self.hv_reference_point
+        ref_point = np.ones(len(reward_vectors[0])) * 4.0
         
         hv_indicator = HV(ref_point=ref_point)
         hv_value = hv_indicator(points)
         
         return hv_value
-    
+
+    def compute_load_balance(self):
+        """Compute load balance loss"""
+        total_balance_loss = 0.0
+        num_layers = 0
+        
+        for layer in self.model.model.layers:
+            if hasattr(layer.mlp, 'gate') and hasattr(layer.mlp.gate, '_last_routing_weights'):
+                routing_weights = layer.mlp.gate._last_routing_weights
+                expert_usage = routing_weights.mean(dim=[0, 1])
+                target = 1.0 / layer.mlp.num_lora_experts
+                balance_loss = ((expert_usage - target) ** 2).mean()
+                total_balance_loss += balance_loss
+                num_layers += 1
+        
+        if num_layers == 0:
+            return torch.tensor(0.0, requires_grad=True, device=next(self.model.parameters()).device)
+        
+        return total_balance_loss / num_layers
+        
     def forward_with_routing_log_probs(self, input_ids, attention_mask=None, preference=None):
         """Forward pass collecting routing log probs with preference conditioning."""
         # Clear previous routing weights
@@ -498,23 +443,24 @@ class MoEGatingTrainer:
         batch_size = input_ids.shape[0]
         queries = batch['query']
         
-        # Sample preferences for this batch
         sampled_preferences = self.sample_preferences()
-        
-        # Collect all reward vectors for hypervolume
+    
         all_reward_vectors = []
         all_scalarized_rewards = []
-        all_preferences_used = []
         
-        # ===== Generation Phase for each preference =====
-        self.model.eval()
+        # Accumulate gradients across preferences
+        self.optimizer.zero_grad()
+        accumulated_policy_loss = 0.0
+        accumulated_entropy = 0.0
+        accumulated_balance_loss = 0.0
         
-        for pref in sampled_preferences:
-            pref_tensor = torch.tensor(pref, dtype=torch.float32, device=next(self.model.parameters()).device)
+        for pref_idx, pref in enumerate(sampled_preferences):
             self.set_model_preference(pref)
             
+            # === Generation Phase (no grad) ===
+            self.model.eval()
             with torch.no_grad():
-                generation_outputs = self.model.generate(
+                response_tensors = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     max_new_tokens=128,
@@ -522,58 +468,65 @@ class MoEGatingTrainer:
                     temperature=0.7,
                     top_p=1.0,
                     pad_token_id=tokenizer.pad_token_id,
-                    return_dict_in_generate=True,
-                    output_scores=False
                 )
-                response_tensors = generation_outputs.sequences
+                # response_tensors = generation_outputs.sequences
             
-            # Decode responses
-            full_responses = tokenizer.batch_decode(response_tensors, skip_special_tokens=False)
-            responses = []
+            # Decode and get rewards
+            full_responses = tokenizer.batch_decode(response_tensors)
+            full_prompts = tokenizer.batch_decode(input_ids)
+            full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
             
-            for full_resp in full_responses:
-                response = full_resp.strip('[PAD] ')
-                response = response.strip('<unk>')
-                temp_resp = response.strip('<s>').strip('</s>')
-                temp_resp = temp_resp.split('\n\nHuman:')[0].strip()
-                temp_resp = temp_resp.split('\nHuman:')[0].strip()
-                temp_resp = temp_resp.split('\n\nAssistant:')[0].strip()
-                temp_resp = temp_resp.split('\nAssistant:')[0].strip()
-                temp_resp = temp_resp.split('\n\n\n')[0].strip()
-                temp_resp = temp_resp.split('###')[0].strip()
-                responses.append(temp_resp)
-            
-            # Compute rewards
-            texts_merge = [q + r for q, r in zip(queries, responses)]
             queries_responses = [
                 (self.instructions.get_input(text), self.instructions.get_response(text))
-                for text in texts_merge
+                for text in full_responses
             ]
             
             if hasattr(self.instructions, 'get_post'):
-                rewards_list = self.reward_model.get_reward_model_scores(
-                    queries_responses, 
-                    self.instructions.get_post
+                rewards_list = self.reward_models.get_reward_model_scores(
+                    queries_responses, self.instructions.get_post
                 )
             else:
-                rewards_list = self.reward_model.get_reward_model_scores(queries_responses)
+                rewards_list = self.reward_models.get_reward_model_scores(queries_responses)
             
-            # rewards_list is [num_rewards][batch_size]
+            # Compute rewards for this preference
             for j in range(batch_size):
                 reward_vector = [rewards_list[k][j] for k in range(self.num_rewards)]
                 all_reward_vectors.append(reward_vector)
-                
-                # Scalarized reward with current preference
                 scalarized = sum(pref[k] * reward_vector[k] for k in range(self.num_rewards))
                 all_scalarized_rewards.append(scalarized)
-                all_preferences_used.append(pref)
-        
-        # Convert to tensors
-        model_device = next(self.model.parameters()).device
-        rewards_tensor = torch.tensor(all_scalarized_rewards, dtype=torch.float32, device=model_device)
-        rewards_normalized = rewards_tensor - self.reward_baseline
+            
+            # === REINFORCE Update (with grad) - immediately after generation ===
+            self.model.train()
+            
+            pref_rewards = torch.tensor(
+                all_scalarized_rewards[-batch_size:],  # Only this preference's rewards
+                dtype=torch.float32, 
+                device=input_ids.device
+            )
+            pref_rewards_normalized = pref_rewards - self.reward_baseline
+            
+            outputs, routing_log_probs = self.forward_with_routing_log_probs(
+                input_ids, attention_mask, preference=pref
+            )
+            
+            if routing_log_probs:
+                for log_probs in routing_log_probs:
+                    probs = torch.exp(log_probs)
+                    max_log_probs = log_probs.max(dim=-1)[0]
+                    policy_loss = -(pref_rewards_normalized.unsqueeze(-1) * max_log_probs).mean()
+                    entropy = -(probs * log_probs).sum(dim=-1).mean()
+                    
+                    accumulated_policy_loss += policy_loss / len(sampled_preferences)
+                    accumulated_entropy += entropy / len(sampled_preferences)
+            
+            accumulated_balance_loss += self.compute_load_balance() / len(sampled_preferences)
+            
+            # Clear cache after each preference
+            del response_tensors, outputs, routing_log_probs
+            torch.cuda.empty_cache()
         
         # Update baseline
+        rewards_tensor = torch.tensor(all_scalarized_rewards, dtype=torch.float32)
         self.reward_baseline = (
             self.baseline_momentum * self.reward_baseline +
             (1 - self.baseline_momentum) * rewards_tensor.mean().item()
@@ -581,61 +534,14 @@ class MoEGatingTrainer:
         
         # Compute hypervolume
         hv_value = self.compute_hypervolume(all_reward_vectors)
-        
-        # ===== REINFORCE Update =====
-        self.model.train()
-        self.optimizer.zero_grad()
-        
-        total_policy_loss = 0.0
-        total_entropy = 0.0
-        num_forward = 0
-        
-        # Forward pass for each preference to compute gradients
-        for pref_idx, pref in enumerate(sampled_preferences):
-            self.set_model_preference(pref)
-            
-            outputs, routing_log_probs = self.forward_with_routing_log_probs(
-                input_ids, attention_mask, preference=pref
-            )
-            
-            if routing_log_probs:
-                # Get rewards for this preference (batch_size samples)
-                start_idx = pref_idx * batch_size
-                end_idx = start_idx + batch_size
-                pref_rewards = rewards_normalized[start_idx:end_idx]
-                
-                for log_probs in routing_log_probs:
-                    probs = torch.exp(log_probs)
-                    
-                    # Policy loss
-                    max_log_probs = log_probs.max(dim=-1)[0]  # [batch, seq]
-                    policy_loss_layer = -(pref_rewards.unsqueeze(-1) * max_log_probs).mean()
-                    total_policy_loss += policy_loss_layer
-                    
-                    # Entropy
-                    entropy = -(probs * log_probs).sum(dim=-1).mean()
-                    total_entropy += entropy
-                
-                num_forward += len(routing_log_probs)
-        
-        if num_forward > 0:
-            policy_loss = total_policy_loss / num_forward
-            entropy_bonus = total_entropy / num_forward
-        else:
-            model_device = next(self.model.parameters()).device
-            policy_loss = torch.tensor(0.0, requires_grad=True, device=model_device)
-            entropy_bonus = torch.tensor(0.0, requires_grad=True, device=model_device)
-        
-        # Load balance loss
-        balance_loss = self.compute_load_balance_loss()
-        
-        # Hypervolume loss: negative HV (we want to maximize HV, so minimize -HV)
-        # Normalized by number of samples for stability
         hv_loss = -hv_value / len(all_reward_vectors)
-        hv_loss_tensor = torch.tensor(hv_loss, dtype=policy_loss.dtype, device=policy_loss.device)
+        hv_loss_tensor = torch.tensor(hv_loss, device=input_ids.device)
         
-        # Total loss (hv_loss is float, doesn't backprop but guides overall training)
-        total_loss = policy_loss + alpha_balance * balance_loss - alpha_entropy * entropy_bonus + alpha_hypervolume * hv_loss_tensor
+        # Total loss
+        total_loss = (accumulated_policy_loss + 
+                    alpha_balance * accumulated_balance_loss - 
+                    alpha_entropy * accumulated_entropy + 
+                    alpha_hypervolume * hv_loss_tensor)
         
         if total_loss.requires_grad:
             total_loss.backward()
@@ -646,32 +552,13 @@ class MoEGatingTrainer:
             self.optimizer.step()
         
         return {
-            'policy_loss': policy_loss.item() if isinstance(policy_loss, torch.Tensor) else policy_loss,
-            'balance_loss': balance_loss.item() if isinstance(balance_loss, torch.Tensor) else balance_loss,
-            'entropy_loss': -entropy_bonus.item() if isinstance(entropy_bonus, torch.Tensor) else -entropy_bonus,
+            'policy_loss': accumulated_policy_loss.item(),
+            'balance_loss': accumulated_balance_loss.item(),
+            'entropy_loss': -accumulated_entropy.item(),
             'hypervolume_loss': hv_loss,
             'hypervolume_value': hv_value,
-            'total_loss': total_loss.item() if isinstance(total_loss, torch.Tensor) else total_loss,
+            'total_loss': total_loss.item(),
             'mean_reward': rewards_tensor.mean().item(),
             'std_reward': rewards_tensor.std().item(),
             'baseline': self.reward_baseline
         }
-    
-    def compute_load_balance_loss(self):
-        """Compute load balance loss"""
-        total_balance_loss = 0.0
-        num_layers = 0
-        
-        for layer in self.model.model.layers:
-            if hasattr(layer.mlp, 'gate') and hasattr(layer.mlp.gate, '_last_routing_weights'):
-                routing_weights = layer.mlp.gate._last_routing_weights
-                expert_usage = routing_weights.mean(dim=[0, 1])
-                target = 1.0 / layer.mlp.num_lora_experts
-                balance_loss = ((expert_usage - target) ** 2).mean()
-                total_balance_loss += balance_loss
-                num_layers += 1
-        
-        if num_layers == 0:
-            return torch.tensor(0.0, requires_grad=True, device=next(self.model.parameters()).device)
-        
-        return total_balance_loss / num_layers
