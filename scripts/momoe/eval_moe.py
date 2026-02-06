@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 import torch
 import numpy as np
 import pandas as pd
@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 from trl import set_seed
 from accelerate import Accelerator
 from moe_architecture import MoEGatingTrainer
-from moe_utils import compute_hypervolume, sample_preferences_uniform, convert_to_moe_model, load_moe_gating_weights
+from moe_utils import compute_hypervolume, convert_to_moe_model, load_moe_gating_weights
 
 script_dir = Path(__file__).resolve().parent  # project/scripts/momoe
 project_root = script_dir.parent.parent       # project/
@@ -24,7 +24,8 @@ from scripts.utils.utils import (
     build_dataset_eval_ppo,
     build_dataset_summary_eval_ppo,
     get_clean_data,
-    load_config
+    load_config,
+    sample_preferences_uniform
 )
 from scripts.utils.multi_reward_models import RewardModels
 
@@ -35,14 +36,15 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    base_model_name: str = field(default='meta-llama/Llama-2-7b-hf')
-    lora_expert_paths: list = field(default_factory=list, metadata={"help": "list of paths to LoRA expert models"})
+    base_model_name: str = field(default="./models/sft/model/", metadata={"help": "local path to the sft model"})
+    lora_expert_paths: List[str] = field(default_factory=lambda: [], metadata={"help": "list of paths to LoRA expert models"})
     checkpoint_path: str = field(default='', metadata={"help": "path to MoE gating weights checkpoint"})
-    reward_names: str = field(default='harmless,helpful', metadata={"help": "comma-separated reward model names"})
     num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input"})
-    num_eval_samples: Optional[int] = field(default=100, metadata={"help": "number of dataset samples to evaluate"})
-    exp_type: str = field(default='assistant', metadata={"help": "experiment type: 'assistant' or 'summary'"})
-    save_directory: str = field(default='./moe_eval/')
+    num_eval_samples: Optional[int] = field(default=0, metadata={"help": "number of dataset samples to evaluate"})
+    reward_names: Optional[str] = field(default='harmless,helpful', metadata={"help": "comma-separated reward model names"})
+    exp_type: Optional[str] = field(default='assistant', metadata={"help": "experiment type: 'assistant' or 'summary'"})
+    save_directory: str = field(default='./results/momoe/')
+    wandb_name: str = field(default="assistant_moemoe", metadata={"help": "name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
@@ -111,7 +113,7 @@ else:
 print(f"Full dataset size: {len(valid_dataset)}")
 
 # Limit to num_eval_samples
-if script_args.num_eval_samples is not None and script_args.num_eval_samples < len(valid_dataset):
+if script_args.num_eval_samples > 0 and script_args.num_eval_samples < len(valid_dataset):
     valid_dataset = valid_dataset.select(range(script_args.num_eval_samples))
 print(f"Evaluation dataset size: {len(valid_dataset)}")
 
@@ -151,9 +153,6 @@ model.eval()
 all_results = []  # List of dicts for DataFrame
 per_input_hv = []  # HV per input (across all preferences)
 per_input_rewards = []  # Reward vectors per input
-
-# Reference point for HV calculation
-ref_point = [-4.0] * len(reward_names) 
 
 # Create trainer for utility functions
 trainer = MoEGatingTrainer(
@@ -237,8 +236,7 @@ with torch.no_grad():
         # Compute hypervolume for each input in batch (after all preferences)
         for local_idx in range(batch_size):
             input_hv = compute_hypervolume(
-                per_input_rewards[input_idx + local_idx], 
-                ref_point
+                per_input_rewards[input_idx + local_idx]
             )
             per_input_hv.append(input_hv)
         
@@ -253,42 +251,83 @@ print("Evaluation Summary")
 print("=" * 60)
 
 results_df = pd.DataFrame(all_results)
-hv_array = np.array(per_input_hv)
 
 # Overview
-print(f"\nInputs: {len(per_input_hv)} | Preferences/input: {script_args.num_pref_samples} | Total generations: {len(all_results)}")
+print(f"\nInputs: {len(valid_dataset)} | Preferences/input: {script_args.num_pref_samples} | Total generations: {len(all_results)}")
 
-# Per-objective rewards
-print(f"\nPer-Objective Rewards:")
+# Per-objective rewards (overall)
+print(f"\nPer-Objective Rewards (Overall):")
 for name in reward_names:
     col = f'reward_{name}'
     print(f"  {name}: {results_df[col].mean():.4f} ± {results_df[col].std():.4f} [{results_df[col].min():.4f}, {results_df[col].max():.4f}]")
 
-# Scalarized reward
-print(f"\nScalarized Reward: {results_df['scalarized_reward'].mean():.4f} ± {results_df['scalarized_reward'].std():.4f}")
+# Scalarized reward (overall)
+print(f"\nScalarized Reward (Overall): {results_df['scalarized_reward'].mean():.4f} ± {results_df['scalarized_reward'].std():.4f}")
 
-# Hypervolume
+# Per-preference sample results
+print(f"\n" + "-" * 60)
+print("Per-Preference Sample Results:")
+print("-" * 60)
+
+summary_rows = []
+
+# Add overall summary row
 all_reward_vectors = [[r[f'reward_{name}'] for name in reward_names] for r in all_results]
 global_hv = compute_hypervolume(all_reward_vectors)
-print(f"\nHypervolume:")
-print(f"  Per-input: {hv_array.mean():.4f} ± {hv_array.std():.4f} [{hv_array.min():.4f}, {hv_array.max():.4f}]")
-print(f"  Global:    {global_hv:.4f}")
 
-# Save results
-results_df.to_csv(os.path.join(script_args.save_directory, 'eval_results.csv'), index=False)
-pd.DataFrame({'input_idx': range(len(per_input_hv)), 'hypervolume': per_input_hv}).to_csv(os.path.join(script_args.save_directory, 'per_input_hv.csv'), index=False)
-
-summary = {
-    'num_inputs': len(per_input_hv),
-    'num_preferences': script_args.num_pref_samples,
-    'mean_hv': hv_array.mean(),
-    'std_hv': hv_array.std(),
-    'global_hv': global_hv,
+overall_row = {
+    'type': 'overall',
+    'pref_idx': -1,
+    **{f'pref_{name}': None for name in reward_names},
     'mean_scalarized_reward': results_df['scalarized_reward'].mean(),
+    'std_scalarized_reward': results_df['scalarized_reward'].std(),
     **{f'mean_reward_{name}': results_df[f'reward_{name}'].mean() for name in reward_names},
     **{f'std_reward_{name}': results_df[f'reward_{name}'].std() for name in reward_names},
+    'hypervolume': global_hv,
+    'num_inputs': len(valid_dataset),
+    'num_preferences': script_args.num_pref_samples,
 }
-pd.DataFrame([summary]).to_csv(os.path.join(script_args.save_directory, 'eval_summary.csv'), index=False)
+summary_rows.append(overall_row)
 
-print(f"\nResults saved to: {script_args.save_directory}")
+# Add per-preference rows
+for pref_idx, pref in enumerate(sampled_preferences):
+    pref_df = results_df[results_df['pref_idx'] == pref_idx]
+    pref_str = ", ".join([f"{reward_names[k]}={pref[k]:.2f}" for k in range(len(reward_names))])
+    
+    print(f"\nPref {pref_idx + 1}: [{pref_str}]")
+    
+    pref_row = {
+        'type': 'preference',
+        'pref_idx': pref_idx,
+        **{f'pref_{name}': pref[k] for k, name in enumerate(reward_names)},
+        'mean_scalarized_reward': pref_df['scalarized_reward'].mean(),
+        'std_scalarized_reward': pref_df['scalarized_reward'].std(),
+        'hypervolume': None,
+        'num_inputs': None,
+        'num_preferences': None,
+    }
+    
+    for name in reward_names:
+        col = f'reward_{name}'
+        mean_val = pref_df[col].mean()
+        std_val = pref_df[col].std()
+        print(f"  {name}: {mean_val:.4f} ± {std_val:.4f}")
+        pref_row[f'mean_reward_{name}'] = mean_val
+        pref_row[f'std_reward_{name}'] = std_val
+    
+    print(f"  Scalarized: {pref_df['scalarized_reward'].mean():.4f} ± {pref_df['scalarized_reward'].std():.4f}")
+    summary_rows.append(pref_row)
+
+print("-" * 60)
+
+# Hypervolume
+print(f"\nHypervolume (Global): {global_hv:.4f}")
+
+# Save results
+results_df.to_csv(os.path.join(output_dir, 'eval_results.csv'), index=False)
+pd.DataFrame(summary_rows).to_csv(os.path.join(output_dir, 'eval_summary.csv'), index=False)
+
+print(f"\nResults saved to: {output_dir}")
+print("  - eval_results.csv (all generations)")
+print("  - eval_summary.csv (overall + per-preference summary)")
 print("=" * 60)

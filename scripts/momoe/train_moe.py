@@ -39,14 +39,14 @@ summary_dataset_path = 'openai/summarize_from_feedback'
 # ==================== define script arguments ====================
 @dataclass
 class ScriptArguments:
-    base_model_name: str = field(default="./models/sft/model/")
-    lora_expert_paths: List[str] = field(default_factory=lambda: [])
+    base_model_name: str = field(default="./models/sft/model/", metadata={"help": "local path to the sft model"})
+    lora_expert_paths: List[str] = field(default_factory=lambda: [], metadata={"help": "list of paths to LoRA expert models"})
     num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input during training"})
-    reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
+    reward_names: Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
     log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
-    save_directory: str = field(default="./moe_models/", metadata={"help": "directory to save the model"})
-    wandb_name: str = field(default="moe_gating_training", metadata={"help": "name for this experiment"})
+    save_directory: str = field(default="./models/momoe/", metadata={"help": "directory to save the model"})
+    wandb_name: str = field(default="assistant_moemoe", metadata={"help": "name for this experiment"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]

@@ -31,7 +31,55 @@ def print_trainable_parameters(model):
     print(
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
+    
 
+def sample_preferences_uniform(num_rewards, num_samples):
+    """Sample preferences uniformly from the simplex using a grid."""
+    if num_rewards == 2:
+        # For 2D, use evenly spaced points
+        preferences = []
+        for i in range(num_samples):
+            w = i / (num_samples - 1) if num_samples > 1 else 0.5
+            preferences.append([w, 1 - w])
+        return preferences
+    else:
+        # For higher dimensions, generate grid points on simplex
+        # Find appropriate grid resolution to get ~num_samples points
+        from itertools import combinations_with_replacement
+        
+        def simplex_grid(dim, resolution):
+            """Generate evenly spaced points on a simplex."""
+            points = []
+            # Generate all combinations that sum to resolution
+            for combo in combinations_with_replacement(range(resolution + 1), dim - 1):
+                # Convert to differences to get partition
+                prev = 0
+                parts = []
+                for val in combo:
+                    parts.append(val - prev)
+                    prev = val
+                parts.append(resolution - prev)
+                # Normalize to get point on simplex
+                point = [p / resolution for p in parts]
+                points.append(point)
+            return points
+        
+        # Binary search for resolution that gives ~num_samples points
+        # Number of points for dim d and resolution r is C(r + d - 1, d - 1)
+        from math import comb
+        resolution = 1
+        while comb(resolution + num_rewards - 1, num_rewards - 1) < num_samples:
+            resolution += 1
+        
+        points = simplex_grid(num_rewards, resolution)
+        
+        # If we have more points than needed, subsample evenly
+        if len(points) > num_samples:
+            indices = np.linspace(0, len(points) - 1, num_samples, dtype=int)
+            points = [points[i] for i in indices]
+        
+        return points
+    
 
 class Instructions:
     response_split = "\n\nAssistant:"

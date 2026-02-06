@@ -17,7 +17,7 @@ script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, merge_weights_with_preference, \
+from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, merge_weights_with_preference, sample_preferences_uniform, \
                                 Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo
 tqdm.pandas()
 
@@ -32,6 +32,7 @@ class ScriptArguments:
     ppo_model_name1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
     ppo_model_name2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
     ppo_model_name3: Optional[str]=field(default='')
+    num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input"})
     reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
     exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
     save_directory: Optional[str] = field(default='./results/ppo_rs/', metadata={"help": "directory to save results"})
@@ -160,29 +161,14 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
 # ========== start evaluation ==========
 print("evaluating........")
 # preference list
-if reward_models.num_rewards == 3:
-    preferences = np.array([
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0],
-        [0.2, 0.2, 0.6],
-        [0.2, 0.6, 0.2],
-        [0.33, 0.33, 0.33],
-        [0.6, 0.2, 0.2],
-        [1.0, 0.0, 0.0], 
-        ])
-elif reward_models.num_rewards == 2:
-    preferences = np.array([
-        [0.0, 1.0],
-        [0.25, 0.75],
-        [0.5, 0.5],
-        [0.75, 0.25],
-        [1.0, 0.0],
-        ])
-else:
-    raise NotImplementedError
+sampled_preferences = sample_preferences_uniform(reward_models.num_rewards, num_samples=script_args.num_pref_samples)
+print(f"\nSampled {len(sampled_preferences)} preferences:")
+for i, pref in enumerate(sampled_preferences):
+    pref_str = ", ".join([f"{reward_names[k]}={pref[k]:.2f}" for k in range(len(reward_names))])
+    print(f"  Pref {i+1}: [{pref_str}]")
 
-for k in range(0, len(preferences)):
-    preference = preferences[k]
+for k in range(0, len(sampled_preferences)):
+    preference = sampled_preferences[k]
     temp_save_path = output_dir + '/temp_merged_model_pref_{}_{}'.format('_'.join([str(p) for p in preference]), k)
     if process_id == 0:
         if len(preference) == 3:

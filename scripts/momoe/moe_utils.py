@@ -36,23 +36,6 @@ def compute_hypervolume(reward_vectors):
     
     return hv_value
 
-# ==================== preference sampling ====================
-
-def sample_preferences_uniform(num_rewards, num_samples):
-    """Sample preferences uniformly from the simplex."""
-    preferences = []
-    for i in range(num_samples):
-        # Uniform sampling on simplex
-        if num_rewards == 2:
-            # For 2D, use evenly spaced points
-            w = i / (num_samples - 1) if num_samples > 1 else 0.5
-            preferences.append([w, 1 - w])
-        else:
-            # For higher dimensions, use Dirichlet
-            pref = np.random.dirichlet(np.ones(num_rewards))
-            preferences.append(pref.tolist())
-    return preferences
-
 # ==================== key function: convert architectures ====================
 
 def convert_to_moe_model(base_model_name, lora_expert_paths, subspace_rank=8, d_model=512, num_rewards=2, target_device=None):
