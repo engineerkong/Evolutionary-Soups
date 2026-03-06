@@ -492,7 +492,7 @@ class MoEGatingTrainer:
             for j in range(batch_size):
                 reward_vector = [rewards_list[k][j] for k in range(self.num_rewards)]
                 all_reward_vectors.append(reward_vector)
-                scalarized = sum(pref[k] * reward_vector[k] for k in range(self.num_rewards))
+                scalarized = sum(pref[k] * reward_vector[k] for k in range(self.num_rewards)) # TODO
                 all_scalarized_rewards.append(scalarized)
             
             # === REINFORCE Update (with grad) - immediately after generation ===
@@ -514,7 +514,7 @@ class MoEGatingTrainer:
                     probs = torch.exp(log_probs)
                     max_log_probs = log_probs.max(dim=-1)[0]
                     policy_loss = -(pref_rewards_normalized.unsqueeze(-1) * max_log_probs).mean()
-                    entropy = -(probs * log_probs).sum(dim=-1).mean()
+                    entropy = (probs * log_probs).sum(dim=-1).mean()
                     
                     accumulated_policy_loss += policy_loss / len(sampled_preferences)
                     accumulated_entropy += entropy / len(sampled_preferences)
@@ -539,9 +539,9 @@ class MoEGatingTrainer:
         
         # Total loss
         total_loss = (accumulated_policy_loss + 
-                    alpha_balance * accumulated_balance_loss - 
-                    alpha_entropy * accumulated_entropy + 
-                    alpha_hypervolume * hv_loss_tensor)
+                    alpha_balance * accumulated_balance_loss + 
+                    alpha_entropy * accumulated_entropy) 
+                    # + alpha_hypervolume * hv_loss_tensor
         
         if total_loss.requires_grad:
             total_loss.backward()
@@ -554,7 +554,7 @@ class MoEGatingTrainer:
         return {
             'policy_loss': accumulated_policy_loss.item(),
             'balance_loss': accumulated_balance_loss.item(),
-            'entropy_loss': -accumulated_entropy.item(),
+            'entropy_loss': accumulated_entropy.item(),
             'hypervolume_loss': hv_loss,
             'hypervolume_value': hv_value,
             'total_loss': total_loss.item(),

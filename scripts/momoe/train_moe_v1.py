@@ -9,11 +9,9 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, HfArgumentParser
 from trl import set_seed
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-
-from moe_architecture import MoEGatingTrainer
-from moe_utils import (
+# adapt versions
+from moe_architecture_v1 import MoEGatingTrainer
+from moe_utils_v1 import (
     convert_to_moe_model,
     save_moe_gating_weights
 )
@@ -95,6 +93,7 @@ moe_model = convert_to_moe_model(
     num_rewards=len(reward_names),
     target_device=f"cuda:{gpu_id}"
 )
+moe_model = accelerator.prepare(moe_model)
 tokenizer = load_main_tokenizer(script_args.base_model_name)
 
 # ========== prepare dataset and dataloader ==========
@@ -115,6 +114,20 @@ else:
     )
     instructions = Instructions_summary()
 print(f"Dataset size: {len(dataset)}")
+if accelerator.num_processes > 1:
+    # Deterministic shard sizing (no collective needed): each shard is either
+    # floor(N/world_size) or floor(N/world_size)+1. We trim to floor(N/world_size)
+    # to guarantee identical number of optimizer steps across ranks.
+    min_len = len(dataset) // accelerator.num_processes
+    dataset = dataset.shard(
+        num_shards=accelerator.num_processes,
+        index=accelerator.process_index,
+        contiguous=True
+    )
+    print(f"Rank {accelerator.process_index}: local shard size {len(dataset)}")
+    if len(dataset) > min_len:
+        dataset = dataset.select(range(min_len))
+    print(f"Rank {accelerator.process_index}: synchronized shard size {len(dataset)}")
 
 # ========== start training ==========
 trainer = MoEGatingTrainer(
@@ -129,17 +142,17 @@ print_trainable_parameters(moe_model)
 
 stats = {
     'rewards': [],
-    'balance_losses': [],
     'policy_losses': [],
+    'hv_policy_losses': [],
+    'balance_losses': [],
     'entropy_losses': [],
-    'hypervolume_losses': [],
-    'hypervolume_values': [],
     'total_losses': [],
     'reward_mean': [],
     'reward_std': [],
 }
 
 epochs = cfg['epochs']
+global_step = 0
 for epoch in range(epochs):
     print(f"\nEpoch {epoch + 1}/{epochs}")
     
@@ -152,57 +165,59 @@ for epoch in range(epochs):
         losses = trainer.train_step_reinforce(
             batch_data,
             tokenizer,
+            alpha_hypervolume=cfg['alpha_hypervolume'],
             alpha_balance=cfg['alpha_balance'],
-            alpha_entropy=cfg['alpha_entropy'],
-            alpha_hypervolume=cfg['alpha_hypervolume']
+            alpha_entropy=cfg['alpha_entropy']
         )
         
         # record stats
         stats['rewards'].append(losses['mean_reward'])
-        stats['balance_losses'].append(losses['balance_loss'])
         stats['policy_losses'].append(losses.get('policy_loss', 0.0))
+        stats['hv_policy_losses'].append(losses.get('hv_policy_loss', 0.0))
+        stats['balance_losses'].append(losses['balance_loss'])
         stats['entropy_losses'].append(losses.get('entropy_loss', 0.0))
-        stats['hypervolume_losses'].append(losses.get('hypervolume_loss', 0.0))
-        stats['hypervolume_values'].append(losses.get('hypervolume_value', 0.0)) # ?
         stats['total_losses'].append(losses['total_loss'])
         stats['reward_mean'].append(losses['mean_reward'])
         stats['reward_std'].append(losses.get('std_reward', 0.0))
+        global_step += 1
         
         # print
         if i % 100 == 0:
             print(f"\nBatch {i // cfg['batch_size']}: "
                     f"Reward: {losses['mean_reward']:.4f}, "
-                    f"Balance: {losses['balance_loss']:.4f}, "
                     f"Policy: {losses.get('policy_loss', 0.0):.4f}, "
+                    f"HV-Policy: {losses.get('hv_policy_loss', 0.0):.4f}, "
+                    f"Balance: {losses['balance_loss']:.4f}, "
                     f"Entropy: {losses.get('entropy_loss', 0.0):.4f}, "
-                    f"HV Loss: {losses.get('hypervolume_loss', 0.0):.4f}, "
-                    f"HV Value: {losses.get('hypervolume_value', 0.0):.4f}, "
                     f"Total: {losses['total_loss']:.4f}")
         
         pbar.update(1)
         
         # Regular checkpoint
-        if i > 0 and i % 1000 == 0:
+        if global_step > 0 and global_step % 200 == 0:
             save_path = os.path.join(
                 script_args.save_directory,
                 script_args.wandb_name,
-                f'batch_{i}'
+                f'step_{global_step}'
             )
             os.makedirs(save_path, exist_ok=True)
             
             # Save only gating weights and tokenizer
-            save_moe_gating_weights(moe_model, save_path)
-            tokenizer.save_pretrained(save_path)
-            
-            # Save training stats
-            torch.save({
-                'epoch': epoch,
-                'batch': i,
-                'baseline': trainer.reward_baseline,
-                'stats': stats
-            }, os.path.join(save_path, 'training_state.pt'))
-            
-            print(f"\nCheckpoint saved to {save_path}")
+            if accelerator.is_main_process:
+                save_moe_gating_weights(moe_model, save_path)
+                tokenizer.save_pretrained(save_path)
+                
+                # Save training stats
+                torch.save({
+                    'epoch': epoch,
+                    'batch': i,
+                    'global_step': global_step,
+                    'baseline': trainer.reward_baseline,
+                    'hv_baseline': trainer.hv_baseline,
+                    'stats': stats
+                }, os.path.join(save_path, 'training_state.pt'))
+                
+                print(f"\nCheckpoint saved to {save_path}")
     
     pbar.close()
     
@@ -210,15 +225,17 @@ for epoch in range(epochs):
     save_path = os.path.join(
         script_args.save_directory,
         script_args.wandb_name,
-        f'epoch_{epoch}_final'
+        f'epoch_{epoch + 1}_step_{global_step}_final'
     )
     os.makedirs(save_path, exist_ok=True)
-    save_moe_gating_weights(moe_model, save_path)
-    tokenizer.save_pretrained(save_path)
-    
-    # save training stats
-    df = pd.DataFrame(stats)
-    df.to_csv(os.path.join(output_dir, 'data.csv'))
+    if accelerator.is_main_process:
+        save_moe_gating_weights(moe_model, save_path)
+        tokenizer.save_pretrained(save_path)
+        
+        # save training stats
+        df = pd.DataFrame(stats)
+        df.to_csv(os.path.join(output_dir, 'data.csv'))
 
-print("Training complete!")
-print(f"Final model saved to: {save_path}")
+if accelerator.is_main_process:
+    print("Training complete!")
+    print(f"Final model saved to: {save_path}")

@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional, List
 import torch
@@ -11,8 +12,14 @@ from transformers import DataCollatorWithPadding, AutoTokenizer, HfArgumentParse
 from torch.utils.data import DataLoader
 from trl import set_seed
 from accelerate import Accelerator
-from moe_architecture import MoEGatingTrainer
-from moe_utils import compute_hypervolume, convert_to_moe_model, load_moe_gating_weights
+# adapt versions
+from moe_architecture_v2 import MoEGatingTrainer
+from moe_utils_v2 import (
+    compute_hypervolume,
+    convert_to_moe_model,
+    load_moe_gating_weights,
+    resolve_gating_checkpoint_path,
+)
 
 script_dir = Path(__file__).resolve().parent  # project/scripts/momoe
 project_root = script_dir.parent.parent       # project/
@@ -51,6 +58,8 @@ script_args = parser.parse_args_into_dataclasses()[0]
 cfg = load_config(script_dir / 'config.yaml')
 print(f"Script arguments: {script_args}")
 print(f"Training config: {cfg}")
+update_per_preference = bool(cfg.get('update_per_preference', True))
+print(f"Expected training update mode: {'per-preference step' if update_per_preference else 'accumulated single-step'}")
 
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 print('output dir: ', output_dir)
@@ -95,8 +104,13 @@ model = convert_to_moe_model(
 )
 tokenizer = load_main_tokenizer(script_args.base_model_name)
 
-print(f"Loading gating weights from: {script_args.checkpoint_path}")
-load_moe_gating_weights(model, script_args.checkpoint_path)
+resolved_checkpoint_path = resolve_gating_checkpoint_path(script_args.checkpoint_path)
+print(f"Loading gating weights from: {resolved_checkpoint_path}")
+weights_loaded = load_moe_gating_weights(model, resolved_checkpoint_path)
+if not weights_loaded:
+    raise FileNotFoundError(
+        f"Missing gating checkpoint at: {resolved_checkpoint_path}/gating_weights.pt"
+    )
 
 # ========== prepare evaluation dataset and dataloader ==========
 if script_args.exp_type == 'assistant':
@@ -111,11 +125,27 @@ else:
     instructions = Instructions_summary()
 
 print(f"Full dataset size: {len(valid_dataset)}")
+global_eval_size = len(valid_dataset)
 
 # Limit to num_eval_samples
 if script_args.num_eval_samples > 0 and script_args.num_eval_samples < len(valid_dataset):
     valid_dataset = valid_dataset.select(range(script_args.num_eval_samples))
 print(f"Evaluation dataset size: {len(valid_dataset)}")
+global_eval_size = len(valid_dataset)
+shard_start = 0
+if accelerator.num_processes > 1:
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
+    base = global_eval_size // world_size
+    remainder = global_eval_size % world_size
+    shard_start = rank * base + min(rank, remainder)
+
+    valid_dataset = valid_dataset.shard(
+        num_shards=world_size,
+        index=rank,
+        contiguous=True
+    )
+    print(f"Rank {rank}: local eval shard size {len(valid_dataset)} (start={shard_start})")
 
 valid_batch_size = 8
 for key in ['key', 'text', 'prompt', 'response', 'query']:
@@ -163,7 +193,7 @@ trainer = MoEGatingTrainer(
     num_pref_samples=script_args.num_pref_samples
 )
 
-input_idx = 0
+local_input_idx = 0
 pbar = tqdm(total=len(valid_dataset), desc="Evaluating")
 
 with torch.no_grad():
@@ -216,11 +246,12 @@ with torch.no_grad():
                 response = full_responses[local_idx].replace(full_prompts[local_idx], '').strip()
                 
                 result = {
-                    'input_idx': input_idx + local_idx,
+                    'input_idx': shard_start + local_input_idx + local_idx,
                     'pref_idx': pref_idx,
                     'prompt': full_prompts[local_idx],
                     'response': response,
                     'scalarized_reward': scalarized_reward,
+                    'rank': accelerator.process_index,
                 }
                 for k, name in enumerate(reward_names):
                     result[f'pref_{name}'] = pref[k]
@@ -231,29 +262,91 @@ with torch.no_grad():
                 # Track per-input rewards for hypervolume
                 if pref_idx == 0:
                     per_input_rewards.append([])
-                per_input_rewards[input_idx + local_idx].append(reward_vector)
+                per_input_rewards[local_input_idx + local_idx].append(reward_vector)
         
         # Compute hypervolume for each input in batch (after all preferences)
         for local_idx in range(batch_size):
             input_hv = compute_hypervolume(
-                per_input_rewards[input_idx + local_idx]
+                per_input_rewards[local_input_idx + local_idx]
             )
             per_input_hv.append(input_hv)
         
-        input_idx += batch_size
+        local_input_idx += batch_size
         pbar.update(batch_size)
 
 pbar.close()
+
+# Save per-rank shards to avoid large all_gather_object traffic.
+rank_results_path = os.path.join(output_dir, f'eval_results_rank{accelerator.process_index}.csv')
+rank_hv_path = os.path.join(output_dir, f'per_input_hv_rank{accelerator.process_index}.csv')
+pd.DataFrame(all_results).to_csv(rank_results_path, index=False)
+pd.DataFrame({
+    'rank': accelerator.process_index,
+    'local_input_idx': list(range(len(per_input_hv))),
+    'hypervolume': per_input_hv
+}).to_csv(rank_hv_path, index=False)
+
+if not accelerator.is_main_process:
+    print(f"Rank {accelerator.process_index}: evaluation shard complete.")
+    sys.exit(0)
 
 # ========== summarize and print evaluation results ==========
 print("\n" + "=" * 60)
 print("Evaluation Summary")
 print("=" * 60)
 
-results_df = pd.DataFrame(all_results)
+if accelerator.num_processes > 1:
+    # Wait for all rank files without distributed barrier to avoid deadlock
+    # when one worker crashes before a collective.
+    expected_results = [
+        os.path.join(output_dir, f'eval_results_rank{rank_idx}.csv')
+        for rank_idx in range(accelerator.num_processes)
+    ]
+    expected_hv = [
+        os.path.join(output_dir, f'per_input_hv_rank{rank_idx}.csv')
+        for rank_idx in range(accelerator.num_processes)
+    ]
+
+    wait_timeout_sec = 1800
+    poll_interval_sec = 2
+    start_wait = time.time()
+    while True:
+        ready_results = all(os.path.exists(p) for p in expected_results)
+        ready_hv = all(os.path.exists(p) for p in expected_hv)
+        if ready_results and ready_hv:
+            break
+        if time.time() - start_wait > wait_timeout_sec:
+            missing = [p for p in (expected_results + expected_hv) if not os.path.exists(p)]
+            raise TimeoutError(
+                "Timed out waiting for rank output files. "
+                f"Missing {len(missing)} files, examples: {missing[:4]}"
+            )
+        time.sleep(poll_interval_sec)
+
+    results_frames = []
+    hv_frames = []
+    for rank_idx in range(accelerator.num_processes):
+        rank_results = os.path.join(output_dir, f'eval_results_rank{rank_idx}.csv')
+        rank_hv = os.path.join(output_dir, f'per_input_hv_rank{rank_idx}.csv')
+        if os.path.exists(rank_results):
+            results_frames.append(pd.read_csv(rank_results))
+        if os.path.exists(rank_hv):
+            hv_frames.append(pd.read_csv(rank_hv))
+    results_df = pd.concat(results_frames, ignore_index=True) if results_frames else pd.DataFrame()
+    hv_df = pd.concat(hv_frames, ignore_index=True) if hv_frames else pd.DataFrame()
+else:
+    results_df = pd.DataFrame(all_results)
+    hv_df = pd.DataFrame({
+        'rank': accelerator.process_index,
+        'local_input_idx': list(range(len(per_input_hv))),
+        'hypervolume': per_input_hv
+    })
+
+all_results = results_df.to_dict('records')
+per_input_hv = hv_df['hypervolume'].tolist() if not hv_df.empty else []
 
 # Overview
-print(f"\nInputs: {len(valid_dataset)} | Preferences/input: {script_args.num_pref_samples} | Total generations: {len(all_results)}")
+print(f"\nInputs: {global_eval_size} | Preferences/input: {script_args.num_pref_samples} | Total generations: {len(all_results)}")
 
 # Per-objective rewards (overall)
 print(f"\nPer-Objective Rewards (Overall):")
@@ -284,8 +377,9 @@ overall_row = {
     **{f'mean_reward_{name}': results_df[f'reward_{name}'].mean() for name in reward_names},
     **{f'std_reward_{name}': results_df[f'reward_{name}'].std() for name in reward_names},
     'hypervolume': global_hv,
-    'num_inputs': len(valid_dataset),
+    'num_inputs': global_eval_size,
     'num_preferences': script_args.num_pref_samples,
+    'update_per_preference': update_per_preference,
 }
 summary_rows.append(overall_row)
 
