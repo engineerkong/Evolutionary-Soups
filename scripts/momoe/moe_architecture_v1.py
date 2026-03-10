@@ -74,6 +74,9 @@ class AttentionGatingNetwork(nn.Module):
         # Phase-2 policy update flag: when True, build graph for routing branch
         # even if outer model forward runs under torch.no_grad().
         self._force_policy_grad = False
+        # When enabled, cache per-step selected log-probs during generate().
+        self._collect_policy_trajectory = False
+        self._selected_log_probs_history = []
     
     def forward(self, x, preference=None):
         """
@@ -121,8 +124,26 @@ class AttentionGatingNetwork(nn.Module):
             scores = self.router(router_input)                       # [batch, num_experts]
             lora_weights_seq = F.softmax(scores, dim=-1)             # [batch, num_experts]
 
+        if self._collect_policy_trajectory:
+            # Keep action-causal REINFORCE: sampled action is also used by routing.
+            with torch.enable_grad():
+                step_log_probs = torch.log(lora_weights_seq + 1e-8)  # [batch, num_experts]
+                sampled_actions = torch.distributions.Categorical(probs=lora_weights_seq).sample()  # [batch]
+                selected_log_probs = step_log_probs.gather(
+                    dim=1,
+                    index=sampled_actions.unsqueeze(1)
+                ).squeeze(1)  # [batch]
+                sampled_one_hot = F.one_hot(
+                    sampled_actions,
+                    num_classes=self.num_lora_experts
+                ).to(device=device, dtype=dtype)
+            self._selected_log_probs_history.append(selected_log_probs)
+            lora_weights_seq = sampled_one_hot
+            print(sampled_one_hot)
+
         # Broadcast to all token positions: [batch, seq_len, num_experts]
         lora_weights = lora_weights_seq.unsqueeze(1).expand(-1, seq_len, -1)
+        # print(lora_weights)
 
         # Store for REINFORCE loss computation.
         # Use grad-mode rather than module.training so policy updates still work
@@ -271,16 +292,11 @@ class MoEGatingTrainer:
     
     def sample_preferences(self):
         """Sample preferences from Dirichlet distribution (uniform on simplex)."""
-        # preferences = []
-        # for _ in range(self.num_pref_samples):
-        #     pref = np.random.dirichlet(np.ones(self.num_rewards))
-        #     preferences.append(pref.tolist())
-        # return preferences
-        if self.num_rewards != 2:
-            raise ValueError(
-                f"Hardcoded v1 preference [1.0, 0.0] requires num_rewards=2, got {self.num_rewards}"
-            )
-        return [[1.0, 0.0] for _ in range(self.num_pref_samples)]
+        preferences = []
+        for _ in range(self.num_pref_samples):
+            pref = np.random.dirichlet(np.ones(self.num_rewards))
+            preferences.append(pref.tolist())
+        return preferences
 
     def _pref_key(self, preference, ndigits=2):
         pref = np.asarray(preference, dtype=np.float32)
@@ -331,6 +347,67 @@ class MoEGatingTrainer:
             return torch.tensor(0.0, requires_grad=True,
                                 device=next(self.model.parameters()).device)
         return total_balance_loss / num_layers
+
+    def _enable_policy_trajectory_capture(self):
+        """Enable per-step sampled log-prob capture inside generate()."""
+        for layer in self._core_model().model.layers:
+            if hasattr(layer.mlp, 'gate'):
+                gate = layer.mlp.gate
+                gate._force_policy_grad = True
+                gate._collect_policy_trajectory = True
+                gate._selected_log_probs_history = []
+
+    def _disable_policy_trajectory_capture(self):
+        """Disable trajectory capture and reset runtime flags."""
+        for layer in self._core_model().model.layers:
+            if hasattr(layer.mlp, 'gate'):
+                gate = layer.mlp.gate
+                gate._force_policy_grad = False
+                gate._collect_policy_trajectory = False
+
+    def _gather_selected_log_probs_trajectory(self):
+        """
+        Gather selected log-probs from all MoE layers and all generation steps.
+        Returns a flat list of tensors, each with shape [batch].
+        """
+        selected_log_probs = []
+        for layer in self._core_model().model.layers:
+            if hasattr(layer.mlp, 'gate'):
+                gate = layer.mlp.gate
+                if hasattr(gate, '_selected_log_probs_history'):
+                    selected_log_probs.extend(gate._selected_log_probs_history)
+        return selected_log_probs
+
+    def _debug_print_router_grad_status(self, tag=""):
+        """Print a compact gradient-health summary for router parameters."""
+        if not self._debug_grad:
+            return
+        grad_norm_sq = 0.0
+        num_with_grad = 0
+        num_total = 0
+        sample_name = None
+        sample_grad_mean = None
+
+        for layer_idx, layer in enumerate(self._core_model().model.layers):
+            if not hasattr(layer.mlp, 'gate'):
+                continue
+            for name, param in layer.mlp.gate.named_parameters():
+                num_total += 1
+                if param.grad is None:
+                    continue
+                num_with_grad += 1
+                g = param.grad.detach()
+                grad_norm_sq += (g * g).sum().item()
+                if sample_name is None:
+                    sample_name = f"layer{layer_idx}.{name}"
+                    sample_grad_mean = g.abs().mean().item()
+
+        grad_norm = grad_norm_sq ** 0.5
+        print(
+            f"[DEBUG][Grad]{tag} router_params_with_grad={num_with_grad}/{num_total} "
+            f"global_grad_norm={grad_norm:.6f} "
+            f"sample={sample_name} sample_abs_mean={sample_grad_mean}"
+        )
         
     def forward_with_routing_log_probs(self, input_ids, attention_mask=None, preference=None):
         """
@@ -379,10 +456,11 @@ class MoEGatingTrainer:
                             alpha_hypervolume=0.1, alpha_balance=0.1, alpha_entropy=0.01,
                             update_per_preference=True):
         """
-        Training step with REINFORCE, preference conditioning, and hypervolume loss.
+        Standard REINFORCE update for router parameters.
 
-        [FIX] 使用完整序列（prompt + response）做forward来获取路由决策，
-        确保奖励信号与实际产生response的路由决策对应。
+        Policy gradient objective:
+            L = -E[(R - b) * log pi(a|s)]
+        where b is a moving-average reward baseline.
         """
         # ---- Prepare inputs ----
         input_ids_list = []
@@ -413,49 +491,34 @@ class MoEGatingTrainer:
         batch_size = input_ids.shape[0]
         
         sampled_preferences = self.sample_preferences()
-        
-        all_reward_vectors = []
+        sampled_preferences = [[1.0, 0.0]]
         all_scalarized_rewards = []
-        
-        accumulated_policy_loss = 0.0
-        accumulated_hv_policy_loss = 0.0
-        accumulated_entropy = 0.0
-        accumulated_balance_loss = 0.0
-        
-        # 存储每个preference对应的生成结果和奖励
+
+        # Store generated trajectories and scalarized rewards for policy update
         pref_generation_data = []
-        
-        # ========== Phase 1: Generation and Reward Collection (no grad) ==========
+
+        # ========== Phase 1: Sample trajectories and rewards (no grad) ==========
         self.model.eval()
-        for pref_idx, pref in enumerate(sampled_preferences):
+        for pref in sampled_preferences:
             self.set_model_preference(pref)
-            
-            with torch.no_grad():
-                response_tensors = self._core_model().generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=128,
-                    do_sample=True,
-                    temperature=0.7,
-                    top_p=0.9,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            if self._debug_grad and pref_idx == 0:
-                found = False
-                for layer_idx, layer in enumerate(self._core_model().model.layers):
-                    if hasattr(layer.mlp, 'gate') and hasattr(layer.mlp.gate, '_last_routing_weights'):
-                        rw = layer.mlp.gate._last_routing_weights
-                        print(
-                            f"[DEBUG][Phase1][v1] grad_enabled={torch.is_grad_enabled()} "
-                            f"layer={layer_idx} rw.requires_grad={rw.requires_grad} rw.grad_fn={rw.grad_fn}"
-                        )
-                        found = True
-                        break
-                if not found:
-                    print("[DEBUG][Phase1][v1] no routing cache found after generate()")
-            
-            # Decode and get rewards
-            full_responses = tokenizer.batch_decode(response_tensors)
+            self._enable_policy_trajectory_capture()
+            try:
+                with torch.no_grad():
+                    # HF generate() returns full sequences (prompt + sampled continuation).
+                    generated_sequences = self._core_model().generate(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=128,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                selected_log_probs_trajectory = self._gather_selected_log_probs_trajectory()
+            finally:
+                self._disable_policy_trajectory_capture()
+
+            full_responses = tokenizer.batch_decode(generated_sequences)
             full_prompts = tokenizer.batch_decode(input_ids)
             full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
             
@@ -474,74 +537,34 @@ class MoEGatingTrainer:
                 )
             
             pref_rewards = []
-            pref_reward_vectors = []
             for j in range(batch_size):
                 reward_vector = [rewards_list[k][j] for k in range(self.num_rewards)]
-                all_reward_vectors.append(reward_vector)
-                pref_reward_vectors.append(reward_vector)
                 scalarized = float(sum(pref[k] * reward_vector[k] for k in range(self.num_rewards)))
                 all_scalarized_rewards.append(scalarized)
                 pref_rewards.append(scalarized)
-            
-            # 构建完整序列的attention mask
-            full_seq_len = response_tensors.shape[1]
-            full_attention_mask = torch.ones(
-                batch_size, full_seq_len,
-                dtype=torch.long,
-                device=response_tensors.device
-            )
-            for i in range(batch_size):
-                original_padding_len = (attention_mask[i] == 0).sum().item()
-                if original_padding_len > 0:
-                    full_attention_mask[i, :original_padding_len] = 0
-            
+
             pref_generation_data.append({
                 'pref': pref,
-                'response_tensors': response_tensors.detach().clone(),
-                'full_attention_mask': full_attention_mask.detach().clone(),
+                'selected_log_probs_trajectory': selected_log_probs_trajectory,
                 'pref_rewards': pref_rewards,
-                'pref_reward_vectors': pref_reward_vectors,
             })
             
-            del response_tensors
+            del generated_sequences
             torch.cuda.empty_cache()
         
-        # ========== Phase 2: REINFORCE Update with Full Sequence Forward (with grad) ==========
+        # ========== Phase 2: Standard REINFORCE router update ==========
         self.model.train()
-
-        per_input_hv_values = []
-        if len(pref_generation_data) > 0:
-            num_prefs = len(pref_generation_data)
-            for pref_data in pref_generation_data:
-                pref_data['hv_contrib'] = []
-
-            for sample_idx in range(batch_size):
-                points = [
-                    pref_generation_data[pref_idx]['pref_reward_vectors'][sample_idx]
-                    for pref_idx in range(num_prefs)
-                ]
-                hv_full = self.compute_hypervolume(points)
-                per_input_hv_values.append(hv_full)
-
-                if num_prefs == 1:
-                    contribs = [hv_full]
-                else:
-                    contribs = []
-                    for pref_idx in range(num_prefs):
-                        reduced_points = points[:pref_idx] + points[pref_idx + 1:]
-                        hv_reduced = self.compute_hypervolume(reduced_points)
-                        contribs.append(hv_full - hv_reduced)
-
-                for pref_idx in range(num_prefs):
-                    pref_generation_data[pref_idx]['hv_contrib'].append(contribs[pref_idx])
-        
         num_prefs = max(1, len(pref_generation_data))
+        accumulated_policy_loss = 0.0
+        accumulated_total_loss = 0.0
+
+        if not update_per_preference:
+            self.optimizer.zero_grad()
+
         for pref_data in pref_generation_data:
             pref = pref_data['pref']
-            full_input_ids = pref_data['response_tensors']
-            full_attention_mask = pref_data['full_attention_mask']
+            selected_log_probs_trajectory = pref_data['selected_log_probs_trajectory']
             pref_rewards = pref_data['pref_rewards']
-            hv_contrib = pref_data['hv_contrib']
 
             if update_per_preference:
                 self.optimizer.zero_grad()
@@ -549,75 +572,29 @@ class MoEGatingTrainer:
             pref_rewards_tensor = torch.tensor(
                 pref_rewards,
                 dtype=torch.float32,
-                device=full_input_ids.device
+                device=input_ids.device
             )
-            # Use per-batch, per-preference centered scalarized rewards as REINFORCE advantage.
-            # This avoids using cross-step/cross-preference running baselines for policy loss.
-            pref_rewards_normalized = pref_rewards_tensor - pref_rewards_tensor.mean()
-            hv_contrib_tensor = torch.tensor(
-                hv_contrib,
-                dtype=torch.float32,
-                device=full_input_ids.device
-            )
-            hv_contrib_normalized = hv_contrib_tensor - self.hv_baseline
-            
-            # [关键修改] 用完整序列做forward
-            with torch.enable_grad():
-                outputs, routing_log_probs = self.forward_with_routing_log_probs(
-                    full_input_ids, full_attention_mask, preference=pref
-                )
-            if self._debug_grad and routing_log_probs:
-                rp0 = routing_log_probs[0]
-                print(
-                    f"[DEBUG][Phase2][v1] grad_enabled={torch.is_grad_enabled()} "
-                    f"routing_layers={len(routing_log_probs)} "
-                    f"log_probs.requires_grad={rp0.requires_grad} log_probs.grad_fn={rp0.grad_fn}"
-                )
+            advantages = pref_rewards_tensor - self.reward_baseline
 
-            pref_policy_loss_acc = 0.0
-            pref_hv_policy_loss_acc = 0.0
-            pref_entropy_acc = 0.0
-            if routing_log_probs:
-                for log_probs in routing_log_probs:
-                    probs = torch.exp(log_probs)
+            if len(selected_log_probs_trajectory) == 0:
+                continue
 
-                    # Align policy objective with soft-routing inference:
-                    # use expected log-prob under the full routing distribution.
-                    expected_log_probs = (probs * log_probs).sum(dim=-1)
-
-                    policy_loss = -(pref_rewards_normalized * expected_log_probs).mean()
-                    hv_policy_loss = -(hv_contrib_normalized * expected_log_probs).mean()
-                    entropy = (probs * log_probs).sum(dim=-1).mean()
-
-                    pref_policy_loss_acc += policy_loss
-                    pref_hv_policy_loss_acc += hv_policy_loss
-                    pref_entropy_acc += entropy
-
-            pref_balance_loss = self.compute_load_balance()
-            pref_total_loss = (pref_policy_loss_acc +
-                               alpha_balance * pref_balance_loss +
-                               alpha_entropy * pref_entropy_acc +
-                               alpha_hypervolume * pref_hv_policy_loss_acc)
-            if self._debug_grad:
-                print(
-                    f"[DEBUG][Loss][v1] pref_total_loss.requires_grad={getattr(pref_total_loss, 'requires_grad', None)} "
-                    f"pref_total_loss.grad_fn={getattr(pref_total_loss, 'grad_fn', None)}"
-                )
+            # selected_log_probs_trajectory: list of [batch] tensors gathered during generate()
+            selected_log_probs_tensor = torch.stack(selected_log_probs_trajectory, dim=0)  # [num_decisions, batch]
+            pref_policy_loss = -(
+                advantages.detach().unsqueeze(0) * selected_log_probs_tensor
+            ).mean()
+            pref_total_loss = pref_policy_loss
 
             if update_per_preference:
-                policy_val = pref_policy_loss_acc.item() if isinstance(pref_policy_loss_acc, torch.Tensor) else float(pref_policy_loss_acc)
-                hv_policy_val = pref_hv_policy_loss_acc.item() if isinstance(pref_hv_policy_loss_acc, torch.Tensor) else float(pref_hv_policy_loss_acc)
-                balance_val = pref_balance_loss.item() if isinstance(pref_balance_loss, torch.Tensor) else float(pref_balance_loss)
-                entropy_val = pref_entropy_acc.item() if isinstance(pref_entropy_acc, torch.Tensor) else float(pref_entropy_acc)
+                policy_val = pref_policy_loss.item() if isinstance(pref_policy_loss, torch.Tensor) else float(pref_policy_loss)
                 total_val = pref_total_loss.item() if isinstance(pref_total_loss, torch.Tensor) else float(pref_total_loss)
                 print(f"Pref {pref}: "
                       f"Policy Loss={policy_val:.4f}, "
-                      f"HV Policy Loss={hv_policy_val:.4f}, "
-                      f"Balance Loss={balance_val:.4f}, "
-                      f"Entropy={entropy_val:.4f}, "
                       f"Total Loss={total_val:.4f}")
                 if isinstance(pref_total_loss, torch.Tensor) and pref_total_loss.requires_grad:
                     pref_total_loss.backward()
+                    self._debug_print_router_grad_status(tag=f"[pref={pref}]")
                     torch.nn.utils.clip_grad_norm_(
                         [p for p in self.model.parameters() if p.requires_grad],
                         max_norm=1.0
@@ -626,15 +603,13 @@ class MoEGatingTrainer:
                 else:
                     print(
                         "Warning: pref_total_loss has no grad_fn; skipping optimizer step for this preference. "
-                        f"routing_layers={len(routing_log_probs)}, model_training={self.model.training}"
+                        f"num_decisions={len(selected_log_probs_trajectory)}"
                     )
 
-            accumulated_policy_loss += pref_policy_loss_acc / num_prefs
-            accumulated_hv_policy_loss += pref_hv_policy_loss_acc / num_prefs
-            accumulated_entropy += pref_entropy_acc / num_prefs
-            accumulated_balance_loss += pref_balance_loss / num_prefs
+            accumulated_policy_loss += pref_policy_loss / num_prefs
+            accumulated_total_loss += pref_total_loss / num_prefs
 
-            del full_input_ids, outputs, routing_log_probs
+            del selected_log_probs_tensor
             torch.cuda.empty_cache()
         
         # Update baseline
@@ -643,20 +618,10 @@ class MoEGatingTrainer:
             self.baseline_momentum * self.reward_baseline +
             (1 - self.baseline_momentum) * rewards_tensor.mean().item()
         )
-        mean_input_hv = float(np.mean(per_input_hv_values)) if len(per_input_hv_values) > 0 else 0.0
-        self.hv_baseline = (
-            self.baseline_momentum * self.hv_baseline +
-            (1 - self.baseline_momentum) * mean_input_hv
-        )
-        
-        total_loss = (accumulated_policy_loss +
-                    alpha_balance * accumulated_balance_loss +
-                    alpha_entropy * accumulated_entropy +
-                    alpha_hypervolume * accumulated_hv_policy_loss)
 
         if not update_per_preference:
-            self.optimizer.zero_grad()
-            total_loss.backward()
+            accumulated_total_loss.backward()
+            self._debug_print_router_grad_status(tag="[accumulated]")
             torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad],
                 max_norm=1.0
@@ -665,11 +630,11 @@ class MoEGatingTrainer:
         
         return {
             'policy_loss': accumulated_policy_loss.item() if isinstance(accumulated_policy_loss, torch.Tensor) else accumulated_policy_loss,
-            'hv_policy_loss': accumulated_hv_policy_loss.item() if isinstance(accumulated_hv_policy_loss, torch.Tensor) else accumulated_hv_policy_loss,
-            'balance_loss': accumulated_balance_loss.item() if isinstance(accumulated_balance_loss, torch.Tensor) else accumulated_balance_loss,
-            'entropy_loss': accumulated_entropy.item() if isinstance(accumulated_entropy, torch.Tensor) else accumulated_entropy,
-            'total_loss': total_loss.item(),
+            'hv_policy_loss': 0.0,
+            'balance_loss': 0.0,
+            'entropy_loss': 0.0,
+            'total_loss': accumulated_total_loss.item() if isinstance(accumulated_total_loss, torch.Tensor) else float(accumulated_total_loss),
             'mean_reward': rewards_tensor.mean().item(),
-            'std_reward': rewards_tensor.std().item(),
+            'std_reward': rewards_tensor.std(unbiased=False).item(),
             'baseline': self.reward_baseline
         }

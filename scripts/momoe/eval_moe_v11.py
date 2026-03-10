@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader
 from trl import set_seed
 from accelerate import Accelerator
 # adapt versions
-from moe_architecture_v1 import MoEGatingTrainer
-from moe_utils_v1 import (
+from moe_architecture_v11 import MoEGatingTrainer
+from moe_utils_v11 import (
     compute_hypervolume,
     convert_to_moe_model,
     load_moe_gating_weights,
@@ -160,6 +160,7 @@ eval_dataloader = DataLoader(
 )
 
 sampled_preferences = sample_preferences_uniform(len(reward_names), script_args.num_pref_samples)
+sampled_preferences = [[1.0, 0.0]] # hardcode for testing
 print(f"\nSampled {len(sampled_preferences)} preferences:")
 for i, pref in enumerate(sampled_preferences):
     pref_str = ", ".join([f"{reward_names[k]}={pref[k]:.2f}" for k in range(len(reward_names))])
@@ -236,9 +237,13 @@ with torch.no_grad():
                 )
             
             # Process results for each sample in batch
+            core_model = model.module if hasattr(model, 'module') else model
+            gate = next((layer.mlp.gate for layer in core_model.model.layers if hasattr(layer.mlp, 'gate')), None)
+            batch_lora_weights = gate._last_routing_weights.detach().cpu() if gate is not None and hasattr(gate, '_last_routing_weights') and gate._last_routing_weights is not None else None
             for local_idx in range(batch_size):
                 reward_vector = [rewards_list[k][local_idx] for k in range(len(reward_names))]
                 scalarized_reward = sum(pref[k] * reward_vector[k] for k in range(len(reward_names)))
+                print(f"lora_weights: {batch_lora_weights[local_idx].tolist() if batch_lora_weights is not None else None}, scalarized_reward: {scalarized_reward}, reward_vector: {reward_vector}")
                 
                 # Extract response (without prompt)
                 response = full_responses[local_idx].replace(full_prompts[local_idx], '').strip()
@@ -381,7 +386,6 @@ overall_row = {
 summary_rows.append(overall_row)
 
 # Add per-preference rows
-sampled_preferences = [[1.0, 0.0]] # hardcode for testing
 for pref_idx, pref in enumerate(sampled_preferences):
     pref_df = results_df[results_df['pref_idx'] == pref_idx]
     pref_str = ", ".join([f"{reward_names[k]}={pref[k]:.2f}" for k in range(len(reward_names))])

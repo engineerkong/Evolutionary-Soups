@@ -6,7 +6,7 @@ from transformers import AutoModelForCausalLM
 from peft import PeftModel
 import numpy as np
 from pymoo.indicators.hv import HV
-from scripts.momoe.moe_architecture_v2 import (
+from moe_architecture_v2 import (
     LoRAExpertFFNComplete,
     MoEFFNLayer,
     AttentionGatingNetwork

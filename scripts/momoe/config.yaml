@@ -1,7 +1,7 @@
 # config.yaml
 
-epochs: 2
-learning_rate: 1e-5
+epochs: 5
+learning_rate: 1e-4
 batch_size: 64
 subspace_rank: 8
 d_model: 512

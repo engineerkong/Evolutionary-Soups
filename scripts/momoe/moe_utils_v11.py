@@ -6,7 +6,7 @@ from transformers import AutoModelForCausalLM
 from peft import PeftModel
 import numpy as np
 from pymoo.indicators.hv import HV
-from moe_architecture_v1 import (
+from moe_architecture_v11 import (
     LoRAExpertFFNComplete,
     MoEFFNLayer,
     AttentionGatingNetwork
@@ -253,12 +253,13 @@ def save_moe_gating_weights(model, save_path):
     """Save only the trainable gating network weights"""
     import os
     os.makedirs(save_path, exist_ok=True)
-    
+
+    core_model = model.module if hasattr(model, "module") else model
     gating_state_dict = {}
-    for name, param in model.named_parameters():
+    for name, param in core_model.named_parameters():
         if 'gate' in name and param.requires_grad:
             gating_state_dict[name] = param.cpu()
-    
+
     torch.save(gating_state_dict, os.path.join(save_path, 'gating_weights.pt'))
     print(f"Saved gating weights to {save_path}/gating_weights.pt")
 
@@ -269,9 +270,62 @@ def load_moe_gating_weights(model, save_path):
     weights_path = os.path.join(resolved_path, 'gating_weights.pt')
     
     if os.path.exists(weights_path):
-        gating_state_dict = torch.load(weights_path, map_location=model.device)
-        model.load_state_dict(gating_state_dict, strict=False)
+        core_model = model.module if hasattr(model, "module") else model
+        target_state = core_model.state_dict()
+        model_device = next(core_model.parameters()).device
+
+        loaded_state = torch.load(weights_path, map_location=model_device)
+        if not isinstance(loaded_state, dict):
+            print(f"Invalid gating checkpoint format: {weights_path}")
+            return False
+
+        # Normalize potential DDP prefixes for backward compatibility.
+        normalized_state = {}
+        for k, v in loaded_state.items():
+            if not isinstance(k, str):
+                continue
+            nk = k
+            if nk.startswith("module."):
+                nk = nk[len("module."):]
+            normalized_state[nk] = v
+
+        # Keep only keys that exist in current model and are gate params.
+        filtered_state = {}
+        for k, v in normalized_state.items():
+            if "gate" not in k:
+                continue
+            if k in target_state:
+                filtered_state[k] = v
+
+        if len(filtered_state) == 0:
+            print(
+                "No matching gate keys found while loading checkpoint. "
+                f"checkpoint={weights_path}"
+            )
+            sample_ckpt = list(normalized_state.keys())[:5]
+            sample_model = [k for k in target_state.keys() if "gate" in k][:5]
+            print(f"Sample checkpoint keys: {sample_ckpt}")
+            print(f"Sample model gate keys: {sample_model}")
+            return False
+
+        missing, unexpected = core_model.load_state_dict(filtered_state, strict=False)
+        missing_gate = [k for k in missing if "gate" in k]
+        unexpected_gate = [k for k in unexpected if "gate" in k]
+        loaded_gate_keys = len(filtered_state) - len(unexpected_gate)
+
         print(f"Loaded gating weights from {weights_path}")
+        print(
+            f"Gate key match summary: loaded={loaded_gate_keys}, "
+            f"missing_gate={len(missing_gate)}, unexpected_gate={len(unexpected_gate)}"
+        )
+        if missing_gate:
+            print(f"Sample missing gate keys: {missing_gate[:5]}")
+        if unexpected_gate:
+            print(f"Sample unexpected gate keys: {unexpected_gate[:5]}")
+
+        if loaded_gate_keys <= 0:
+            print("Gate load failed: zero gate parameters were applied.")
+            return False
         return True
     else:
         print(f"No gating weights found at {weights_path}")

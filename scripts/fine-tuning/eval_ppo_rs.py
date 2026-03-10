@@ -120,7 +120,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
         "min_length": -1,
         "top_k": 0.0,
         "top_p": 0.9, 
-        "do_sample": True,
+        "do_sample": False,
     }
     tokenizer.padding_side = "left"
     
