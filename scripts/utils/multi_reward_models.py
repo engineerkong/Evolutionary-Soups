@@ -20,7 +20,7 @@ class RewardModels():
             self.rm_tokenizers.append(AutoTokenizer.from_pretrained(self.rm_tokenizer_path_list[i]))
     
     # add normalize_rewards flag to control reward normalization
-    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True):
+    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True, round_digits=1):
         texts_for_rewards = []
         for i in range(self.num_rewards):
             if i >= 1 and self.rm_tokenizer_path_list[i] == self.rm_tokenizer_path_list[i-1]:
@@ -57,9 +57,20 @@ class RewardModels():
                 reward_mean_std = None
 
             if 'humor' in self.reward_model_path_list[i] or 'faithful' in self.reward_model_path_list[i]:
-                temp_reward = get_rewards(self.reward_models[i], texts_for_rewards[i], reward_mean_std=reward_mean_std, sub_position=1)
+                temp_reward = get_rewards(
+                    self.reward_models[i],
+                    texts_for_rewards[i],
+                    reward_mean_std=reward_mean_std,
+                    sub_position=1,
+                    round_digits=round_digits,
+                )
             else:
-                temp_reward = get_rewards(self.reward_models[i], texts_for_rewards[i], reward_mean_std=reward_mean_std)
+                temp_reward = get_rewards(
+                    self.reward_models[i],
+                    texts_for_rewards[i],
+                    reward_mean_std=reward_mean_std,
+                    round_digits=round_digits,
+                )
             rewards.append(temp_reward)
         return rewards
             

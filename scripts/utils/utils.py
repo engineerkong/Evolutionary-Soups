@@ -381,7 +381,7 @@ def load_main_tokenizer(tokenizer_name):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     return tokenizer
 
-def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_position=0):
+def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_position=0, round_digits=1):
     rewards = []
     # print('log: reward model forwarding ...')
     with torch.no_grad():
@@ -394,10 +394,12 @@ def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_posit
             # pbar.update(1)
     
     if reward_mean_std is None:
-        rewards = [np.round(r.cpu().detach().item(), 1) for r in rewards]
+        rewards = [r.cpu().detach().item() for r in rewards]
     else:
         mean_reward, std_reward = reward_mean_std
-        rewards = [np.round((r.cpu().detach().item() - mean_reward) / std_reward, 1) for r in rewards]
+        rewards = [(r.cpu().detach().item() - mean_reward) / std_reward for r in rewards]
+    if round_digits is not None:
+        rewards = [np.round(r, round_digits) for r in rewards]
     return rewards
 
 
@@ -479,5 +481,4 @@ def get_clean_data(full_responses, full_prompts, remove_bad=False):
         full_responses_clean.append(clean_resp)
         full_prompts_clean.append(full_prompts[i])
     return full_prompts_clean, full_responses_clean
-
 

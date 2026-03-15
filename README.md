@@ -34,3 +34,22 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/momoe/train_moe.py --base_m
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/eval_moe_v1.py --base_model_name './models/sft/assistant_sft/model/' --lora_expert_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --checkpoint_path './models/momoe/assistant_momoe_0503a/epoch_2_step_1668_final/' --reward_names 'harmless,helpful' --num_pref_samples 5 --num_eval_samples 0 --exp_type 'assistant' --wandb_name 'assistant_momoe_0503a' 2>&1 | tee ./logs/momoe_assistant_eval_0503a.log
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/momoe/eval_moe.py --base_model_name './models/sft/summary_sft/model/' --lora_expert_paths './models/ppo/summary_ppo_summary_0302/batch_307/' './models/ppo/summary_ppo_faithful_0302/batch_307/' './models/ppo/summary_ppo_deberta_0302/batch_307/' --checkpoint_path './models/momoe/summary_moe_0602x/batch_16000/' --reward_names 'summary,faithful,deberta' --num_pref_samples 5 --num_eval_samples 0 --exp_type 'summary' --wandb_name 'summary_moe_eval_0602' 2>&1 | tee ./logs/momoe_summary_eval_0602x.log
 ```
+
+```
+# QMO
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/train_qmo.py --sft_model_name './models/sft/assistant_sft/model/' --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --num_pref_samples 11 --log_with 'wandb' --wandb_name 'qmo_assistant_1303b' 2>&1 | tee ./logs/qmo_assistant_1303b.log
+
+CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 --main_process_port 29601 ./scripts/momoe/eval_qmo.py --base_model_name './models/sft/assistant_sft/model/' --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --manual_expert_weights '0.0,1.0' --num_pref_samples 1 --wandb_name 'qmo_assistant_eval_1303c' 2>&1 | tee ./logs/qmo_assistant_eval_1303c.log
+```
+
+```
+# NEW
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/collect_rewards.py --sft_model_name './models/sft/assistant_sft/model/' --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --wandb_name 'new_assistant_1403a' 2>&1 | tee ./logs/new_assistant_1403a.log
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/build_dataset.py --rewards_csv './results/new/data/new_assistant_1403/collected_rewards.csv' --wandb_name 'new_assistant_1403b' 2>&1 | tee ./logs/new_assistant_1403b.log
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/train_new.py --sft_model_name './models/sft/assistant_sft/model/' --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --dataset_csv './results/new/data/new_assistant_1403b/gating_dataset.csv' --rewards_csv './results/new/data/new_assistant_1403a/collected_rewards.csv' --log_with 'wandb' --wandb_name 'new_assistant_1403c' 2>&1 | tee ./logs/new_assistant_1403c.log
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 ./scripts/momoe/test_new.py --sft_model_name './models/sft/assistant_sft/model/' --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' --checkpoint_path './models/new/new_assistant_1403c/epoch_301_step_3311' --dataset_csv './results/new/data/new_assistant_1403a/gating_dataset.csv' --rewards_csv './results/new/data/new_assistant_1403b/collected_rewards.csv' --wandb_name 'new_assistant_1403d' 2>&1 | tee ./logs/new_assistant_1403d.log
+
+```
