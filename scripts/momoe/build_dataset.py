@@ -27,7 +27,7 @@ class ScriptArguments:
     rewards_csv: str = './results/new/data/new_assistant/collected_rewards.csv'
     reward_names: str = 'harmless,helpful'
     num_pref_samples: int = 11
-    save_directory: str = './results/new/data/'
+    save_directory: str = './results/new/'
     wandb_name: str = 'new_assistant'
 
 

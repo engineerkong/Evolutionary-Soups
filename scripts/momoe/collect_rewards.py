@@ -27,6 +27,7 @@ from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo,
+    build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
     get_clean_data, load_main_tokenizer,
 )
 from new_utils import merge_and_save_weights, load_base_model
@@ -50,9 +51,10 @@ class ScriptArguments:
     expert_model_paths: List[str] = field(default_factory=list)
     reward_names: str = 'harmless,helpful'
     exp_type: str = 'assistant'
-    save_directory: str = './results/new/data/'
+    save_directory: str = './results/new/'
     wandb_name: str = 'new_assistant'
-    mini_batch_size: int = 64
+    mini_batch_size: int = 8
+    split: str = 'train'  # 'train' or 'test'
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -73,12 +75,20 @@ tokenizer = load_main_tokenizer(script_args.sft_model_name)
 tokenizer.padding_side = 'left'
 
 if script_args.exp_type == 'assistant':
-    dataset = build_dataset_ppo(
-        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers[0], split='train') # hardcoded for testing
+    if script_args.split == 'test':
+        dataset = build_dataset_eval_ppo(
+            'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
+    else:
+        dataset = build_dataset_ppo(
+            'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions()
 else:
-    dataset = build_dataset_summary_ppo(
-        'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers[0], split='train')
+    if script_args.split == 'test':
+        dataset = build_dataset_summary_eval_ppo(
+            'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers, split='test')
+    else:
+        dataset = build_dataset_summary_ppo(
+            'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
 
 # Shard across processes
@@ -91,8 +101,10 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
         dataset = dataset.remove_columns(key)
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+# drop_last=True: avoids gather_for_metrics padding duplicates when
+# dataset_size % (num_gpus * batch_size) != 0
 dataloader = DataLoader(dataset, batch_size=script_args.mini_batch_size,
-                        drop_last=False, collate_fn=data_collator)
+                        drop_last=True, collate_fn=data_collator)
 
 generation_kwargs = {
     'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
@@ -103,7 +115,9 @@ generation_kwargs = {
 }
 
 all_rows = []
-prompt_offset = process_id * (len(dataset))  # global prompt index offset
+# Number of complete batches × batch_size = exact prompts evaluated per process
+# (drop_last=True guarantees no padding duplicates)
+num_prompts_per_process = (len(dataset) // script_args.mini_batch_size) * script_args.mini_batch_size
 
 for t_val in SAMPLE_T_VALUES:
     print(f'\n[Rank {process_id}] Collecting rewards for t={t_val:.1f}')
@@ -120,7 +134,8 @@ for t_val in SAMPLE_T_VALUES:
     model = AutoModelForCausalLM.from_pretrained(
         temp_path, torch_dtype=torch.bfloat16, device_map=gpu_id)
     model.resize_token_embeddings(len(tokenizer))
-    model, dataloader_prepared = accelerator.prepare(model, dataloader)
+    # Only prepare model — dataloader is already sharded via dataset.shard() above
+    model = accelerator.prepare(model)
     model.eval()
 
     full_responses = []
@@ -128,12 +143,14 @@ for t_val in SAMPLE_T_VALUES:
     prompt_ids_list = []
 
     with torch.no_grad():
-        for batch in tqdm(dataloader_prepared, desc=f't={t_val}'):
+        for batch in tqdm(dataloader, desc=f't={t_val}'):
+            input_ids      = batch['input_ids'].to(f'cuda:{gpu_id}')
+            attention_mask = batch['attention_mask'].to(f'cuda:{gpu_id}')
             outputs = accelerator.unwrap_model(model).generate(
-                batch['input_ids'], attention_mask=batch['attention_mask'],
+                input_ids, attention_mask=attention_mask,
                 **generation_kwargs)
             full_responses.extend(outputs)
-            full_prompts.extend(batch['input_ids'])
+            full_prompts.extend(input_ids)
 
     full_responses = tokenizer.batch_decode(full_responses)
     full_prompts_decoded = tokenizer.batch_decode(full_prompts)
@@ -150,20 +167,17 @@ for t_val in SAMPLE_T_VALUES:
         rewards_list = reward_models.get_reward_model_scores(
             queries_responses, normalize_rewards=False)
 
-    # Gather across processes
-    rewards_gathered = [accelerator.gather_for_metrics(r) for r in rewards_list]
-    prompts_gathered = accelerator.gather_for_metrics(full_prompts_decoded)
-
-    if process_id == 0:
-        for idx in range(len(prompts_gathered)):
-            row = {
-                'prompt_idx': idx,
-                't_value': t_val,
-                'prompt_text': prompts_gathered[idx],
-            }
-            for k, name in enumerate(reward_names):
-                row[f'reward_{name}'] = rewards_gathered[k][idx]
-            all_rows.append(row)
+    # Each process saves its own shard — no gather needed, no duplication risk
+    shard_start = process_id * num_prompts_per_process
+    for idx in range(len(full_prompts_decoded)):
+        row = {
+            'prompt_idx': shard_start + idx,
+            't_value': t_val,
+            'prompt_text': full_prompts_decoded[idx],
+        }
+        for k, name in enumerate(reward_names):
+            row[f'reward_{name}'] = rewards_list[k][idx]
+        all_rows.append(row)
 
     # Clean up merged model
     del model
@@ -175,11 +189,26 @@ for t_val in SAMPLE_T_VALUES:
         import shutil
         shutil.rmtree(temp_path, ignore_errors=True)
 
+# Save per-rank shard
+shard_path = os.path.join(output_dir, f'collected_rewards_rank{process_id}.csv')
+pd.DataFrame(all_rows).to_csv(shard_path, index=False, escapechar='\\')
+print(f'[Rank {process_id}] Saved {len(all_rows)} rows to {shard_path}')
+
+accelerator.wait_for_everyone()
+
+# Rank 0 merges all shards into final CSV
 if process_id == 0:
-    df = pd.DataFrame(all_rows)
+    shards = []
+    for rank in range(accelerator.num_processes):
+        p = os.path.join(output_dir, f'collected_rewards_rank{rank}.csv')
+        shards.append(pd.read_csv(p))
+    df = pd.concat(shards, ignore_index=True).sort_values(
+        ['t_value', 'prompt_idx']).reset_index(drop=True)
     out_path = os.path.join(output_dir, 'collected_rewards.csv')
     df.to_csv(out_path, index=False, escapechar='\\')
+    # Remove shards
+    for rank in range(accelerator.num_processes):
+        os.remove(os.path.join(output_dir, f'collected_rewards_rank{rank}.csv'))
     print(f'\nRewards saved to {out_path}')
-    print(f'Total rows: {len(df)} ({len(df) // len(SAMPLE_T_VALUES)} prompts × {len(SAMPLE_T_VALUES)} t values)')
-    print(df.groupby('t_value')[
-        [f'reward_{n}' for n in reward_names]].mean().round(4))
+    print(f'Total rows: {len(df)} ({df["prompt_idx"].nunique()} prompts × {len(SAMPLE_T_VALUES)} t values)')
+    print(df.groupby('t_value')[[f'reward_{n}' for n in reward_names]].mean().round(4))

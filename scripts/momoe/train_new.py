@@ -40,7 +40,7 @@ class ScriptArguments:
     wandb_name: str = 'new_assistant'
     hidden_dim: int = 256
     lr: float = 1e-4
-    epochs: int = 10 
+    epochs: int = 1000
     batch_size: int = 128
 
 
