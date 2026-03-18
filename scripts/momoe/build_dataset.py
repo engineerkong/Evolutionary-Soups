@@ -19,7 +19,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.utils import sample_preferences_uniform
 from new_architecture import chebyshev_optimal_weights
 
-SAMPLE_T_VALUES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+SAMPLE_T_VALUES = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
 
 
 @dataclass
