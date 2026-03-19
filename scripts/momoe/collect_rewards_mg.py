@@ -95,6 +95,37 @@ def get_simplex_samples(
 
 
 # ---------------------------------------------------------------------------
+# Merge helpers
+# ---------------------------------------------------------------------------
+
+def merge_and_save_weights(
+    expert_model_paths: List[str],
+    weights: List[float],
+    save_path: str,
+):
+    """Flat merge — same weight vector applied to every tensor (uniform mode)."""
+    n_experts = len(expert_model_paths)
+    assert len(weights) == n_experts
+    assert abs(sum(weights) - 1.0) < 1e-6
+
+    print(f"  Loading {n_experts} expert models for flat merge...")
+    models      = [AutoModelForCausalLM.from_pretrained(p, torch_dtype=torch.float32)
+                   for p in expert_model_paths]
+    state_dicts = [m.state_dict() for m in models]
+
+    merged = {
+        key: sum(weights[k] * state_dicts[k][key].float() for k in range(n_experts))
+        for key in state_dicts[0]
+    }
+
+    models[0].load_state_dict(merged)
+    models[0].half()
+    models[0].save_pretrained(save_path)
+    AutoTokenizer.from_pretrained(expert_model_paths[0]).save_pretrained(save_path)
+    print(f"  Saved flat-merged model → {save_path}")
+
+
+# ---------------------------------------------------------------------------
 # Blockwise merge helpers
 # ---------------------------------------------------------------------------
 
@@ -275,7 +306,38 @@ all_rows = []
 num_prompts_per_process = (len(dataset) // script_args.batch_size) * script_args.batch_size
 
 # ---------------------------------------------------------------------------
-# Main sweep
+# Phase 1: pre-merge all weight combinations to disk (rank 0, CPU only)
+# ---------------------------------------------------------------------------
+
+if process_id == 0:
+    for sample in SAMPLE_WEIGHTS:
+        if script_args.block_mode == 'uniform':
+            weights_str = '_'.join(f'{w:.2f}' for w in sample)
+            temp_path   = os.path.join(output_dir, f'temp_model_w{weights_str}')
+            merge_and_save_weights(
+                expert_model_paths = script_args.expert_model_paths,
+                weights            = sample,
+                save_path          = temp_path,
+            )
+        else:
+            early_w, mid_w, late_w = sample
+            weights_str = ('E' + '_'.join(f'{w:.2f}' for w in early_w) +
+                           '_M' + '_'.join(f'{w:.2f}' for w in mid_w) +
+                           '_L' + '_'.join(f'{w:.2f}' for w in late_w))
+            temp_path = os.path.join(output_dir, f'temp_model_w{weights_str}')
+            merge_and_save_weights_blockwise(
+                expert_model_paths = script_args.expert_model_paths,
+                early_weights      = early_w,
+                mid_weights        = mid_w,
+                late_weights       = late_w,
+                save_path          = temp_path,
+            )
+    print(f'\n[Rank 0] All {len(SAMPLE_WEIGHTS)} models merged and saved to disk.')
+
+accelerator.wait_for_everyone()
+
+# ---------------------------------------------------------------------------
+# Phase 2: inference sweep — load each pre-merged model and collect rewards
 # ---------------------------------------------------------------------------
 
 for sample in SAMPLE_WEIGHTS:
@@ -294,16 +356,6 @@ for sample in SAMPLE_WEIGHTS:
 
     temp_path = os.path.join(output_dir, f'temp_model_w{weights_str}')
 
-    if process_id == 0:
-        merge_and_save_weights_blockwise(
-            expert_model_paths = script_args.expert_model_paths,
-            early_weights      = early_w,
-            mid_weights        = mid_w,
-            late_weights       = late_w,
-            save_path          = temp_path,
-        )
-    accelerator.wait_for_everyone()
-
     model = AutoModelForCausalLM.from_pretrained(
         temp_path, torch_dtype=torch.bfloat16, device_map=gpu_id)
     model.resize_token_embeddings(len(tokenizer))
@@ -311,7 +363,7 @@ for sample in SAMPLE_WEIGHTS:
     model.eval()
 
     full_responses      = []
-    full_prompts_decoded = []    # decode immediately, no tensor accumulation
+    full_prompts_decoded = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc=weights_str):
@@ -320,11 +372,10 @@ for sample in SAMPLE_WEIGHTS:
             outputs = accelerator.unwrap_model(model).generate(
                 input_ids, attention_mask=attention_mask,
                 **generation_kwargs)
-            full_responses.extend(outputs.cpu())
+            full_responses.extend(tokenizer.batch_decode(outputs.cpu()))
             full_prompts_decoded.extend(tokenizer.batch_decode(input_ids.cpu()))
+            del outputs, input_ids, attention_mask
 
-    full_responses = tokenizer.batch_decode(full_responses)
-    # full_prompts_decoded already decoded above — no second decode needed
     full_prompts_decoded, full_responses = get_clean_data(full_responses, full_prompts_decoded)
 
     queries_responses = [
@@ -342,11 +393,9 @@ for sample in SAMPLE_WEIGHTS:
     for idx in range(len(full_prompts_decoded)):
         row = {'prompt_idx': shard_start + idx, 'prompt_text': full_prompts_decoded[idx]}
         if script_args.block_mode == 'uniform':
-            # Single weight vector — same column schema as collect_rewards.py
             for k, w in enumerate(sample):
                 row[f'w{k}'] = w
         else:
-            # Three independent vectors stored with block suffix
             for k, w in enumerate(early_w):
                 row[f'w{k}_early'] = w
             for k, w in enumerate(mid_w):
@@ -361,8 +410,17 @@ for sample in SAMPLE_WEIGHTS:
     gc.collect()
     torch.cuda.empty_cache()
 
-    if process_id == 0:
-        shutil.rmtree(temp_path, ignore_errors=True)
+# Clean up all temp models after inference is complete
+if process_id == 0:
+    for sample in SAMPLE_WEIGHTS:
+        if script_args.block_mode == 'uniform':
+            weights_str = '_'.join(f'{w:.2f}' for w in sample)
+        else:
+            early_w, mid_w, late_w = sample
+            weights_str = ('E' + '_'.join(f'{w:.2f}' for w in early_w) +
+                           '_M' + '_'.join(f'{w:.2f}' for w in mid_w) +
+                           '_L' + '_'.join(f'{w:.2f}' for w in late_w))
+        shutil.rmtree(os.path.join(output_dir, f'temp_model_w{weights_str}'), ignore_errors=True)
 
 # ---------------------------------------------------------------------------
 # Save shards and merge  (unchanged from collect_rewards.py)

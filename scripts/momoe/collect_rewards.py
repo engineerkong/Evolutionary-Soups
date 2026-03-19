@@ -165,11 +165,13 @@ for weights in SAMPLE_WEIGHTS:
             outputs = accelerator.unwrap_model(model).generate(
                 input_ids, attention_mask=attention_mask,
                 **generation_kwargs)
-            full_responses.extend(outputs.cpu())
+            # FIX 1: decode immediately instead of accumulating raw tensors
+            full_responses.extend(tokenizer.batch_decode(outputs.cpu()))
             full_prompts_decoded.extend(tokenizer.batch_decode(input_ids.cpu()))
+            # FIX 2: explicitly free GPU tensors after each batch
+            del outputs, input_ids, attention_mask
 
-    full_responses = tokenizer.batch_decode(full_responses)
-    # full_prompts_decoded already decoded above — no second decode needed
+    # full_responses already decoded above — no second decode needed
     full_prompts_decoded, full_responses = get_clean_data(full_responses, full_prompts_decoded)
 
     queries_responses = [
@@ -197,7 +199,8 @@ for weights in SAMPLE_WEIGHTS:
             row[f'reward_{name}'] = rewards_list[k][idx]
         all_rows.append(row)
 
-    # Clean up merged model
+    # FIX 3: free accelerator's internal references before deleting the model
+    accelerator.free_memory()
     del model
     gc.collect()
     torch.cuda.empty_cache()
