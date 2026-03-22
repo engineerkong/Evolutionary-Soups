@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
+import datetime
 
 import pandas as pd
 import torch
@@ -317,6 +318,7 @@ output_dir  = os.path.join(script_args.save_directory, script_args.wandb_name)
 os.makedirs(output_dir, exist_ok=True)
 
 set_seed(8888)
+torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=60))
 accelerator = Accelerator()
 process_id  = accelerator.local_process_index
 gpu_id      = process_id
@@ -380,8 +382,14 @@ generation_kwargs = {
     'do_sample': False,
 }
 
-all_rows = []
 num_prompts_per_process = (len(dataset) // script_args.batch_size) * script_args.batch_size
+
+# ---------------------------------------------------------------------------
+# Initialise shard CSV path and header-written flag here,
+# before the inference loop, instead of accumulating all_rows.
+# ---------------------------------------------------------------------------
+shard_path = os.path.join(output_dir, f'collected_rewards_rank{process_id}.csv')
+_csv_header_written = False
 
 
 # ---------------------------------------------------------------------------
@@ -506,6 +514,12 @@ for sample in SAMPLE_WEIGHTS:
             queries_responses, normalize_rewards=False)
 
     shard_start = process_id * num_prompts_per_process
+
+    # ---------------------------------------------------------------------------
+    # Build rows for this combination and append to CSV immediately,
+    # instead of accumulating in all_rows for a single end-of-script write.
+    # ---------------------------------------------------------------------------
+    rows_this_combination = []
     for idx in range(len(full_prompts_decoded)):
         row = {'prompt_idx': shard_start + idx, 'prompt_text': full_prompts_decoded[idx]}
         if script_args.block_mode == 'uniform':
@@ -520,7 +534,14 @@ for sample in SAMPLE_WEIGHTS:
                 row[f'w{k}_late'] = w
         for k, name in enumerate(reward_names):
             row[f'reward_{name}'] = rewards_list[k][idx]
-        all_rows.append(row)
+        rows_this_combination.append(row)
+
+    df_chunk = pd.DataFrame(rows_this_combination)
+    df_chunk.to_csv(shard_path, mode='a', index=False,
+                    header=not _csv_header_written, escapechar='\\')
+    _csv_header_written = True
+    print(f'[Rank {process_id}] Appended {len(rows_this_combination)} rows → {shard_path}')
+    # ---------------------------------------------------------------------------
 
     if not script_args.use_lora:
         # Disk path only — LoRA path reuses base_model across all iterations
@@ -547,12 +568,10 @@ if not script_args.use_lora and process_id == 0:
 
 
 # ---------------------------------------------------------------------------
-# Save shards and merge — unchanged
+# Removed the original one-shot pd.DataFrame(all_rows).to_csv(...)
+# block here — shard CSV is already fully written by this point.
 # ---------------------------------------------------------------------------
-
-shard_path = os.path.join(output_dir, f'collected_rewards_rank{process_id}.csv')
-pd.DataFrame(all_rows).to_csv(shard_path, index=False, escapechar='\\')
-print(f'[Rank {process_id}] Saved {len(all_rows)} rows → {shard_path}')
+print(f'[Rank {process_id}] Shard complete → {shard_path}')
 
 accelerator.wait_for_everyone()     # safe: all ranks reach here symmetrically
 

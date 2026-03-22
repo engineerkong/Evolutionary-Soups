@@ -15,6 +15,7 @@ Output CSV columns (blockwise):
 import os
 import sys
 from dataclasses import dataclass, field
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -26,11 +27,24 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import sample_preferences_uniform
 
+
+def _simplex_grid(n_objectives: int, step: float):
+    """Return all grid points on the probability simplex with given step size."""
+    steps = round(1.0 / step)
+    vals  = [round(i * step, 8) for i in range(steps + 1)]
+    return np.array([
+        list(combo)
+        for combo in product(vals, repeat=n_objectives)
+        if abs(sum(combo) - 1.0) < 1e-6
+    ])
+
+
 def chebyshev_optimal_weights(
     reward_matrix,
     preference,
     sample_weights,
     n_interp=1000,
+    simplex_step=0.1,
 ):
     preference    = np.array(preference,    dtype=np.float64)
     reward_matrix = np.array(reward_matrix, dtype=np.float64)
@@ -38,36 +52,15 @@ def chebyshev_optimal_weights(
 
     blockwise = isinstance(sample_weights[0], tuple)
     n_experts = len(sample_weights[0][0]) if blockwise else len(sample_weights[0])
-    rng       = np.random.default_rng(seed=42)
 
     if not blockwise:
-        if n_experts == 2:
-            # --- 2 experts: exact 1D linear interpolation ---
-            observed_t    = np.array([w[0] for w in sample_weights])
-            sort_idx      = np.argsort(observed_t)
-            observed_t    = observed_t[sort_idx]
-            reward_sorted = reward_matrix[sort_idx]
-
-            fine_t       = np.linspace(observed_t[0], observed_t[-1], n_interp)
-            fine_rewards = np.stack([
-                np.interp(fine_t, observed_t, reward_sorted[:, i])
-                for i in range(reward_matrix.shape[1])
-            ], axis=1)                                       # (n_interp, num_rewards)
-
-            gaps      = preference * np.abs(fine_rewards - r_star)
-            utilities = -gaps.max(axis=1)
-            best_idx  = int(np.argmax(utilities))
-            optimal_t = float(fine_t[best_idx])
-            return [optimal_t, 1.0 - optimal_t]
-
-        else:
-            # --- n_experts>2: RBF surrogate over the full simplex ---
-            X_observed = np.array(sample_weights)            # (num_observed, n_experts)
-            fine_w     = rng.dirichlet(np.ones(n_experts), size=n_interp)
-                                                             # (n_interp, n_experts)
+        # --- uniform: simplex grid ---
+        X_observed = np.array(sample_weights)                # (num_observed, n_experts)
+        fine_w     = _simplex_grid(n_experts, simplex_step)  # (n_grid, n_experts)
 
     else:
         # --- blockwise: RBF surrogate over flattened (early, mid, late) ---
+        rng = np.random.default_rng(seed=42)
         X_observed = np.array([
             list(e) + list(m) + list(l)
             for e, m, l in sample_weights
@@ -79,7 +72,7 @@ def chebyshev_optimal_weights(
         fine_w     = np.concatenate([fine_early, fine_mid, fine_late], axis=1)
                                                              # (n_interp, n_experts*3)
 
-    # --- shared RBF path for n_experts>2 uniform and blockwise ---
+    # --- shared RBF path ---
     from scipy.interpolate import RBFInterpolator
     fine_rewards = np.stack([
         RBFInterpolator(X_observed, reward_matrix[:, i], kernel='linear')(fine_w)
@@ -104,10 +97,12 @@ def chebyshev_optimal_weights(
 class ScriptArguments:
     rewards_csv:      str = './results/new/data/new_assistant/collected_rewards.csv'
     reward_names:     str = 'harmless,helpful'
-    num_pref_samples: int = 11
+    num_pref_samples: int = 11           # 11 for 2 rewards, 66 for 3 rewards
     save_directory:   str = './results/new/'
     wandb_name:       str = 'new_assistant'
-    block_mode:       str = 'uniform'   # 'uniform' | 'custom'
+    block_mode:       str   = 'uniform'  # 'uniform' | 'custom'
+    simplex_step:     float = 0.1        # grid step for uniform n>2 Chebyshev search
+    n_interp:         int   = 1000       # Dirichlet draws for blockwise Chebyshev search
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -167,7 +162,11 @@ for prompt_idx in prompt_ids:
         continue
 
     for preference in preferences:
-        opt_w = chebyshev_optimal_weights(reward_matrix, preference, sample_weights)
+        opt_w = chebyshev_optimal_weights(
+            reward_matrix, preference, sample_weights,
+            n_interp=script_args.n_interp,
+            simplex_step=script_args.simplex_step,
+        )
 
         row = {
             'prompt_idx':  prompt_idx,

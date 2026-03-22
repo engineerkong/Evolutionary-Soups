@@ -53,14 +53,21 @@ def chebyshev_optimal_weights(reward_matrix, preference, sample_weights):
 class GatingNetwork(nn.Module):
     """Maps (prompt_hidden, preference) -> merging weights over experts.
 
-    prompt_hidden : mean-pooled hidden states averaged over the two expert models,
+    prompt_hidden : mean-pooled hidden states averaged over the expert models,
                     shape (batch, lm_hidden_size)
     preference    : shape (batch, num_experts)
-    output        : shape (batch, num_experts), sums to 1 via softmax
+
+    uniform  output : (batch, num_experts),     sums to 1 via softmax
+    custom   output : (batch, num_experts * 3), each block of num_experts sums to 1
     """
 
-    def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_dim=256):
+    def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_dim=256,
+                 block_mode='uniform'):
         super().__init__()
+        self.num_experts = num_experts
+        self.block_mode  = block_mode
+        n_out = num_experts * 3 if block_mode == 'custom' else num_experts
+
         self.prompt_proj = nn.Sequential(
             nn.Linear(lm_hidden_size, hidden_dim),
             nn.ReLU(),
@@ -74,14 +81,18 @@ class GatingNetwork(nn.Module):
         self.fusion = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, num_experts),
+            nn.Linear(hidden_dim // 2, n_out),
         )
 
     def forward(self, prompt_hidden, preference):
-        p = self.prompt_proj(prompt_hidden)
-        r = self.pref_proj(preference)
-        x = torch.cat([p, r], dim=-1)
-        logits = self.fusion(x)
+        p      = self.prompt_proj(prompt_hidden)
+        r      = self.pref_proj(preference)
+        logits = self.fusion(torch.cat([p, r], dim=-1))
+        if self.block_mode == 'custom':
+            # Apply softmax independently to each of the 3 blocks
+            B = logits.shape[0]
+            logits = logits.view(B, 3, self.num_experts)
+            return F.softmax(logits, dim=-1).view(B, 3 * self.num_experts)
         return F.softmax(logits, dim=-1)
 
 
@@ -232,43 +243,38 @@ def merge_model_weights(model, expert_state_dicts, expert_weights):
 
 
 # ---------------------------------------------------------------------------
-# Shared constants and dataset used by both train_new and test_gating_network
+# Dataset — reads gating_dataset.csv produced by build_dataset_mg.py
 # ---------------------------------------------------------------------------
 
-SAMPLE_T_VALUES = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-
-
 class GatingDataset(torch.utils.data.Dataset):
-    """Each item: one (prompt_text, preference, optimal_weights, reward_matrix) tuple."""
+    """Each item: (prompt_text, preference, optimal_weights).
 
-    def __init__(self, dataset_df, rewards_df, reward_names, tokenizer, max_length=256):
-        self.tokenizer = tokenizer
+    uniform  optimal_weights : flat list of length num_experts
+    custom   optimal_weights : flat list of length num_experts * 3
+                               [early_w0, ..., mid_w0, ..., late_w0, ...]
+    """
+
+    def __init__(self, dataset_df, reward_names, tokenizer,
+                 block_mode='uniform', max_length=256):
+        self.tokenizer  = tokenizer
         self.max_length = max_length
-        self.reward_names = reward_names
-        self.items = []
-
-        # Build reward lookup: prompt_idx -> {t_value: reward_vector}
-        reward_lookup = {}
-        for _, row in rewards_df.iterrows():
-            idx = int(row['prompt_idx'])
-            t = float(row['t_value'])
-            rv = [float(row[f'reward_{n}']) for n in reward_names]
-            if idx not in reward_lookup:
-                reward_lookup[idx] = {}
-            reward_lookup[idx][t] = rv
+        self.items      = []
+        n = len(reward_names)
 
         for _, row in dataset_df.iterrows():
-            idx = int(row['prompt_idx'])
-            if idx not in reward_lookup:
-                continue
-            preference = [float(row[f'pref_{n}']) for n in reward_names]
-            optimal_w  = [float(row[f'optimal_w{k}']) for k in range(len(reward_names))]
-            reward_matrix = np.array([reward_lookup[idx][t] for t in SAMPLE_T_VALUES])
+            preference = [float(row[f'pref_{name}']) for name in reward_names]
+            if block_mode == 'uniform':
+                optimal_w = [float(row[f'optimal_w{k}']) for k in range(n)]
+            else:
+                optimal_w = (
+                    [float(row[f'optimal_w{k}_early']) for k in range(n)] +
+                    [float(row[f'optimal_w{k}_mid'])   for k in range(n)] +
+                    [float(row[f'optimal_w{k}_late'])  for k in range(n)]
+                )
             self.items.append({
-                'prompt_text': str(row['prompt_text']),
-                'preference': preference,
+                'prompt_text':     str(row['prompt_text']),
+                'preference':      preference,
                 'optimal_weights': optimal_w,
-                'reward_matrix': reward_matrix,
             })
 
     def __len__(self):
@@ -276,7 +282,7 @@ class GatingDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         item = self.items[idx]
-        enc = self.tokenizer(
+        enc  = self.tokenizer(
             item['prompt_text'],
             max_length=self.max_length,
             truncation=True,
@@ -288,7 +294,6 @@ class GatingDataset(torch.utils.data.Dataset):
             'attention_mask':  enc['attention_mask'].squeeze(0),
             'preference':      torch.tensor(item['preference'],      dtype=torch.float32),
             'optimal_weights': torch.tensor(item['optimal_weights'], dtype=torch.float32),
-            'reward_matrix':   torch.tensor(item['reward_matrix'],   dtype=torch.float32),
         }
 
 

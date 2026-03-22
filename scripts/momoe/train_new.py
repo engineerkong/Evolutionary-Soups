@@ -24,24 +24,24 @@ script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, load_main_tokenizer, print_trainable_parameters
-from new_architecture import GatingNetwork, chebyshev_optimal_weights, GatingDataset, get_prompt_hidden, SAMPLE_T_VALUES
+from new_architecture import GatingNetwork, GatingDataset, get_prompt_hidden
 from new_utils import load_base_model, save_gating_network
 
 
 @dataclass
 class ScriptArguments:
-    sft_model_name: str = './models/sft/model/'
+    sft_model_name:     str       = './models/sft/model/'
     expert_model_paths: List[str] = field(default_factory=list)
-    dataset_csv: str = './data/new/new_assistant/gating_dataset.csv'
-    rewards_csv: str = './data/new/new_assistant/collected_rewards.csv'
-    reward_names: str = 'harmless,helpful'
-    log_with: str = 'none'
-    save_directory: str = './models/new/'
-    wandb_name: str = 'new_assistant'
-    hidden_dim: int = 256
-    lr: float = 1e-4
-    epochs: int = 1000
-    batch_size: int = 128
+    dataset_csv:        str       = './data/new/new_assistant/gating_dataset.csv'
+    reward_names:       str       = 'harmless,helpful'
+    block_mode:         str       = 'uniform'   # 'uniform' | 'custom'
+    log_with:           str       = 'none'
+    save_directory:     str       = './models/new/'
+    wandb_name:         str       = 'new_assistant'
+    hidden_dim:         int       = 256
+    lr:                 float     = 1e-4
+    epochs:             int       = 1000
+    batch_size:         int       = 128
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -73,10 +73,10 @@ with torch.no_grad():
     lm_hidden_size = dummy_out.hidden_states[-1].shape[-1]
 print(f'Detected lm_hidden_size = {lm_hidden_size}')
 
-# Load datasets
-dataset_df = pd.read_csv(script_args.dataset_csv)
-rewards_df = pd.read_csv(script_args.rewards_csv)
-train_dataset = GatingDataset(dataset_df, rewards_df, reward_names, tokenizer)
+# Load dataset
+dataset_df    = pd.read_csv(script_args.dataset_csv)
+train_dataset = GatingDataset(dataset_df, reward_names, tokenizer,
+                               block_mode=script_args.block_mode)
 print(f'Training dataset size: {len(train_dataset)}')
 
 train_loader = DataLoader(train_dataset, batch_size=script_args.batch_size,
@@ -87,6 +87,7 @@ gating_net = GatingNetwork(
     lm_hidden_size=lm_hidden_size,
     num_experts=num_experts,
     hidden_dim=script_args.hidden_dim,
+    block_mode=script_args.block_mode,
 )
 optimizer = torch.optim.Adam(gating_net.parameters(), lr=script_args.lr)
 gating_net, optimizer, train_loader = accelerator.prepare(gating_net, optimizer, train_loader)
@@ -106,54 +107,19 @@ for epoch in range(script_args.epochs):
     progress = tqdm(train_loader, desc=f'Epoch {epoch+1}/{script_args.epochs}')
 
     for batch in progress:
-        input_ids      = batch['input_ids'].to(f'cuda:{gpu_id}')
-        attention_mask = batch['attention_mask'].to(f'cuda:{gpu_id}')
-        preference     = batch['preference'].to(f'cuda:{gpu_id}')
-        optimal_weights= batch['optimal_weights'].to(f'cuda:{gpu_id}')
-        reward_matrix  = batch['reward_matrix'].to(f'cuda:{gpu_id}')
-        # reward_matrix: (B, num_t, num_rewards)
+        input_ids       = batch['input_ids'].to(f'cuda:{gpu_id}')
+        attention_mask  = batch['attention_mask'].to(f'cuda:{gpu_id}')
+        preference      = batch['preference'].to(f'cuda:{gpu_id}')
+        optimal_weights = batch['optimal_weights'].to(f'cuda:{gpu_id}')
 
         # Frozen prompt representation
         prompt_hidden = get_prompt_hidden(expert_models, input_ids, attention_mask)
 
-        # Predicted weights
-        pred_weights = gating_net(prompt_hidden, preference)  # (B, num_experts)
+        # Predicted weights — (B, num_experts) uniform or (B, num_experts*3) blockwise
+        pred_weights = gating_net(prompt_hidden, preference)
 
-        # Reward-space MSE loss
-        # predicted reward = interpolate reward_matrix at pred_weights[:, 0]
-        t_vals = torch.tensor(SAMPLE_T_VALUES, dtype=torch.float32, device=f'cuda:{gpu_id}')
-
-        # Interpolate for predicted t and optimal t
-        def interpolate_reward(weights_col0, reward_mat):
-            """Linear interpolation of reward at given t values.
-            weights_col0: (B,)  the t values to interpolate at
-            reward_mat:   (B, num_t, num_rewards)
-            returns:      (B, num_rewards)
-            """
-            B = weights_col0.shape[0]
-            num_t = len(SAMPLE_T_VALUES)
-            # Find surrounding indices
-            t_vals_exp = t_vals.unsqueeze(0).expand(B, -1)  # (B, num_t)
-            t_query = weights_col0.unsqueeze(1)              # (B, 1)
-            # idx of the first t_val >= t_query
-            idx_high = (t_vals_exp >= t_query).float().argmax(dim=1).clamp(1, num_t-1)  # (B,)
-            idx_low  = (idx_high - 1).clamp(0, num_t-2)
-
-            t_low  = t_vals[idx_low]                          # (B,)
-            t_high = t_vals[idx_high]                         # (B,)
-            span   = (t_high - t_low).clamp(min=1e-8)
-            alpha  = ((t_query.squeeze(1) - t_low) / span).clamp(0, 1)  # (B,)
-
-            r_low  = reward_mat[torch.arange(B), idx_low]    # (B, num_rewards)
-            r_high = reward_mat[torch.arange(B), idx_high]   # (B, num_rewards)
-            return r_low + alpha.unsqueeze(1) * (r_high - r_low)
-
-        pred_t   = pred_weights[:, 0]                  # (B,)
-        opt_t    = optimal_weights[:, 0]               # (B,)
-        pred_r   = interpolate_reward(pred_t, reward_matrix)   # (B, num_rewards)
-        opt_r    = interpolate_reward(opt_t,  reward_matrix)   # (B, num_rewards)
-
-        loss = F.mse_loss(pred_r, opt_r)
+        # Weight-space MSE against Chebyshev ground-truth from build_dataset_mg
+        loss = F.mse_loss(pred_weights, optimal_weights)
 
         optimizer.zero_grad()
         accelerator.backward(loss)
