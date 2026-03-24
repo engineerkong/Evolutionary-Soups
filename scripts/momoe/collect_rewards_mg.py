@@ -304,7 +304,7 @@ class ScriptArguments:
     exp_type:           str       = 'assistant'
     save_directory:     str       = './results/new/'
     wandb_name:         str       = 'new_assistant'
-    batch_size:         int       = 64
+    batch_size:         int       = 128
     split:              str       = 'train'
     block_mode:         str       = 'uniform'
     simplex_step:       float     = 0.2

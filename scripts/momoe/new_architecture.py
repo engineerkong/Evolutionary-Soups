@@ -97,7 +97,101 @@ class GatingNetwork(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Gating Network Trainer
+# Dataset — reads gating_dataset.csv produced by build_dataset_mg.py
+# ---------------------------------------------------------------------------
+
+class GatingDataset(torch.utils.data.Dataset):
+    """Each item: (prompt_text, preference, optimal_weights[, opt_r, reward_basis]).
+
+    uniform  optimal_weights : flat list of length num_experts
+    custom   optimal_weights : flat list of length num_experts * 3
+                               [early_w0, ..., mid_w0, ..., late_w0, ...]
+
+    reward_basis (optional, for loss_mode='reward'):
+        np.array (n_experts_total, n_rewards) — per-prompt linear reward model
+        fit via lstsq on collected_rewards.csv so that r(w) ≈ w @ reward_basis.
+        pred_r = pred_weights @ reward_basis  is then differentiable.
+    opt_r (optional, for loss_mode='reward'):
+        np.array (n_rewards,) — reward at the optimal weights, evaluated via RBF.
+    """
+
+    def __init__(self, dataset_df, reward_names, tokenizer,
+                 block_mode='uniform', max_length=256,
+                 reward_basis_map=None, opt_r_map=None):
+        """
+        reward_basis_map : dict  prompt_idx -> np.array (n_experts_total, n_rewards)
+        opt_r_map        : dict  (prompt_idx, pref_tuple) -> np.array (n_rewards,)
+        """
+        self.tokenizer  = tokenizer
+        self.max_length = max_length
+        self.items      = []
+        n = len(reward_names)
+
+        for _, row in dataset_df.iterrows():
+            preference = [float(row[f'pref_{name}']) for name in reward_names]
+            if block_mode == 'uniform':
+                optimal_w = [float(row[f'optimal_w{k}']) for k in range(n)]
+            else:
+                optimal_w = (
+                    [float(row[f'optimal_w{k}_early']) for k in range(n)] +
+                    [float(row[f'optimal_w{k}_mid'])   for k in range(n)] +
+                    [float(row[f'optimal_w{k}_late'])  for k in range(n)]
+                )
+            pidx     = int(row['prompt_idx'])
+            pref_key = tuple(round(v, 6) for v in preference)
+            item = {
+                'prompt_idx':      pidx,
+                'prompt_text':     str(row['prompt_text']),
+                'preference':      preference,
+                'optimal_weights': optimal_w,
+                'reward_basis':    reward_basis_map[pidx]             if reward_basis_map else None,
+                'opt_r':           opt_r_map.get((pidx, pref_key))   if opt_r_map        else None,
+            }
+            self.items.append(item)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        item = self.items[idx]
+        enc  = self.tokenizer(
+            item['prompt_text'],
+            max_length=self.max_length,
+            truncation=True,
+            padding='max_length',
+            return_tensors='pt',
+        )
+        out = {
+            'prompt_idx':      torch.tensor(item['prompt_idx'],      dtype=torch.long),
+            'input_ids':       enc['input_ids'].squeeze(0),
+            'attention_mask':  enc['attention_mask'].squeeze(0),
+            'preference':      torch.tensor(item['preference'],      dtype=torch.float32),
+            'optimal_weights': torch.tensor(item['optimal_weights'], dtype=torch.float32),
+        }
+        if item['reward_basis'] is not None:
+            out['reward_basis'] = torch.tensor(item['reward_basis'], dtype=torch.float32)
+        if item['opt_r'] is not None:
+            out['opt_r'] = torch.tensor(item['opt_r'], dtype=torch.float32)
+        return out
+
+
+def get_prompt_hidden(expert_models, input_ids, attention_mask):
+    """Frozen mean-pool hidden states averaged over all expert models."""
+    all_hidden = []
+    with torch.no_grad():
+        for model in expert_models:
+            out = model(input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True)
+            h = out.hidden_states[-1]
+            mask = attention_mask.unsqueeze(-1).float()
+            pooled = (h * mask).sum(1) / mask.sum(1)
+            all_hidden.append(pooled)
+    return torch.stack(all_hidden).mean(0)
+
+
+# ---------------------------------------------------------------------------
+# Gating Network Trainer (not in use)
 # ---------------------------------------------------------------------------
 
 class GatingNetworkTrainer:
@@ -213,7 +307,7 @@ class GatingNetworkTrainer:
 
 
 # ---------------------------------------------------------------------------
-# Model merging (kept from qmo_architecture for reuse in eval)
+# Model merging (not in use)
 # ---------------------------------------------------------------------------
 
 def merge_model_weights(model, expert_state_dicts, expert_weights):
@@ -241,72 +335,3 @@ def merge_model_weights(model, expert_state_dicts, expert_weights):
             buffer_map[key].copy_(
                 merged_val.to(dtype=buffer_map[key].dtype, device=buffer_map[key].device))
 
-
-# ---------------------------------------------------------------------------
-# Dataset — reads gating_dataset.csv produced by build_dataset_mg.py
-# ---------------------------------------------------------------------------
-
-class GatingDataset(torch.utils.data.Dataset):
-    """Each item: (prompt_text, preference, optimal_weights).
-
-    uniform  optimal_weights : flat list of length num_experts
-    custom   optimal_weights : flat list of length num_experts * 3
-                               [early_w0, ..., mid_w0, ..., late_w0, ...]
-    """
-
-    def __init__(self, dataset_df, reward_names, tokenizer,
-                 block_mode='uniform', max_length=256):
-        self.tokenizer  = tokenizer
-        self.max_length = max_length
-        self.items      = []
-        n = len(reward_names)
-
-        for _, row in dataset_df.iterrows():
-            preference = [float(row[f'pref_{name}']) for name in reward_names]
-            if block_mode == 'uniform':
-                optimal_w = [float(row[f'optimal_w{k}']) for k in range(n)]
-            else:
-                optimal_w = (
-                    [float(row[f'optimal_w{k}_early']) for k in range(n)] +
-                    [float(row[f'optimal_w{k}_mid'])   for k in range(n)] +
-                    [float(row[f'optimal_w{k}_late'])  for k in range(n)]
-                )
-            self.items.append({
-                'prompt_text':     str(row['prompt_text']),
-                'preference':      preference,
-                'optimal_weights': optimal_w,
-            })
-
-    def __len__(self):
-        return len(self.items)
-
-    def __getitem__(self, idx):
-        item = self.items[idx]
-        enc  = self.tokenizer(
-            item['prompt_text'],
-            max_length=self.max_length,
-            truncation=True,
-            padding='max_length',
-            return_tensors='pt',
-        )
-        return {
-            'input_ids':       enc['input_ids'].squeeze(0),
-            'attention_mask':  enc['attention_mask'].squeeze(0),
-            'preference':      torch.tensor(item['preference'],      dtype=torch.float32),
-            'optimal_weights': torch.tensor(item['optimal_weights'], dtype=torch.float32),
-        }
-
-
-def get_prompt_hidden(expert_models, input_ids, attention_mask):
-    """Frozen mean-pool hidden states averaged over all expert models."""
-    all_hidden = []
-    with torch.no_grad():
-        for model in expert_models:
-            out = model(input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True)
-            h = out.hidden_states[-1]
-            mask = attention_mask.unsqueeze(-1).float()
-            pooled = (h * mask).sum(1) / mask.sum(1)
-            all_hidden.append(pooled)
-    return torch.stack(all_hidden).mean(0)

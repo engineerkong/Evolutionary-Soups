@@ -95,7 +95,7 @@ def chebyshev_optimal_weights(
 
 @dataclass
 class ScriptArguments:
-    rewards_csv:      str = './results/new/data/new_assistant/collected_rewards.csv'
+    rewards_csv:      str = './results/new/new_assistant/collected_rewards.csv'
     reward_names:     str = 'harmless,helpful'
     num_pref_samples: int = 11           # 11 for 2 rewards, 66 for 3 rewards
     save_directory:   str = './results/new/'

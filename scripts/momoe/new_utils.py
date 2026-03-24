@@ -172,13 +172,15 @@ def save_gating_network(gating_net, save_path):
     torch.save(gating_net.state_dict(), os.path.join(save_path, 'gating_network.pt'))
 
 
-def load_gating_network(save_path, lm_hidden_size=4096, num_experts=2, device='cuda'):
+def load_gating_network(save_path, lm_hidden_size=4096, num_experts=2,
+                        block_mode='uniform', device='cuda'):
     """Resolve checkpoint and load GatingNetwork."""
     resolved = _resolve_checkpoint(save_path, 'gating_network.pt')
     ckpt_file = os.path.join(resolved, 'gating_network.pt')
     if not os.path.exists(ckpt_file):
         return None
-    net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts)
+    net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
+                        block_mode=block_mode)
     net.load_state_dict(torch.load(ckpt_file, map_location=device))
     return net.to(device)
 

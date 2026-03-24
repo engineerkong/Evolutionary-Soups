@@ -1,8 +1,16 @@
-"""Step 3: Train GatingNetwork on the supervised dataset from build_dataset.py.
+"""Step 3: Train GatingNetwork on the supervised dataset from build_dataset_mg.py.
 
-The network learns f(prompt_hidden, preference) -> merging weights.
-prompt_hidden is the mean-pooled last hidden state averaged over both expert models.
-Loss is reward-space MSE: predicted_reward vs chebyshev_optimal_reward.
+loss_mode='weight' (default):
+    MSE between predicted weights and Chebyshev-optimal weights.
+    Fast — no reward data needed beyond gating_dataset.csv.
+
+loss_mode='reward':
+    MSE between predicted reward and optimal reward.
+    pred_r = pred_weights @ B  where B is a per-prompt linear reward model
+    fit from collected_rewards.csv via least squares, making pred_r fully
+    differentiable w.r.t. pred_weights.
+    opt_r is the reward at optimal_weights, evaluated via RBF offline.
+    Requires --rewards_csv.
 """
 import os
 import sys
@@ -15,6 +23,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
+from scipy.interpolate import RBFInterpolator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import HfArgumentParser
@@ -32,9 +41,11 @@ from new_utils import load_base_model, save_gating_network
 class ScriptArguments:
     sft_model_name:     str       = './models/sft/model/'
     expert_model_paths: List[str] = field(default_factory=list)
+    rewards_csv:        str       = ''          # required when loss_mode='reward'
     dataset_csv:        str       = './data/new/new_assistant/gating_dataset.csv'
     reward_names:       str       = 'harmless,helpful'
     block_mode:         str       = 'uniform'   # 'uniform' | 'custom'
+    loss_mode:          str       = 'weight'    # 'weight'  | 'reward'
     log_with:           str       = 'none'
     save_directory:     str       = './models/new/'
     wandb_name:         str       = 'new_assistant'
@@ -46,14 +57,18 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
+
+if script_args.loss_mode == 'reward' and not script_args.rewards_csv:
+    raise ValueError('--rewards_csv is required when --loss_mode reward')
+
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 os.makedirs(output_dir, exist_ok=True)
 
 set_seed(8888)
 accelerator = Accelerator()
-gpu_id = accelerator.local_process_index
+gpu_id       = accelerator.local_process_index
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
-num_experts = len(reward_names)
+num_rewards  = len(reward_names)
 
 tokenizer = load_main_tokenizer(script_args.sft_model_name)
 
@@ -66,26 +81,85 @@ for path in script_args.expert_model_paths:
         p.requires_grad = False
     expert_models.append(m)
 
-# Infer hidden size from first expert
 with torch.no_grad():
-    dummy = tokenizer('hello', return_tensors='pt').to(f'cuda:{gpu_id}')
+    dummy     = tokenizer('hello', return_tensors='pt').to(f'cuda:{gpu_id}')
     dummy_out = expert_models[0](**dummy, output_hidden_states=True)
     lm_hidden_size = dummy_out.hidden_states[-1].shape[-1]
 print(f'Detected lm_hidden_size = {lm_hidden_size}')
 
-# Load dataset
+# ── Precompute reward maps (only for loss_mode='reward') ─────────────────────
+reward_basis_map = None   # prompt_idx -> np.array (n_experts_total, n_rewards)
+opt_r_map        = None   # (prompt_idx, pref_tuple) -> np.array (n_rewards,)
+
+if script_args.loss_mode == 'reward':
+    rewards_df   = pd.read_csv(script_args.rewards_csv)
+    dataset_df_r = pd.read_csv(script_args.dataset_csv)   # needed for opt_r lookup
+    r_cols = [f'reward_{n}' for n in reward_names]
+
+    # Infer weight columns
+    if script_args.block_mode == 'uniform':
+        w_cols = sorted([c for c in rewards_df.columns
+                         if c.startswith('w') and c[1:].isdigit()],
+                        key=lambda c: int(c[1:]))
+    else:
+        e_cols = sorted([c for c in rewards_df.columns if c.endswith('_early')],
+                        key=lambda c: int(c[1:c.index('_')]))
+        m_cols = sorted([c for c in rewards_df.columns if c.endswith('_mid')],
+                        key=lambda c: int(c[1:c.index('_')]))
+        l_cols = sorted([c for c in rewards_df.columns if c.endswith('_late')],
+                        key=lambda c: int(c[1:c.index('_')]))
+        w_cols = e_cols + m_cols + l_cols
+
+    print('Precomputing reward basis and opt_r ...')
+    reward_basis_map = {}
+    opt_r_map        = {}
+
+    for pidx in rewards_df['prompt_idx'].unique():
+        sub = rewards_df[rewards_df['prompt_idx'] == pidx]
+        W   = sub[w_cols].values.astype(np.float64)   # (n_obs, n_experts_total)
+        R   = sub[r_cols].values.astype(np.float64)   # (n_obs, n_rewards)
+
+        # Per-prompt linear reward model: R ≈ W @ B  (lstsq fit)
+        B, _, _, _ = np.linalg.lstsq(W, R, rcond=None)  # (n_experts_total, n_rewards)
+        reward_basis_map[int(pidx)] = B.astype(np.float32)
+
+        # Per-prompt RBF to evaluate reward at optimal weights
+        rbfs = [RBFInterpolator(W, R[:, k], kernel='linear') for k in range(num_rewards)]
+
+        # Look up all (prompt, preference) rows in dataset_csv for this prompt
+        rows = dataset_df_r[dataset_df_r['prompt_idx'] == pidx]
+        for _, drow in rows.iterrows():
+            if script_args.block_mode == 'uniform':
+                opt_w = np.array([float(drow[f'optimal_w{k}'])
+                                  for k in range(num_rewards)], dtype=np.float64)
+            else:
+                opt_w = np.array(
+                    [float(drow[f'optimal_w{k}_early']) for k in range(num_rewards)] +
+                    [float(drow[f'optimal_w{k}_mid'])   for k in range(num_rewards)] +
+                    [float(drow[f'optimal_w{k}_late'])  for k in range(num_rewards)],
+                    dtype=np.float64)
+            opt_r = np.array([rbfs[k](opt_w.reshape(1, -1))[0]
+                              for k in range(num_rewards)], dtype=np.float32)
+            pref_key = tuple(round(float(drow[f'pref_{n}']), 6) for n in reward_names)
+            opt_r_map[(int(pidx), pref_key)] = opt_r
+
+    print(f'  Done. {len(reward_basis_map)} prompts, {len(opt_r_map)} (prompt, pref) pairs.')
+
+# ── Dataset and loader ────────────────────────────────────────────────────────
 dataset_df    = pd.read_csv(script_args.dataset_csv)
 train_dataset = GatingDataset(dataset_df, reward_names, tokenizer,
-                               block_mode=script_args.block_mode)
+                               block_mode=script_args.block_mode,
+                               reward_basis_map=reward_basis_map,
+                               opt_r_map=opt_r_map)
 print(f'Training dataset size: {len(train_dataset)}')
 
 train_loader = DataLoader(train_dataset, batch_size=script_args.batch_size,
                           shuffle=True, drop_last=True)
 
-# Gating network
+# ── Gating network ────────────────────────────────────────────────────────────
 gating_net = GatingNetwork(
     lm_hidden_size=lm_hidden_size,
-    num_experts=num_experts,
+    num_experts=num_rewards,
     hidden_dim=script_args.hidden_dim,
     block_mode=script_args.block_mode,
 )
@@ -99,7 +173,9 @@ if accelerator.is_main_process and script_args.log_with == 'wandb':
     wandb_run = wandb.init(project='new_gating', name=script_args.wandb_name)
 
 print_trainable_parameters(gating_net)
+print(f'loss_mode = {script_args.loss_mode}')
 
+# ── Training loop ─────────────────────────────────────────────────────────────
 global_step = 0
 for epoch in range(script_args.epochs):
     gating_net.train()
@@ -112,14 +188,19 @@ for epoch in range(script_args.epochs):
         preference      = batch['preference'].to(f'cuda:{gpu_id}')
         optimal_weights = batch['optimal_weights'].to(f'cuda:{gpu_id}')
 
-        # Frozen prompt representation
         prompt_hidden = get_prompt_hidden(expert_models, input_ids, attention_mask)
+        pred_weights  = gating_net(prompt_hidden, preference)
 
-        # Predicted weights — (B, num_experts) uniform or (B, num_experts*3) blockwise
-        pred_weights = gating_net(prompt_hidden, preference)
+        if script_args.loss_mode == 'weight':
+            loss = F.mse_loss(pred_weights, optimal_weights)
 
-        # Weight-space MSE against Chebyshev ground-truth from build_dataset_mg
-        loss = F.mse_loss(pred_weights, optimal_weights)
+        else:  # 'reward'
+            # reward_basis: (B, n_experts_total, n_rewards)
+            # pred_r = pred_weights @ reward_basis  — differentiable w.r.t. pred_weights
+            reward_basis = batch['reward_basis'].to(f'cuda:{gpu_id}')
+            opt_r        = batch['opt_r'].to(f'cuda:{gpu_id}')
+            pred_r = torch.einsum('be,ber->br', pred_weights, reward_basis)
+            loss   = F.mse_loss(pred_r, opt_r)
 
         optimizer.zero_grad()
         accelerator.backward(loss)
