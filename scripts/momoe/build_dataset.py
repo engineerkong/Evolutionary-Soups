@@ -28,35 +28,16 @@ script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import sample_preferences_uniform
-
-
-def utility_optimal_weights(reward_matrix, preference, sample_weights):
-    """Return the sample weight with the highest linear utility sum_i(pref_i * reward_i).
-
-    Args:
-        reward_matrix:  (n_samples, n_rewards) array of real measured rewards.
-        preference:     (n_rewards,) preference vector summing to 1.
-        sample_weights: list of weight vectors (uniform) or list of (early, mid, late)
-                        tuples (blockwise). Must have n_samples entries.
-
-    Returns:
-        The entry from sample_weights with the highest utility (same type as input).
-    """
-    preference    = np.array(preference,    dtype=np.float64)
-    reward_matrix = np.array(reward_matrix, dtype=np.float64)
-    utilities     = reward_matrix @ preference   # (n_samples,)
-    best_idx      = int(np.argmax(utilities))
-    return sample_weights[best_idx]
-
+from new_utils import utility_optimal_weights
 
 @dataclass
 class ScriptArguments:
     rewards_csv:      str = './results/new/new_assistant/collected_rewards.csv'
     reward_names:     str = 'harmless,helpful'
     num_pref_samples: int = 11           # 11 for 2 rewards, 66 for 3 rewards
+    block_mode:       str = 'uniform'    # 'uniform' | 'custom'
     save_directory:   str = './results/new/'
     wandb_name:       str = 'new_assistant'
-    block_mode:       str = 'uniform'    # 'uniform' | 'custom'
 
 
 parser = HfArgumentParser(ScriptArguments)

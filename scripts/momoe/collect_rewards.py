@@ -17,9 +17,8 @@ import os
 import shutil
 import sys
 from dataclasses import dataclass, field
-from itertools import product
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List
 import datetime
 
 import pandas as pd
@@ -27,9 +26,9 @@ import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorWithPadding, HfArgumentParser
+from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from trl import set_seed
-from peft import PeftModel, set_peft_model_state_dict
+from peft import PeftModel
 
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
@@ -41,6 +40,11 @@ from scripts.utils.utils import (
     build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
     get_clean_data, load_main_tokenizer
 )
+from new_utils import (
+    EARLY_FRAC, LATE_FRAC, get_simplex_samples,
+    merge_and_save_weights, merge_and_save_weights_blockwise,
+    load_lora_adapters, apply_merged_lora, apply_merged_lora_blockwise,
+)
 
 REWARD_PATHS = {
     'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
@@ -50,246 +54,6 @@ REWARD_PATHS = {
     'faithful': 'CogComp/bart-faithful-summary-detector',
     'humor':    'mohameddhiab/humor-no-humor',
 }
-
-EARLY_FRAC = 1 / 3
-LATE_FRAC  = 1 / 3
-
-
-# ---------------------------------------------------------------------------
-# Simplex sampling — unchanged
-# ---------------------------------------------------------------------------
-
-def get_simplex_samples(
-    n_objectives: int,
-    step: float = 0.2,
-    block_mode: str = 'uniform',
-) -> List[Union[List[float], Tuple[List[float], List[float], List[float]]]]:
-    """
-    Generate weight samples on the simplex.
-
-    uniform : returns List[List[float]]
-    custom  : returns List[Tuple[List[float], List[float], List[float]]]
-    """
-    steps = round(1.0 / step)
-    vals  = [round(i * step, 8) for i in range(steps + 1)]
-    base  = [
-        list(combo)
-        for combo in product(vals, repeat=n_objectives)
-        if abs(sum(combo) - 1.0) < 1e-6
-    ]
-    if block_mode == 'uniform':
-        return base
-    if block_mode == 'custom':
-        return list(product(base, base, base))
-    raise ValueError(f"Unknown block_mode '{block_mode}'. Choose: uniform | custom")
-
-
-# ---------------------------------------------------------------------------
-# Shared layer-classification helpers
-# ---------------------------------------------------------------------------
-
-def _get_layer_idx(key: str) -> Optional[int]:
-    """Extract layer index from keys like 'model.layers.7.self_attn.q_proj.weight'."""
-    parts = key.split('.')
-    for i, part in enumerate(parts):
-        if part == 'layers' and i + 1 < len(parts):
-            try:
-                return int(parts[i + 1])
-            except ValueError:
-                pass
-    return None
-
-
-def _is_head_tensor(key: str) -> bool:
-    return any(k in key for k in ('lm_head', 'model.norm'))
-
-
-def _is_embed_tensor(key: str) -> bool:
-    return 'embed_tokens' in key
-
-
-def _block_weights_fn(key: str,
-                      early_weights: List[float],
-                      mid_weights:   List[float],
-                      late_weights:  List[float],
-                      early_end:     int,
-                      late_start:    int) -> List[float]:
-    """Return the weight vector that should govern tensor `key`."""
-    if _is_embed_tensor(key):
-        return early_weights
-    if _is_head_tensor(key):
-        return late_weights
-    idx = _get_layer_idx(key)
-    if idx is None:
-        return mid_weights
-    if idx < early_end:
-        return early_weights
-    if idx >= late_start:
-        return late_weights
-    return mid_weights
-
-
-# ---------------------------------------------------------------------------
-# Disk-based merge helpers  (used only when use_lora=False — original path)
-# ---------------------------------------------------------------------------
-
-def merge_and_save_weights(
-    expert_model_paths: List[str],
-    weights: List[float],
-    save_path: str,
-):
-    """Flat merge — same weight vector applied to every tensor (uniform mode)."""
-    n_experts = len(expert_model_paths)
-    assert len(weights) == n_experts
-    assert abs(sum(weights) - 1.0) < 1e-6
-
-    print(f"  Loading {n_experts} expert models for flat merge...")
-    models      = [AutoModelForCausalLM.from_pretrained(p, torch_dtype=torch.float32)
-                   for p in expert_model_paths]
-    state_dicts = [m.state_dict() for m in models]
-
-    merged = {
-        key: sum(weights[k] * state_dicts[k][key].float() for k in range(n_experts))
-        for key in state_dicts[0]
-    }
-    models[0].load_state_dict(merged)
-    models[0].half()
-    models[0].save_pretrained(save_path)
-    AutoTokenizer.from_pretrained(expert_model_paths[0]).save_pretrained(save_path)
-    print(f"  Saved flat-merged model → {save_path}")
-
-
-def merge_and_save_weights_blockwise(
-    expert_model_paths: List[str],
-    early_weights: List[float],
-    mid_weights:   List[float],
-    late_weights:  List[float],
-    save_path: str,
-    early_frac: float = EARLY_FRAC,
-    late_frac:  float = LATE_FRAC,
-):
-    """Blockwise disk merge — different weight vectors per layer block."""
-    n_experts = len(expert_model_paths)
-    for name, w in [('early', early_weights), ('mid', mid_weights), ('late', late_weights)]:
-        assert len(w) == n_experts, \
-            f"{name}_weights has {len(w)} entries but there are {n_experts} experts"
-        assert abs(sum(w) - 1.0) < 1e-6, \
-            f"{name}_weights must sum to 1.0, got {sum(w):.6f}"
-
-    print(f"  Loading {n_experts} expert models for blockwise merge...")
-    models      = [AutoModelForCausalLM.from_pretrained(p, torch_dtype=torch.float32)
-                   for p in expert_model_paths]
-    state_dicts = [m.state_dict() for m in models]
-
-    n_layers   = models[0].config.num_hidden_layers
-    early_end  = int(n_layers * early_frac)
-    late_start = n_layers - int(n_layers * late_frac)
-
-    print(f"  Layers: {n_layers} total | "
-          f"early 0–{early_end-1} {early_weights} | "
-          f"mid {early_end}–{late_start-1} {mid_weights} | "
-          f"late {late_start}–{n_layers-1} {late_weights}")
-
-    merged = {
-        key: sum(
-            _block_weights_fn(key, early_weights, mid_weights, late_weights,
-                              early_end, late_start)[k] * state_dicts[k][key].float()
-            for k in range(n_experts)
-        )
-        for key in state_dicts[0]
-    }
-    models[0].load_state_dict(merged)
-    models[0].half()
-    models[0].save_pretrained(save_path)
-    AutoTokenizer.from_pretrained(expert_model_paths[0]).save_pretrained(save_path)
-    print(f"  Saved blockwise-merged model → {save_path}")
-
-
-# ---------------------------------------------------------------------------
-# LoRA-based merge helpers  (used only when use_lora=True — new fast path)
-# ---------------------------------------------------------------------------
-
-def load_lora_adapters(base_model: PeftModel,
-                       expert_model_paths: List[str]) -> List[dict]:
-    """
-    Load each expert's LoRA adapter into CPU memory as a plain state dict.
-    The base model is never duplicated — only the tiny delta weights are kept.
-    Called ONCE before the inference sweep.
-
-    Loads adapter files directly from disk (safetensors or bin) so that
-    base_model is never modified: the previous approach used PeftModel.from_pretrained
-    + unload() which stripped LoRA modules from base_model in-place, causing
-    set_peft_model_state_dict to silently no-op during inference.
-    """
-    import os
-    adapter_state_dicts = []
-    for path in expert_model_paths:
-        sf_path  = os.path.join(path, 'adapter_model.safetensors')
-        bin_path = os.path.join(path, 'adapter_model.bin')
-        if os.path.exists(sf_path):
-            from safetensors.torch import load_file
-            sd = {k: v.clone().cpu() for k, v in load_file(sf_path).items()}
-        elif os.path.exists(bin_path):
-            sd = {k: v.clone().cpu() for k, v in torch.load(bin_path, map_location='cpu').items()}
-        else:
-            raise FileNotFoundError(
-                f"No adapter_model.safetensors or adapter_model.bin found in {path}")
-        adapter_state_dicts.append(sd)
-        print(f"  Cached LoRA adapter: {path}")
-    return adapter_state_dicts
-
-
-def apply_merged_lora(
-    peft_model: PeftModel,
-    adapter_state_dicts: List[dict],
-    weights: List[float],
-) -> None:
-    """
-    Flat interpolation: merge adapter dicts with `weights` and hot-swap them
-    onto `peft_model` in-place.  No disk I/O, no model reload.
-    """
-    assert abs(sum(weights) - 1.0) < 1e-6, f"weights must sum to 1, got {sum(weights)}"
-    merged = {
-        key: sum(weights[k] * adapter_state_dicts[k][key].float()
-                 for k in range(len(weights)))
-        for key in adapter_state_dicts[0]
-    }
-    set_peft_model_state_dict(peft_model,
-                              {k: v.to(peft_model.device) for k, v in merged.items()})
-    del merged
-    gc.collect()
-
-
-def apply_merged_lora_blockwise(
-    peft_model: PeftModel,
-    adapter_state_dicts: List[dict],
-    early_weights: List[float],
-    mid_weights:   List[float],
-    late_weights:  List[float],
-    n_layers: int,
-    early_frac: float = EARLY_FRAC,
-    late_frac:  float = LATE_FRAC,
-) -> None:
-    """
-    Blockwise interpolation: different weight vectors for early / mid / late
-    LoRA adapter keys.  Hot-swapped in-place, no disk I/O.
-    """
-    early_end  = int(n_layers * early_frac)
-    late_start = n_layers - int(n_layers * late_frac)
-
-    merged = {
-        key: sum(
-            _block_weights_fn(key, early_weights, mid_weights, late_weights,
-                              early_end, late_start)[k]
-            * adapter_state_dicts[k][key].float()
-            for k in range(len(adapter_state_dicts))
-        )
-        for key in adapter_state_dicts[0]
-    }
-    set_peft_model_state_dict(peft_model,
-                              {k: v.to(peft_model.device) for k, v in merged.items()})
-    del merged
-    gc.collect()
 
 
 # ---------------------------------------------------------------------------
@@ -302,14 +66,14 @@ class ScriptArguments:
     expert_model_paths: List[str] = field(default_factory=list)
     reward_names:       str       = 'harmless,helpful'
     exp_type:           str       = 'assistant'
-    save_directory:     str       = './results/new/'
-    wandb_name:         str       = 'new_assistant'
     batch_size:         int       = 128
     split:              str       = 'train'
     block_mode:         str       = 'uniform'
     simplex_step:       float     = 0.2
     use_lora:           bool      = True    # True → in-memory LoRA swap (recommended)
                                             # False → original disk merge
+    save_directory:     str       = './results/new/'
+    wandb_name:         str       = 'new_assistant'
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -339,7 +103,7 @@ print(f'block_mode={script_args.block_mode} | '
 
 
 # ---------------------------------------------------------------------------
-# Dataset / dataloader setup — unchanged
+# Dataset / dataloader setup
 # ---------------------------------------------------------------------------
 
 tokenizer = load_main_tokenizer(script_args.sft_model_name)
@@ -362,9 +126,18 @@ else:
             'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
 
+# Compute true shard start in the full dataset before sharding.
+# HuggingFace shard(contiguous=True) splits N items into n shards where
+# shard k starts at:  (N // n) * k + min(k, N % n)
+_full_size = len(dataset)
 if accelerator.num_processes > 1:
+    _div, _mod = divmod(_full_size, accelerator.num_processes)
+    shard_start = _div * process_id + min(process_id, _mod)
+    print(f'[Rank {process_id}] Full dataset size: {_full_size} | Shard start index: {shard_start}')
     dataset = dataset.shard(num_shards=accelerator.num_processes,
                             index=process_id, contiguous=True)
+else:
+    shard_start = 0
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:
@@ -372,7 +145,7 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
 
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 dataloader    = DataLoader(dataset, batch_size=script_args.batch_size,
-                           drop_last=True, collate_fn=data_collator)
+                           drop_last=False, collate_fn=data_collator)
 
 generation_kwargs = {
     'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
@@ -381,8 +154,6 @@ generation_kwargs = {
     'top_p': 0.9,
     'do_sample': False,
 }
-
-num_prompts_per_process = (len(dataset) // script_args.batch_size) * script_args.batch_size
 
 # ---------------------------------------------------------------------------
 # Initialise shard CSV path and header-written flag here,
@@ -427,19 +198,25 @@ else:
             if script_args.block_mode == 'uniform':
                 weights_str = '_'.join(f'{w:.2f}' for w in sample)
                 temp_path   = os.path.join(output_dir, f'temp_model_w{weights_str}')
-                merge_and_save_weights(
-                    expert_model_paths=script_args.expert_model_paths,
-                    weights=sample, save_path=temp_path)
+                if os.path.exists(temp_path):
+                    print(f'  Skipping (already exists): {temp_path}')
+                else:
+                    merge_and_save_weights(
+                        expert_model_paths=script_args.expert_model_paths,
+                        weights=sample, save_path=temp_path)
             else:
                 early_w, mid_w, late_w = sample
                 weights_str = ('E' + '_'.join(f'{w:.2f}' for w in early_w) +
                                '_M' + '_'.join(f'{w:.2f}' for w in mid_w) +
                                '_L' + '_'.join(f'{w:.2f}' for w in late_w))
                 temp_path = os.path.join(output_dir, f'temp_model_w{weights_str}')
-                merge_and_save_weights_blockwise(
-                    expert_model_paths=script_args.expert_model_paths,
-                    early_weights=early_w, mid_weights=mid_w, late_weights=late_w,
-                    save_path=temp_path)
+                if os.path.exists(temp_path):
+                    print(f'  Skipping (already exists): {temp_path}')
+                else:
+                    merge_and_save_weights_blockwise(
+                        expert_model_paths=script_args.expert_model_paths,
+                        early_weights=early_w, mid_weights=mid_w, late_weights=late_w,
+                        save_path=temp_path)
         print(f'\n[Rank 0] All {len(SAMPLE_WEIGHTS)} models merged and saved to disk.')
     accelerator.wait_for_everyone()     # only barrier in the whole script; disk path only
 
@@ -513,15 +290,14 @@ for sample in SAMPLE_WEIGHTS:
         rewards_list = reward_models.get_reward_model_scores(
             queries_responses, normalize_rewards=False)
 
-    shard_start = process_id * num_prompts_per_process
-
     # ---------------------------------------------------------------------------
     # Build rows for this combination and append to CSV immediately,
     # instead of accumulating in all_rows for a single end-of-script write.
     # ---------------------------------------------------------------------------
     rows_this_combination = []
     for idx in range(len(full_prompts_decoded)):
-        row = {'prompt_idx': shard_start + idx, 'prompt_text': full_prompts_decoded[idx]}
+        row = {'prompt_idx': shard_start + idx,
+               'prompt_text': full_prompts_decoded[idx].replace('\r', '').replace('\n', ' ')}
         if script_args.block_mode == 'uniform':
             for k, w in enumerate(sample):
                 row[f'w{k}'] = w
@@ -550,21 +326,21 @@ for sample in SAMPLE_WEIGHTS:
         torch.cuda.empty_cache()
 
 
-# ---------------------------------------------------------------------------
-# Cleanup temp models — disk path only
-# ---------------------------------------------------------------------------
+# # ---------------------------------------------------------------------------
+# # Cleanup temp models — disk path only
+# # ---------------------------------------------------------------------------
 
-if not script_args.use_lora and process_id == 0:
-    for sample in SAMPLE_WEIGHTS:
-        if script_args.block_mode == 'uniform':
-            weights_str = '_'.join(f'{w:.2f}' for w in sample)
-        else:
-            early_w, mid_w, late_w = sample
-            weights_str = ('E' + '_'.join(f'{w:.2f}' for w in early_w) +
-                           '_M' + '_'.join(f'{w:.2f}' for w in mid_w) +
-                           '_L' + '_'.join(f'{w:.2f}' for w in late_w))
-        shutil.rmtree(os.path.join(output_dir, f'temp_model_w{weights_str}'),
-                      ignore_errors=True)
+# if not script_args.use_lora and process_id == 0:
+#     for sample in SAMPLE_WEIGHTS:
+#         if script_args.block_mode == 'uniform':
+#             weights_str = '_'.join(f'{w:.2f}' for w in sample)
+#         else:
+#             early_w, mid_w, late_w = sample
+#             weights_str = ('E' + '_'.join(f'{w:.2f}' for w in early_w) +
+#                            '_M' + '_'.join(f'{w:.2f}' for w in mid_w) +
+#                            '_L' + '_'.join(f'{w:.2f}' for w in late_w))
+#         shutil.rmtree(os.path.join(output_dir, f'temp_model_w{weights_str}'),
+#                       ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

@@ -3,19 +3,258 @@ import json
 import os
 import re
 import shutil
+from itertools import product
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
 from pymoo.indicators.hv import HV
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from new_architecture import GatingNetwork
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-def compute_hypervolume(reward_vectors):
-    if len(reward_vectors) == 0:
-        return 0.0
-    return HV(ref_point=np.ones(len(reward_vectors[0])))(-np.array(reward_vectors))
+EARLY_FRAC = 1 / 3
+LATE_FRAC  = 1 / 3
+
+# ---------------------------------------------------------------------------
+# Simplex sampling
+# ---------------------------------------------------------------------------
+
+def get_simplex_samples(
+    n_objectives: int,
+    step: float = 0.2,
+    block_mode: str = 'uniform',
+) -> List[Union[List[float], Tuple[List[float], List[float], List[float]]]]:
+    """Generate weight samples on the simplex.
+
+    uniform : returns List[List[float]]
+    custom  : returns List[Tuple[List[float], List[float], List[float]]]
+    """
+    steps = round(1.0 / step)
+    vals  = [round(i * step, 8) for i in range(steps + 1)]
+    base  = [
+        list(combo)
+        for combo in product(vals, repeat=n_objectives)
+        if abs(sum(combo) - 1.0) < 1e-6
+    ]
+    if block_mode == 'uniform':
+        return base
+    if block_mode == 'custom':
+        return list(product(base, base, base))
+    raise ValueError(f"Unknown block_mode '{block_mode}'. Choose: uniform | custom")
+
+# ---------------------------------------------------------------------------
+# Shared layer-classification helpers
+# ---------------------------------------------------------------------------
+
+def _get_layer_idx(key: str):
+    """Extract layer index from keys like 'model.layers.7.self_attn.q_proj.weight'."""
+    parts = key.split('.')
+    for i, part in enumerate(parts):
+        if part == 'layers' and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                pass
+    return None
+
+
+def _is_head_tensor(key: str) -> bool:
+    return any(k in key for k in ('lm_head', 'model.norm'))
+
+
+def _is_embed_tensor(key: str) -> bool:
+    return 'embed_tokens' in key
+
+
+def _block_weights_fn(key, early_weights, mid_weights, late_weights,
+                      early_end, late_start):
+    """Return the weight vector that should govern tensor `key`."""
+    if _is_embed_tensor(key):
+        return early_weights
+    if _is_head_tensor(key):
+        return late_weights
+    idx = _get_layer_idx(key)
+    if idx is None:
+        return mid_weights
+    if idx < early_end:
+        return early_weights
+    if idx >= late_start:
+        return late_weights
+    return mid_weights
+
+# ---------------------------------------------------------------------------
+# Disk-based merge helpers  (use_lora=False path)
+# ---------------------------------------------------------------------------
+
+def merge_and_save_weights(expert_model_paths, weights, save_path):
+    """Flat merge — same weight vector applied to every tensor.
+
+    Memory-efficient: streams one expert at a time.  Peak RAM ≈ 2 × model_float32_size
+    instead of the naive (2n+1) × model_float32_size.
+    """
+    n_experts = len(expert_model_paths)
+    assert abs(sum(weights) - 1.0) < 1e-6
+
+    merged = None
+    model  = None
+    for i in range(n_experts):
+        print(f'  Expert {i+1}/{n_experts}: {expert_model_paths[i]}')
+        model = AutoModelForCausalLM.from_pretrained(
+            expert_model_paths[i], torch_dtype=torch.float32, device_map='cpu')
+        sd = model.state_dict()
+        if merged is None:
+            merged = {k: weights[i] * v.clone() for k, v in sd.items()}
+        else:
+            for k in merged:
+                merged[k].add_(weights[i] * sd[k])
+        del sd
+        if i < n_experts - 1:
+            del model
+            gc.collect()
+        # keep `model` on the last iteration — reused as the save vessel
+
+    model.load_state_dict(merged)
+    del merged; gc.collect()
+    model.half()
+    model.save_pretrained(save_path)
+    AutoTokenizer.from_pretrained(expert_model_paths[0]).save_pretrained(save_path)
+    del model; gc.collect()
+    print(f'  Saved flat-merged model → {save_path}')
+
+
+def merge_and_save_weights_blockwise(expert_model_paths, early_weights, mid_weights,
+                                     late_weights, save_path,
+                                     early_frac=EARLY_FRAC, late_frac=LATE_FRAC):
+    """Blockwise disk merge — different weight vectors per layer block.
+
+    Memory-efficient: streams one expert at a time.  Peak RAM ≈ 2 × model_float32_size.
+    """
+    n_experts = len(expert_model_paths)
+    for name, w in [('early', early_weights), ('mid', mid_weights), ('late', late_weights)]:
+        assert len(w) == n_experts, \
+            f'{name}_weights has {len(w)} entries but there are {n_experts} experts'
+        assert abs(sum(w) - 1.0) < 1e-6, \
+            f'{name}_weights must sum to 1.0, got {sum(w):.6f}'
+
+    # Read layer count from config without loading weights
+    cfg      = AutoConfig.from_pretrained(expert_model_paths[0])
+    n_layers   = cfg.num_hidden_layers
+    early_end  = int(n_layers * early_frac)
+    late_start = n_layers - int(n_layers * late_frac)
+
+    print(f'  Layers: {n_layers} total | '
+          f'early 0–{early_end-1} {early_weights} | '
+          f'mid {early_end}–{late_start-1} {mid_weights} | '
+          f'late {late_start}–{n_layers-1} {late_weights}')
+
+    merged = None
+    model  = None
+    for i in range(n_experts):
+        print(f'  Expert {i+1}/{n_experts}: {expert_model_paths[i]}')
+        model = AutoModelForCausalLM.from_pretrained(
+            expert_model_paths[i], torch_dtype=torch.float32, device_map='cpu')
+        sd = model.state_dict()
+        if merged is None:
+            merged = {
+                k: _block_weights_fn(k, early_weights, mid_weights, late_weights,
+                                     early_end, late_start)[i] * v.clone()
+                for k, v in sd.items()
+            }
+        else:
+            for k in merged:
+                w = _block_weights_fn(k, early_weights, mid_weights, late_weights,
+                                      early_end, late_start)
+                merged[k].add_(w[i] * sd[k])
+        del sd
+        if i < n_experts - 1:
+            del model
+            gc.collect()
+
+    model.load_state_dict(merged)
+    del merged; gc.collect()
+    model.half()
+    model.save_pretrained(save_path)
+    AutoTokenizer.from_pretrained(expert_model_paths[0]).save_pretrained(save_path)
+    del model; gc.collect()
+    print(f'  Saved blockwise-merged model → {save_path}')
+
+# ---------------------------------------------------------------------------
+# LoRA-based merge helpers  (use_lora=True path)
+# ---------------------------------------------------------------------------
+
+def load_lora_adapters(base_model, expert_model_paths):
+    """Load each expert's LoRA adapter into CPU memory as a plain state dict.
+    Called ONCE before the inference sweep; base_model is never modified."""
+    from peft import set_peft_model_state_dict  # noqa: F401 — ensure peft available
+    adapter_state_dicts = []
+    for path in expert_model_paths:
+        sf_path  = os.path.join(path, 'adapter_model.safetensors')
+        bin_path = os.path.join(path, 'adapter_model.bin')
+        if os.path.exists(sf_path):
+            from safetensors.torch import load_file
+            sd = {k: v.clone().cpu() for k, v in load_file(sf_path).items()}
+        elif os.path.exists(bin_path):
+            sd = {k: v.clone().cpu()
+                  for k, v in torch.load(bin_path, map_location='cpu').items()}
+        else:
+            raise FileNotFoundError(
+                f'No adapter_model.safetensors or adapter_model.bin found in {path}')
+        adapter_state_dicts.append(sd)
+        print(f'  Cached LoRA adapter: {path}')
+    return adapter_state_dicts
+
+
+def apply_merged_lora(peft_model, adapter_state_dicts, weights):
+    """Flat interpolation: merge adapter dicts with `weights` and hot-swap in-place."""
+    from peft import set_peft_model_state_dict
+    assert abs(sum(weights) - 1.0) < 1e-6, f'weights must sum to 1, got {sum(weights)}'
+    merged = {
+        key: sum(weights[k] * adapter_state_dicts[k][key].float()
+                 for k in range(len(weights)))
+        for key in adapter_state_dicts[0]
+    }
+    set_peft_model_state_dict(peft_model,
+                              {k: v.to(peft_model.device) for k, v in merged.items()})
+    del merged
+    gc.collect()
+
+
+def apply_merged_lora_blockwise(peft_model, adapter_state_dicts,
+                                early_weights, mid_weights, late_weights, n_layers,
+                                early_frac=EARLY_FRAC, late_frac=LATE_FRAC):
+    """Blockwise interpolation: different weight vectors for early/mid/late LoRA keys."""
+    from peft import set_peft_model_state_dict
+    early_end  = int(n_layers * early_frac)
+    late_start = n_layers - int(n_layers * late_frac)
+    merged = {
+        key: sum(
+            _block_weights_fn(key, early_weights, mid_weights, late_weights,
+                              early_end, late_start)[k]
+            * adapter_state_dicts[k][key].float()
+            for k in range(len(adapter_state_dicts))
+        )
+        for key in adapter_state_dicts[0]
+    }
+    set_peft_model_state_dict(peft_model,
+                              {k: v.to(peft_model.device) for k, v in merged.items()})
+    del merged
+    gc.collect()
+
+# ---------------------------------------------------------------------------
+# Model loading
+# ---------------------------------------------------------------------------
+
+def load_base_model(model_name, target_device=None):
+    return AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map=target_device or 'auto',
+    )
 
 
 def load_expert_state_dicts(expert_paths):
@@ -27,146 +266,9 @@ def load_expert_state_dicts(expert_paths):
         del m
     return state_dicts
 
-
-def load_base_model(model_name, target_device=None):
-    return AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.bfloat16,
-        device_map=target_device or 'auto',
-    )
-
-
-def merge_and_save_weights(expert_model_paths, expert_weights, temp_save_path):
-    """Merge full PPO model state dicts and save to disk (identical to eval_ppo_rs)."""
-    models = [AutoModelForCausalLM.from_pretrained(p, device_map='cpu')
-              for p in expert_model_paths]
-    state_dicts = [m.state_dict() for m in models]
-
-    for i, (sd, w) in enumerate(zip(state_dicts, expert_weights)):
-        for key in list(sd.keys()):
-            if i == 0:
-                state_dicts[0][key] = w * sd[key]
-            else:
-                state_dicts[0][key] += w * sd[key]
-
-    models[0].load_state_dict(state_dicts[0], strict=False)
-    if os.path.exists(temp_save_path):
-        shutil.rmtree(temp_save_path, ignore_errors=True)
-    models[0].save_pretrained(temp_save_path)
-
-    while models:
-        del models[0]
-    while state_dicts:
-        del state_dicts[0]
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-def _get_layer_idx(key: str) -> int | None:
-    """Extract layer index from keys like 'model.layers.7.self_attn.q_proj.weight'."""
-    parts = key.split('.')
-    for i, part in enumerate(parts):
-        if part == 'layers' and i + 1 < len(parts):
-            try:
-                return int(parts[i + 1])
-            except ValueError:
-                pass
-    return None
-
-def _is_head_tensor(key: str) -> bool:
-    """Identify output-side tensors: lm_head and final norm."""
-    return any(k in key for k in ('lm_head', 'model.norm'))
-
-def _is_embed_tensor(key: str) -> bool:
-    """Identify input-side tensors: token embeddings."""
-    return 'embed_tokens' in key
-
-def merge_and_save_weights_blockwise(
-    expert_model_paths: list[str],
-    early_weights: list[float],
-    mid_weights:   list[float],
-    late_weights:  list[float],
-    save_path: str,
-    early_frac: float = 1/3,
-    late_frac:  float = 1/3,
-):
-    """
-    Merge expert models with different weights per layer block.
-
-    Tensor assignment:
-      embed_tokens          → early_weights  (input side)
-      layers 0..early_end-1 → early_weights
-      layers early_end..late_start-1 → mid_weights
-      layers late_start..n_layers-1  → late_weights
-      model.norm + lm_head  → late_weights   (output side)
-
-    Args:
-        expert_model_paths : paths or HF ids for each expert model
-        early_weights      : merge coefficients for early layers + embeddings
-        mid_weights        : merge coefficients for middle layers
-        late_weights       : merge coefficients for late layers + lm_head/norm
-        save_path          : where to save the merged model
-        early_frac         : fraction of layers treated as early (default 1/3)
-        late_frac          : fraction of layers treated as late  (default 1/3)
-    """
-    n_experts = len(expert_model_paths)
-
-    for name, w in [('early', early_weights), ('mid', mid_weights), ('late', late_weights)]:
-        assert len(w) == n_experts, \
-            f"{name}_weights has {len(w)} entries but there are {n_experts} experts"
-        assert abs(sum(w) - 1.0) < 1e-6, \
-            f"{name}_weights must sum to 1.0, got {sum(w):.6f}"
-
-    print(f"Loading {n_experts} expert models...")
-    models = [
-        AutoModelForCausalLM.from_pretrained(p, torch_dtype=torch.float32)
-        for p in expert_model_paths
-    ]
-    state_dicts = [m.state_dict() for m in models]
-
-    n_layers  = models[0].config.num_hidden_layers
-    early_end  = int(n_layers * early_frac)
-    late_start = n_layers - int(n_layers * late_frac)
-
-    print(f"  Total layers : {n_layers}")
-    print(f"  Embeddings   : early_weights={early_weights}")
-    print(f"  Early block  : layers 0–{early_end - 1}  weights={early_weights}")
-    print(f"  Mid block    : layers {early_end}–{late_start - 1}  weights={mid_weights}")
-    print(f"  Late block   : layers {late_start}–{n_layers - 1}  weights={late_weights}")
-    print(f"  Norm + Head  : late_weights={late_weights}")
-
-    def _get_block_weights(key: str) -> list[float]:
-        if _is_embed_tensor(key):
-            return early_weights
-        if _is_head_tensor(key):
-            return late_weights
-        layer_idx = _get_layer_idx(key)
-        if layer_idx is None:
-            # Fallback for any unrecognised non-layer tensor
-            return mid_weights
-        if layer_idx < early_end:
-            return early_weights
-        if layer_idx >= late_start:
-            return late_weights
-        return mid_weights
-
-    print("Merging tensors...")
-    merged_state_dict = {}
-    for key in state_dicts[0]:
-        w = _get_block_weights(key)
-        merged_state_dict[key] = sum(
-            w[k] * state_dicts[k][key].float()
-            for k in range(n_experts)
-        )
-
-    print(f"Saving merged model to {save_path}...")
-    models[0].load_state_dict(merged_state_dict)
-    models[0].half()
-    models[0].save_pretrained(save_path)
-
-    tokenizer = AutoTokenizer.from_pretrained(expert_model_paths[0])
-    tokenizer.save_pretrained(save_path)
-    print("Done.")
+# ---------------------------------------------------------------------------
+# Gating network save / load
+# ---------------------------------------------------------------------------
 
 def save_gating_network(gating_net, save_path):
     """Save GatingNetwork weights and architecture config together."""
@@ -186,8 +288,8 @@ def load_gating_network(save_path, lm_hidden_size=4096, num_experts=2,
                         block_mode='uniform', hidden_dim=256, device='cuda'):
     """Resolve checkpoint and load GatingNetwork.
 
-    Architecture params (lm_hidden_size etc.) are read from gating_config.json
-    when available, otherwise the caller-supplied defaults are used.
+    Architecture params are read from gating_config.json when available;
+    otherwise caller-supplied defaults are used.
     """
     resolved  = _resolve_checkpoint(save_path, 'gating_network.pt')
     ckpt_file = os.path.join(resolved, 'gating_network.pt')
@@ -228,3 +330,87 @@ def _resolve_checkpoint(checkpoint_path, filename):
         )
         candidates.append((key, subdir))
     return sorted(candidates, reverse=True)[0][1] if candidates else checkpoint_path
+
+# ---------------------------------------------------------------------------
+# Reward-based selection helpers
+# ---------------------------------------------------------------------------
+
+def detect_weight_columns(df, block_mode: str):
+    """Return the ordered list of weight column names from a rewards DataFrame."""
+    if block_mode == 'uniform':
+        return sorted([c for c in df.columns if c.startswith('w') and c[1:].isdigit()],
+                      key=lambda c: int(c[1:]))
+    e_cols = sorted([c for c in df.columns if c.endswith('_early')],
+                    key=lambda c: int(c[1:c.index('_')]))
+    m_cols = sorted([c for c in df.columns if c.endswith('_mid')],
+                    key=lambda c: int(c[1:c.index('_')]))
+    l_cols = sorted([c for c in df.columns if c.endswith('_late')],
+                    key=lambda c: int(c[1:c.index('_')]))
+    return e_cols + m_cols + l_cols
+
+
+def build_reward_maps(rewards_df, dataset_df, reward_names, block_mode, loss_mode):
+    """Precompute per-prompt reward maps needed by the gating network training loss.
+
+    Returns:
+        reward_basis_map : prompt_idx -> (n_w, n_rewards) float32 array  (lstsq fit W→R)
+        opt_r_map        : (prompt_idx, pref_tuple) -> (n_rewards,) float32  [reward mode]
+        r_star_map       : prompt_idx -> (n_rewards,) float32 ideal point     [chebyshev mode]
+    """
+    r_cols = [f'reward_{n}' for n in reward_names]
+    w_cols = detect_weight_columns(rewards_df, block_mode)
+
+    reward_basis_map = {}
+    r_star_map       = {}
+    for pidx in rewards_df['prompt_idx'].unique():
+        sub = rewards_df[rewards_df['prompt_idx'] == pidx]
+        W   = sub[w_cols].values.astype(np.float64)
+        R   = sub[r_cols].values.astype(np.float64)
+        B, _, _, _ = np.linalg.lstsq(W, R, rcond=None)
+        reward_basis_map[int(pidx)] = B.astype(np.float32)
+        r_star_map[int(pidx)]       = R.max(axis=0).astype(np.float32)
+
+    opt_r_map = None
+    if loss_mode == 'reward':
+        opt_r_map = {}
+        for pidx in rewards_df['prompt_idx'].unique():
+            sub  = rewards_df[rewards_df['prompt_idx'] == pidx]
+            R    = sub[r_cols].values.astype(np.float64)
+            rows = dataset_df[dataset_df['prompt_idx'] == pidx]
+            for _, drow in rows.iterrows():
+                pref     = np.array([float(drow[f'pref_{n}']) for n in reward_names],
+                                    dtype=np.float64)
+                pref_key = tuple(round(float(p), 6) for p in pref)
+                best_idx = utility_optimal_weights(R, pref, list(range(len(R))))
+                opt_r_map[(int(pidx), pref_key)] = R[best_idx].astype(np.float32)
+
+    return reward_basis_map, opt_r_map, r_star_map
+
+
+def utility_optimal_weights(reward_matrix, preference, sample_weights):
+    """Return the sample weight with the highest linear utility sum_i(pref_i * reward_i).
+
+    Args:
+        reward_matrix:  (n_samples, n_rewards) array of real measured rewards.
+        preference:     (n_rewards,) preference vector summing to 1.
+        sample_weights: list of weight vectors (uniform) or list of (early, mid, late)
+                        tuples (blockwise). Must have n_samples entries.
+
+    Returns:
+        The entry from sample_weights with the highest utility (same type as input).
+    """
+    preference    = np.array(preference,    dtype=np.float64)
+    reward_matrix = np.array(reward_matrix, dtype=np.float64)
+    utilities     = reward_matrix @ preference   # (n_samples,)
+    best_idx      = int(np.argmax(utilities))
+    print(f"reward_matrix:{reward_matrix}, best_idx:{best_idx}", sample_weights[best_idx])
+    return sample_weights[best_idx]
+
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+
+def compute_hypervolume(reward_vectors):
+    if len(reward_vectors) == 0:
+        return 0.0
+    return HV(ref_point=np.ones(len(reward_vectors[0])))(-np.array(reward_vectors))

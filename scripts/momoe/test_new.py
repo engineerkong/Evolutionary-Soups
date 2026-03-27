@@ -30,7 +30,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_main_tokenizer
 from new_architecture import (GatingNetwork, GatingDataset, get_prompt_hidden,
                                get_prompt_hidden_from_reward_models, REWARD_PATHS)
-from new_utils import load_base_model, load_gating_network
+from new_utils import load_base_model, load_gating_network, detect_weight_columns
 
 
 @dataclass
@@ -42,13 +42,14 @@ class ScriptArguments:
     dataset_csv:         str       = './data/new/new_assistant/gating_dataset.csv'
     reward_names:        str       = 'harmless,helpful'
     block_mode:          str       = 'uniform'   # 'uniform' | 'custom'
-    # Solution 1: use reward model hidden states (must match what was used in training)
     use_reward_features: bool      = True
-    save_directory:      str       = './results/new/'
-    wandb_name:          str       = 'new_assistant_test'
+    use_lora:            bool      = True    # True → expert paths are LoRA adapters
+                                             # False → expert paths are full models on disk
     hidden_dim:          int       = 256
     batch_size:          int       = 128
     num_samples:         int       = 0   # 0 = use all
+    save_directory:      str       = './results/new/'
+    wandb_name:          str       = 'new_assistant_test'
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -93,11 +94,10 @@ if use_reward_features:
             else:
                 lm_hidden_size += _out.hidden_states[-1].shape[-1]
 else:
-    # If the expert path contains adapter_config.json it is a LoRA adapter;
-    # merge it into the SFT base model before using it as a feature extractor.
+    # use_lora=True: expert paths are LoRA adapters → load base + merge.
+    # use_lora=False: expert paths are full pre-merged models on disk.
     for path in script_args.expert_model_paths:
-        _adapter_cfg = os.path.join(path, 'adapter_config.json')
-        if os.path.exists(_adapter_cfg):
+        if script_args.use_lora:
             from peft import PeftModel
             m = load_base_model(script_args.sft_model_name, target_device=device)
             m = PeftModel.from_pretrained(m, path)
@@ -170,18 +170,7 @@ if accelerator.is_main_process:
     print(f'Total dataset: {len(full_dataset)} items, this rank: {len(test_dataset)} items')
 
 # ── Precompute per-prompt RBF surrogates from rewards_csv ────────────────────
-if script_args.block_mode == 'uniform':
-    w_cols = sorted([c for c in rewards_df.columns if c.startswith('w') and c[1:].isdigit()],
-                    key=lambda c: int(c[1:]))
-else:
-    e_cols = sorted([c for c in rewards_df.columns if c.endswith('_early')],
-                    key=lambda c: int(c[1:c.index('_')]))
-    m_cols = sorted([c for c in rewards_df.columns if c.endswith('_mid')],
-                    key=lambda c: int(c[1:c.index('_')]))
-    l_cols = sorted([c for c in rewards_df.columns if c.endswith('_late')],
-                    key=lambda c: int(c[1:c.index('_')]))
-    w_cols = e_cols + m_cols + l_cols
-
+w_cols = detect_weight_columns(rewards_df, script_args.block_mode)
 r_cols = [f'reward_{n}' for n in reward_names]
 print('Building per-prompt RBF surrogates ...')
 reward_rbf = {}

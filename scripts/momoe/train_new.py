@@ -36,7 +36,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, load_main_tokenizer, print_trainable_parameters
 from new_architecture import (GatingNetwork, GatingDataset, get_prompt_hidden,
                                get_prompt_hidden_from_reward_models, REWARD_PATHS)
-from new_utils import load_base_model, save_gating_network
+from new_utils import load_base_model, save_gating_network, build_reward_maps
 
 
 @dataclass
@@ -48,18 +48,18 @@ class ScriptArguments:
     reward_names:         str       = 'harmless,helpful'
     block_mode:           str       = 'uniform'    # 'uniform' | 'custom'
     loss_mode:            str       = 'weight'     # 'weight' | 'reward' | 'chebyshev'
-    # Solution 1: use reward model hidden states instead of LLM hidden states
     use_reward_features:  bool      = True
-    # Solution 4: regularisation
+    use_lora:             bool      = True    # True → expert paths are LoRA adapters
+                                              # False → expert paths are full models on disk
+    lr:                   float     = 1e-4    
     weight_decay:         float     = 1e-4
     dropout:              float     = 0.1
+    hidden_dim:           int       = 256
+    epochs:               int       = 100
+    batch_size:           int       = 128
     log_with:             str       = 'none'
     save_directory:       str       = './models/new/'
     wandb_name:           str       = 'new_assistant'
-    hidden_dim:           int       = 256
-    lr:                   float     = 1e-4
-    epochs:               int       = 1000
-    batch_size:           int       = 128
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -112,11 +112,10 @@ if use_reward_features:
                 lm_hidden_size += _out.hidden_states[-1].shape[-1]
 else:
     # Original path: load frozen PPO expert LLMs as prompt encoders.
-    # If the expert path contains adapter_config.json it is a LoRA adapter;
-    # merge it into the SFT base model before using it as a feature extractor.
+    # use_lora=True: expert paths are LoRA adapters → load base + merge.
+    # use_lora=False: expert paths are full pre-merged models on disk.
     for path in script_args.expert_model_paths:
-        _adapter_cfg = os.path.join(path, 'adapter_config.json')
-        if os.path.exists(_adapter_cfg):
+        if script_args.use_lora:
             from peft import PeftModel
             m = load_base_model(script_args.sft_model_name, target_device=f'cuda:{gpu_id}')
             m = PeftModel.from_pretrained(m, path)
@@ -135,70 +134,15 @@ print(f'lm_hidden_size = {lm_hidden_size}  '
       f'({"reward models" if use_reward_features else "expert LLMs"})')
 
 # ── Precompute reward maps (loss_mode='reward' or 'chebyshev') ────────────────
-reward_basis_map = None   # prompt_idx -> np.array (n_experts_total, n_rewards)
-opt_r_map        = None   # (prompt_idx, pref_tuple) -> np.array (n_rewards,)
-r_star_map       = None   # prompt_idx -> np.array (n_rewards,)   [chebyshev]
+reward_basis_map = opt_r_map = r_star_map = None
 
 if script_args.loss_mode in ('reward', 'chebyshev'):
-    rewards_df   = pd.read_csv(script_args.rewards_csv)
-    r_cols = [f'reward_{n}' for n in reward_names]
-
-    # Infer weight columns
-    if script_args.block_mode == 'uniform':
-        w_cols = sorted([c for c in rewards_df.columns
-                         if c.startswith('w') and c[1:].isdigit()],
-                        key=lambda c: int(c[1:]))
-    else:
-        e_cols = sorted([c for c in rewards_df.columns if c.endswith('_early')],
-                        key=lambda c: int(c[1:c.index('_')]))
-        m_cols = sorted([c for c in rewards_df.columns if c.endswith('_mid')],
-                        key=lambda c: int(c[1:c.index('_')]))
-        l_cols = sorted([c for c in rewards_df.columns if c.endswith('_late')],
-                        key=lambda c: int(c[1:c.index('_')]))
-        w_cols = e_cols + m_cols + l_cols
-
     print(f'Precomputing reward maps for loss_mode={script_args.loss_mode} ...')
-    reward_basis_map = {}
-    r_star_map       = {}
-
-    for pidx in rewards_df['prompt_idx'].unique():
-        sub = rewards_df[rewards_df['prompt_idx'] == pidx]
-        W   = sub[w_cols].values.astype(np.float64)   # (n_obs, n_experts_total)
-        R   = sub[r_cols].values.astype(np.float64)   # (n_obs, n_rewards)
-
-        # Per-prompt linear reward model: R ≈ W @ B  (lstsq fit)
-        B, _, _, _ = np.linalg.lstsq(W, R, rcond=None)
-        reward_basis_map[int(pidx)] = B.astype(np.float32)
-
-        # Per-prompt ideal point for Chebyshev utility (Solution 2)
-        r_star_map[int(pidx)] = R.max(axis=0).astype(np.float32)
-
-    # opt_r_map only needed for loss_mode='reward'
-    # opt_w is now a real grid point, so look up its reward directly from collected_rewards.csv.
-    if script_args.loss_mode == 'reward':
-        dataset_df_r = pd.read_csv(script_args.dataset_csv)
-        opt_r_map    = {}
-        for pidx in rewards_df['prompt_idx'].unique():
-            sub   = rewards_df[rewards_df['prompt_idx'] == pidx]
-            W     = sub[w_cols].values.astype(np.float64)   # (n_samples, n_w)
-            R     = sub[r_cols].values.astype(np.float64)   # (n_samples, n_rewards)
-            rows  = dataset_df_r[dataset_df_r['prompt_idx'] == pidx]
-            for _, drow in rows.iterrows():
-                if script_args.block_mode == 'uniform':
-                    opt_w = np.array([float(drow[f'optimal_w{k}'])
-                                      for k in range(num_rewards)], dtype=np.float64)
-                else:
-                    opt_w = np.array(
-                        [float(drow[f'optimal_w{k}_early']) for k in range(num_rewards)] +
-                        [float(drow[f'optimal_w{k}_mid'])   for k in range(num_rewards)] +
-                        [float(drow[f'optimal_w{k}_late'])  for k in range(num_rewards)],
-                        dtype=np.float64)
-                # Direct lookup: find the grid row closest to opt_w (exact match expected)
-                best_idx = int(np.abs(W - opt_w).sum(axis=1).argmin())
-                opt_r    = R[best_idx].astype(np.float32)
-                pref_key = tuple(round(float(drow[f'pref_{n}']), 6) for n in reward_names)
-                opt_r_map[(int(pidx), pref_key)] = opt_r
-
+    rewards_df   = pd.read_csv(script_args.rewards_csv)
+    dataset_df_r = pd.read_csv(script_args.dataset_csv) if script_args.loss_mode == 'reward' else None
+    reward_basis_map, opt_r_map, r_star_map = build_reward_maps(
+        rewards_df, dataset_df_r, reward_names,
+        script_args.block_mode, script_args.loss_mode)
     print(f'  Done. {len(reward_basis_map)} prompts.')
 
 # ── Dataset and loader ────────────────────────────────────────────────────────
