@@ -1,5 +1,4 @@
 import gc
-import json
 import os
 import re
 import shutil
@@ -9,7 +8,7 @@ import torch
 from pymoo.indicators.hv import HV
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from new_architecture import GatingNetwork
+from new_architecture_old import GatingNetwork
 
 
 def compute_hypervolume(reward_vectors):
@@ -169,42 +168,19 @@ def merge_and_save_weights_blockwise(
     print("Done.")
 
 def save_gating_network(gating_net, save_path):
-    """Save GatingNetwork weights and architecture config together."""
     os.makedirs(save_path, exist_ok=True)
     torch.save(gating_net.state_dict(), os.path.join(save_path, 'gating_network.pt'))
-    config = {
-        'lm_hidden_size': gating_net.lm_hidden_size,
-        'hidden_dim':     gating_net.hidden_dim,
-        'num_experts':    gating_net.num_experts,
-        'block_mode':     gating_net.block_mode,
-    }
-    with open(os.path.join(save_path, 'gating_config.json'), 'w') as f:
-        json.dump(config, f, indent=2)
 
 
 def load_gating_network(save_path, lm_hidden_size=4096, num_experts=2,
-                        block_mode='uniform', hidden_dim=256, device='cuda'):
-    """Resolve checkpoint and load GatingNetwork.
-
-    Architecture params (lm_hidden_size etc.) are read from gating_config.json
-    when available, otherwise the caller-supplied defaults are used.
-    """
-    resolved  = _resolve_checkpoint(save_path, 'gating_network.pt')
+                        block_mode='uniform', device='cuda'):
+    """Resolve checkpoint and load GatingNetwork."""
+    resolved = _resolve_checkpoint(save_path, 'gating_network.pt')
     ckpt_file = os.path.join(resolved, 'gating_network.pt')
     if not os.path.exists(ckpt_file):
         return None
-
-    cfg_file = os.path.join(resolved, 'gating_config.json')
-    if os.path.exists(cfg_file):
-        with open(cfg_file) as f:
-            cfg = json.load(f)
-        lm_hidden_size = cfg.get('lm_hidden_size', lm_hidden_size)
-        hidden_dim     = cfg.get('hidden_dim',     hidden_dim)
-        num_experts    = cfg.get('num_experts',    num_experts)
-        block_mode     = cfg.get('block_mode',     block_mode)
-
     net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
-                        hidden_dim=hidden_dim, block_mode=block_mode)
+                        block_mode=block_mode)
     net.load_state_dict(torch.load(ckpt_file, map_location=device))
     return net.to(device)
 

@@ -11,14 +11,6 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import get_clean_data
 
-REWARD_PATHS = {
-    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':  'Tristan/gpt2_reward_summarization',
-    'faithful': 'CogComp/bart-faithful-summary-detector',
-}
-
 
 # ---------------------------------------------------------------------------
 # Chebyshev optimal weight solver
@@ -61,7 +53,7 @@ def chebyshev_optimal_weights(reward_matrix, preference, sample_weights):
 class GatingNetwork(nn.Module):
     """Maps (prompt_hidden, preference) -> merging weights over experts.
 
-    prompt_hidden : mean-pooled hidden states (from expert LLMs or reward models),
+    prompt_hidden : mean-pooled hidden states averaged over the expert models,
                     shape (batch, lm_hidden_size)
     preference    : shape (batch, num_experts)
 
@@ -70,33 +62,25 @@ class GatingNetwork(nn.Module):
     """
 
     def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_dim=256,
-                 block_mode='uniform', dropout=0.1):
+                 block_mode='uniform'):
         super().__init__()
-        self.num_experts    = num_experts
-        self.block_mode     = block_mode
-        self.lm_hidden_size = lm_hidden_size   # saved for checkpoint config
-        self.hidden_dim     = hidden_dim
+        self.num_experts = num_experts
+        self.block_mode  = block_mode
         n_out = num_experts * 3 if block_mode == 'custom' else num_experts
 
-        # Solution 4: Dropout + LayerNorm for better regularisation
         self.prompt_proj = nn.Sequential(
             nn.Linear(lm_hidden_size, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
         )
         self.pref_proj = nn.Sequential(
             nn.Linear(num_experts, 64),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(64, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
         )
         self.fusion = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, n_out),
         )
 
@@ -105,6 +89,7 @@ class GatingNetwork(nn.Module):
         r      = self.pref_proj(preference)
         logits = self.fusion(torch.cat([p, r], dim=-1))
         if self.block_mode == 'custom':
+            # Apply softmax independently to each of the 3 blocks
             B = logits.shape[0]
             logits = logits.view(B, 3, self.num_experts)
             return F.softmax(logits, dim=-1).view(B, 3 * self.num_experts)
@@ -116,29 +101,26 @@ class GatingNetwork(nn.Module):
 # ---------------------------------------------------------------------------
 
 class GatingDataset(torch.utils.data.Dataset):
-    """Each item: (prompt_text, preference, optimal_weights[, opt_r, reward_basis, r_star]).
+    """Each item: (prompt_text, preference, optimal_weights[, opt_r, reward_basis]).
 
     uniform  optimal_weights : flat list of length num_experts
     custom   optimal_weights : flat list of length num_experts * 3
                                [early_w0, ..., mid_w0, ..., late_w0, ...]
 
-    reward_basis (optional, for loss_mode='reward'|'chebyshev'):
+    reward_basis (optional, for loss_mode='reward'):
         np.array (n_experts_total, n_rewards) — per-prompt linear reward model
         fit via lstsq on collected_rewards.csv so that r(w) ≈ w @ reward_basis.
         pred_r = pred_weights @ reward_basis  is then differentiable.
     opt_r (optional, for loss_mode='reward'):
         np.array (n_rewards,) — reward at the optimal weights, evaluated via RBF.
-    r_star (optional, for loss_mode='chebyshev'):
-        np.array (n_rewards,) — per-prompt ideal point (max reward per dimension).
     """
 
     def __init__(self, dataset_df, reward_names, tokenizer,
                  block_mode='uniform', max_length=256,
-                 reward_basis_map=None, opt_r_map=None, r_star_map=None):
+                 reward_basis_map=None, opt_r_map=None):
         """
         reward_basis_map : dict  prompt_idx -> np.array (n_experts_total, n_rewards)
         opt_r_map        : dict  (prompt_idx, pref_tuple) -> np.array (n_rewards,)
-        r_star_map       : dict  prompt_idx -> np.array (n_rewards,)
         """
         self.tokenizer  = tokenizer
         self.max_length = max_length
@@ -162,9 +144,8 @@ class GatingDataset(torch.utils.data.Dataset):
                 'prompt_text':     str(row['prompt_text']),
                 'preference':      preference,
                 'optimal_weights': optimal_w,
-                'reward_basis':    reward_basis_map[pidx]           if reward_basis_map else None,
-                'opt_r':           opt_r_map.get((pidx, pref_key)) if opt_r_map        else None,
-                'r_star':          r_star_map[pidx]                 if r_star_map       else None,
+                'reward_basis':    reward_basis_map[pidx]             if reward_basis_map else None,
+                'opt_r':           opt_r_map.get((pidx, pref_key))   if opt_r_map        else None,
             }
             self.items.append(item)
 
@@ -182,7 +163,6 @@ class GatingDataset(torch.utils.data.Dataset):
         )
         out = {
             'prompt_idx':      torch.tensor(item['prompt_idx'],      dtype=torch.long),
-            'prompt_text':     item['prompt_text'],          # raw text for reward model re-tokenisation
             'input_ids':       enc['input_ids'].squeeze(0),
             'attention_mask':  enc['attention_mask'].squeeze(0),
             'preference':      torch.tensor(item['preference'],      dtype=torch.float32),
@@ -192,13 +172,11 @@ class GatingDataset(torch.utils.data.Dataset):
             out['reward_basis'] = torch.tensor(item['reward_basis'], dtype=torch.float32)
         if item['opt_r'] is not None:
             out['opt_r'] = torch.tensor(item['opt_r'], dtype=torch.float32)
-        if item['r_star'] is not None:
-            out['r_star'] = torch.tensor(item['r_star'], dtype=torch.float32)
         return out
 
 
 def get_prompt_hidden(expert_models, input_ids, attention_mask):
-    """Frozen mean-pool hidden states averaged over all expert LLMs."""
+    """Frozen mean-pool hidden states averaged over all expert models."""
     all_hidden = []
     with torch.no_grad():
         for model in expert_models:
@@ -210,61 +188,6 @@ def get_prompt_hidden(expert_models, input_ids, attention_mask):
             pooled = (h * mask).sum(1) / mask.sum(1)
             all_hidden.append(pooled)
     return torch.stack(all_hidden).mean(0)
-
-
-def get_prompt_hidden_from_reward_models(reward_models, reward_tokenizers,
-                                         prompt_texts, device, max_length=256):
-    """Solution 1: Use reward model hidden states as prompt features.
-
-    Handles both decoder-only (GPT-2) and encoder-decoder (BART/T5) reward models:
-    - Decoder-only: uses last hidden state from output.hidden_states[-1]
-    - Encoder-decoder: uses encoder_last_hidden_state (always computed, no extra flag needed)
-
-    Args:
-        reward_models      : list of AutoModelForSequenceClassification (frozen)
-        reward_tokenizers  : list of corresponding AutoTokenizer objects
-        prompt_texts       : list[str] — raw prompt strings for a batch
-        device             : torch device string or object
-        max_length         : tokenisation truncation length
-
-    Returns:
-        Tensor (batch, hidden_size) — mean-pooled over reward models
-    """
-    all_hidden = []
-    with torch.no_grad():
-        for model, tokenizer in zip(reward_models, reward_tokenizers):
-            enc = tokenizer(
-                prompt_texts,
-                max_length=max_length,
-                truncation=True,
-                padding=True,
-                return_tensors='pt',
-            ).to(device)
-
-            out  = model(**enc, output_hidden_states=True)
-            mask = enc['attention_mask'].unsqueeze(-1).float()
-
-            # Encoder-decoder models (BART, T5, etc.)
-            # encoder_last_hidden_state is always present in Seq2SeqSequenceClassifierOutput
-            if (hasattr(out, 'encoder_last_hidden_state')
-                    and out.encoder_last_hidden_state is not None):
-                h = out.encoder_last_hidden_state              # (B, seq, hidden)
-
-            # Decoder-only models (GPT-2, etc.) — need output_hidden_states=True
-            elif (hasattr(out, 'hidden_states')
-                  and out.hidden_states is not None):
-                h = out.hidden_states[-1]                      # (B, seq, hidden)
-
-            else:
-                raise ValueError(
-                    f'Cannot extract hidden states from {type(out).__name__}. '
-                    'Ensure the model supports output_hidden_states=True.')
-
-            pooled = (h * mask).sum(1) / mask.sum(1)           # mean pool over tokens
-            all_hidden.append(pooled)
-    # Concatenate along feature dim so different hidden sizes are handled correctly.
-    # lm_hidden_size = sum of each model's hidden_size.
-    return torch.cat(all_hidden, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -411,4 +334,3 @@ def merge_model_weights(model, expert_state_dicts, expert_weights):
         elif key in buffer_map:
             buffer_map[key].copy_(
                 merged_val.to(dtype=buffer_map[key].dtype, device=buffer_map[key].device))
-

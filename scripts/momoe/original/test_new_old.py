@@ -1,10 +1,8 @@
 """Test trained GatingNetwork against ground truth from gating_dataset.csv.
 
-Weight-space metrics : MAE between predicted and utility-optimal weights.
+Weight-space metrics : MAE between predicted and optimal weights.
 Reward-space metrics : predicted / optimal / naive rewards estimated via RBF
                        surrogate built from collected_rewards.csv.
-                       (opt_r is looked up at the grid-point opt_w so the RBF
-                       estimate is close to the true measured reward.)
 
 Works for any number of experts and both block_mode='uniform' | 'custom'.
 """
@@ -20,35 +18,31 @@ import torch
 from accelerate import Accelerator
 from scipy.interpolate import RBFInterpolator
 from torch.utils.data import DataLoader
-from transformers import (AutoModelForSequenceClassification, AutoTokenizer,
-                          HfArgumentParser)
+from transformers import HfArgumentParser
 from trl import set_seed
 
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_main_tokenizer
-from new_architecture import (GatingNetwork, GatingDataset, get_prompt_hidden,
-                               get_prompt_hidden_from_reward_models, REWARD_PATHS)
-from new_utils import load_base_model, load_gating_network
+from new_architecture_old import GatingNetwork, GatingDataset, get_prompt_hidden
+from new_utils_old import load_base_model, load_gating_network
 
 
 @dataclass
 class ScriptArguments:
-    sft_model_name:      str       = './models/sft/model/'
-    expert_model_paths:  List[str] = field(default_factory=list)
-    checkpoint_path:     str       = ''
-    rewards_csv:         str       = './data/new/new_assistant/collected_rewards.csv'
-    dataset_csv:         str       = './data/new/new_assistant/gating_dataset.csv'
-    reward_names:        str       = 'harmless,helpful'
-    block_mode:          str       = 'uniform'   # 'uniform' | 'custom'
-    # Solution 1: use reward model hidden states (must match what was used in training)
-    use_reward_features: bool      = True
-    save_directory:      str       = './results/new/'
-    wandb_name:          str       = 'new_assistant_test'
-    hidden_dim:          int       = 256
-    batch_size:          int       = 128
-    num_samples:         int       = 0   # 0 = use all
+    sft_model_name:     str       = './models/sft/model/'
+    expert_model_paths: List[str] = field(default_factory=list)
+    checkpoint_path:    str       = ''
+    rewards_csv:        str       = './data/new/new_assistant/collected_rewards.csv'
+    dataset_csv:        str       = './data/new/new_assistant/gating_dataset.csv'
+    reward_names:       str       = 'harmless,helpful'
+    block_mode:         str       = 'uniform'   # 'uniform' | 'custom'
+    save_directory:     str       = './results/new/'
+    wandb_name:         str       = 'new_assistant_test'
+    hidden_dim:         int       = 256
+    batch_size:         int       = 128
+    num_samples:        int       = 0   # 0 = use all
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -62,58 +56,21 @@ device       = accelerator.device
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 num_experts  = len(reward_names)
 
-# ── Load tokenizer and prompt feature models ──────────────────────────────────
-tokenizer           = load_main_tokenizer(script_args.sft_model_name)
-use_reward_features = script_args.use_reward_features
-feature_models      = []
-feature_tokenizers  = []
+# ── Load tokenizer and frozen expert models ──────────────────────────────────
+tokenizer     = load_main_tokenizer(script_args.sft_model_name)
+expert_models = []
+for path in script_args.expert_model_paths:
+    m = load_base_model(path, target_device=device)
+    m.eval()
+    for p in m.parameters():
+        p.requires_grad = False
+    expert_models.append(m)
 
-if use_reward_features:
-    print('Loading reward models for prompt feature extraction ...')
-    for name in reward_names:
-        path = REWARD_PATHS[name]
-        m    = AutoModelForSequenceClassification.from_pretrained(
-            path, torch_dtype=torch.bfloat16).to(device)
-        m.eval()
-        for p in m.parameters():
-            p.requires_grad = False
-        tok = AutoTokenizer.from_pretrained(path)
-        if tok.pad_token is None:
-            tok.pad_token = tok.eos_token
-        feature_models.append(m)
-        feature_tokenizers.append(tok)
-    lm_hidden_size = 0
-    with torch.no_grad():
-        for _m, _tok in zip(feature_models, feature_tokenizers):
-            _d   = _tok('hello', return_tensors='pt').to(device)
-            _out = _m(**_d, output_hidden_states=True)
-            if (hasattr(_out, 'encoder_last_hidden_state')
-                    and _out.encoder_last_hidden_state is not None):
-                lm_hidden_size += _out.encoder_last_hidden_state.shape[-1]
-            else:
-                lm_hidden_size += _out.hidden_states[-1].shape[-1]
-else:
-    # If the expert path contains adapter_config.json it is a LoRA adapter;
-    # merge it into the SFT base model before using it as a feature extractor.
-    for path in script_args.expert_model_paths:
-        _adapter_cfg = os.path.join(path, 'adapter_config.json')
-        if os.path.exists(_adapter_cfg):
-            from peft import PeftModel
-            m = load_base_model(script_args.sft_model_name, target_device=device)
-            m = PeftModel.from_pretrained(m, path)
-            m = m.merge_and_unload()
-        else:
-            m = load_base_model(path, target_device=device)
-        m.eval()
-        for p in m.parameters():
-            p.requires_grad = False
-        feature_models.append(m)
-    with torch.no_grad():
-        _dummy = tokenizer('hello', return_tensors='pt').to(device)
-        _out   = feature_models[0](**_dummy, output_hidden_states=True)
-        lm_hidden_size = _out.hidden_states[-1].shape[-1]
-print(f'lm_hidden_size = {lm_hidden_size}  '
-      f'({"reward models" if use_reward_features else "expert LLMs"})')
+with torch.no_grad():
+    _dummy = tokenizer('hello', return_tensors='pt').to(device)
+    _out   = expert_models[0](**_dummy, output_hidden_states=True)
+    lm_hidden_size = _out.hidden_states[-1].shape[-1]
+print(f'lm_hidden_size = {lm_hidden_size}')
 
 # ── Load gating network ──────────────────────────────────────────────────────
 gating_net = load_gating_network(
@@ -209,13 +166,8 @@ with torch.no_grad():
         optimal_weights  = batch['optimal_weights'].to(device)
         prompt_idx_batch = batch['prompt_idx']
 
-        if use_reward_features:
-            prompt_texts  = list(batch['prompt_text'])
-            prompt_hidden = get_prompt_hidden_from_reward_models(
-                feature_models, feature_tokenizers, prompt_texts, device)
-        else:
-            prompt_hidden = get_prompt_hidden(feature_models, input_ids, attention_mask)
-        pred_weights = gating_net(prompt_hidden, preference)
+        prompt_hidden = get_prompt_hidden(expert_models, input_ids, attention_mask)
+        pred_weights  = gating_net(prompt_hidden, preference)
 
         for b in range(input_ids.shape[0]):
             pref_np = preference[b].cpu().numpy()
