@@ -403,7 +403,6 @@ def utility_optimal_weights(reward_matrix, preference, sample_weights):
     reward_matrix = np.array(reward_matrix, dtype=np.float64)
     utilities     = reward_matrix @ preference   # (n_samples,)
     best_idx      = int(np.argmax(utilities))
-    print(f"reward_matrix:{reward_matrix}, best_idx:{best_idx}", sample_weights[best_idx])
     return sample_weights[best_idx]
 
 # ---------------------------------------------------------------------------

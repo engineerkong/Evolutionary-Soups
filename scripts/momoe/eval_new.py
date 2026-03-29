@@ -36,7 +36,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
+    build_dataset_eval_ppo, build_dataset_summary_eval_ppo, build_dataset_ppo, build_dataset_summary_ppo,
     get_clean_data, load_main_tokenizer, save_configs, sample_preferences_uniform,
 )
 from new_architecture import GatingNetwork, get_prompt_hidden, get_prompt_hidden_from_reward_models
@@ -264,6 +264,7 @@ if gating_net is not None:
             _tok = AutoTokenizer.from_pretrained(_path)
             if _tok.pad_token is None:
                 _tok.pad_token = _tok.eos_token
+                _m.config.pad_token_id = _tok.eos_token_id
             feature_models.append(_m)
             feature_tokenizers.append(_tok)
     else:
@@ -308,12 +309,16 @@ if script_args.dataset_csv_test and os.path.exists(script_args.dataset_csv_test)
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 if script_args.exp_type == 'assistant':
-    valid_dataset = build_dataset_eval_ppo(
-        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
+    # valid_dataset = build_dataset_eval_ppo(
+    #     'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
+    valid_dataset = build_dataset_ppo(
+        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers[0], split='train')  # TODO
     instructions = Instructions()
 else:
     valid_dataset = build_dataset_summary_eval_ppo(
         'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers, split='test')
+    # valid_dataset = build_dataset_summary_ppo(
+    #     'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers, split='train') # TODO
     instructions = Instructions_summary()
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:

@@ -97,6 +97,7 @@ if use_reward_features:
         tok = AutoTokenizer.from_pretrained(path)
         if tok.pad_token is None:          # GPT-2 tokenisers lack a pad token
             tok.pad_token = tok.eos_token
+            m.config.pad_token_id = tok.eos_token_id  # GPT-2 model config also needs this
         feature_models.append(m)
         feature_tokenizers.append(tok)
     # lm_hidden_size = SUM of each reward model's hidden size (we concatenate, not average)

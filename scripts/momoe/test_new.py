@@ -81,6 +81,7 @@ if use_reward_features:
         tok = AutoTokenizer.from_pretrained(path)
         if tok.pad_token is None:
             tok.pad_token = tok.eos_token
+            m.config.pad_token_id = tok.eos_token_id
         feature_models.append(m)
         feature_tokenizers.append(tok)
     lm_hidden_size = 0
@@ -138,8 +139,8 @@ if script_args.num_samples > 0:
     chosen     = np.random.choice(prompt_ids,
                                   size=min(script_args.num_samples, len(prompt_ids)),
                                   replace=False)
-    dataset_df = dataset_df[dataset_df['prompt_idx'].isin(chosen)].reset_index(drop=True)
-    rewards_df = rewards_df[rewards_df['prompt_idx'].isin(chosen)].reset_index(drop=True)
+    dataset_df = dataset_df[dataset_df['prompt_idx'].isin(chosen)].reset_index(drop=False)
+    rewards_df = rewards_df[rewards_df['prompt_idx'].isin(chosen)].reset_index(drop=False)
 
 # Auto-detect reward names from CSV headers
 pref_cols = [c for c in dataset_df.columns if c.startswith('pref_')]
