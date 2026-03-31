@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List
 import datetime
 
+import numpy as np
 import pandas as pd
 import torch
 from accelerate import Accelerator
@@ -66,12 +67,14 @@ class ScriptArguments:
     expert_model_paths: List[str] = field(default_factory=list)
     reward_names:       str       = 'harmless,helpful'
     exp_type:           str       = 'assistant'
-    batch_size:         int       = 128
+    batch_size:         int       = 64
     split:              str       = 'train'
     block_mode:         str       = 'uniform'
-    simplex_step:       float     = 0.2
-    use_lora:           bool      = True    # True → in-memory LoRA swap (recommended)
+    simplex_step:       float     = 0.1
+    use_lora:           bool      = True    # True → in-memory LoRA swap
                                             # False → original disk merge
+    do_sample:          bool      = True    # passed to generate(); if False, rewards will be deterministic but less smooth
+    num_continuations:  int       = 3       # K continuations per (prompt, weight); rewards averaged
     save_directory:     str       = './results/new/'
     wandb_name:         str       = 'new_assistant'
 
@@ -150,10 +153,12 @@ dataloader    = DataLoader(dataset, batch_size=script_args.batch_size,
 generation_kwargs = {
     'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
     'min_length': -1,
-    'top_k': 0.0,
+    'top_k': 0,
     'top_p': 0.9,
-    'do_sample': False,
+    'temperature': 0.7,
+    'do_sample': script_args.do_sample
 }
+print(f'do_sample={script_args.do_sample}  num_continuations={script_args.num_continuations if script_args.do_sample else 1}')
 
 # ---------------------------------------------------------------------------
 # Initialise shard CSV path and header-written flag here,
@@ -264,40 +269,73 @@ for sample in SAMPLE_WEIGHTS:
 
     model.eval()
 
-    full_responses       = []
-    full_prompts_decoded = []
+    # ── K-continuation reward averaging ──────────────────────────────────────
+    # do_sample=True : run num_continuations independent stochastic passes and
+    #                  average rewards (GRPO / RLOO style variance reduction).
+    # do_sample=False: greedy decoding is deterministic — one pass is enough.
+    # ─────────────────────────────────────────────────────────────────────────
+    n_continuations = script_args.num_continuations if script_args.do_sample else 1
 
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc=weights_str):
-            input_ids      = batch['input_ids'].to(f'cuda:{gpu_id}')
-            attention_mask = batch['attention_mask'].to(f'cuda:{gpu_id}')
-            outputs = accelerator.unwrap_model(model).generate(
-                input_ids, attention_mask=attention_mask, **generation_kwargs)
-            full_responses.extend(tokenizer.batch_decode(outputs.cpu()))
-            full_prompts_decoded.extend(tokenizer.batch_decode(input_ids.cpu()))
-            del outputs, input_ids, attention_mask
+    # On the first pass we also record prompt texts (they don't change across continuations).
+    all_prompts_decoded = None
+    # accumulated_rewards: list of length N_prompts_this_shard, each element is a
+    # list of K reward vectors (one per continuation).
+    accumulated_rewards = None   # initialised after first pass
 
-    full_prompts_decoded, full_responses = get_clean_data(full_responses, full_prompts_decoded)
+    for cont_idx in range(n_continuations):
+        full_responses       = []
+        full_prompts_decoded = []
 
-    queries_responses = [
-        (instructions.get_input(r), instructions.get_response(r))
-        for r in full_responses
-    ]
-    if hasattr(instructions, 'get_post'):
-        rewards_list = reward_models.get_reward_model_scores(
-            queries_responses, instructions.get_post, normalize_rewards=False)
-    else:
-        rewards_list = reward_models.get_reward_model_scores(
-            queries_responses, normalize_rewards=False)
+        with torch.no_grad():
+            for batch in tqdm(dataloader,
+                              desc=f'{weights_str} cont={cont_idx+1}/{n_continuations}'):
+                input_ids      = batch['input_ids'].to(f'cuda:{gpu_id}')
+                attention_mask = batch['attention_mask'].to(f'cuda:{gpu_id}')
+                outputs = accelerator.unwrap_model(model).generate(
+                    input_ids, attention_mask=attention_mask, **generation_kwargs)
+                full_responses.extend(tokenizer.batch_decode(outputs.cpu()))
+                full_prompts_decoded.extend(tokenizer.batch_decode(input_ids.cpu()))
+                del outputs, input_ids, attention_mask
 
+        full_prompts_decoded, full_responses = get_clean_data(full_responses, full_prompts_decoded)
+
+        # Record prompt texts once (same across all continuations)
+        if all_prompts_decoded is None:
+            all_prompts_decoded = full_prompts_decoded
+
+        queries_responses = [
+            (instructions.get_input(r), instructions.get_response(r))
+            for r in full_responses
+        ]
+        if hasattr(instructions, 'get_post'):
+            rewards_list = reward_models.get_reward_model_scores(
+                queries_responses, instructions.get_post,
+                normalize_rewards=False, round_digits=None)
+        else:
+            rewards_list = reward_models.get_reward_model_scores(
+                queries_responses, normalize_rewards=False, round_digits=None)
+        # rewards_list: list of n_objectives lists, each of length N_prompts
+
+        n_prompts = len(all_prompts_decoded)
+        if accumulated_rewards is None:
+            accumulated_rewards = [[[] for _ in range(n_objectives)]
+                                   for _ in range(n_prompts)]
+
+        for idx in range(n_prompts):
+            for k in range(n_objectives):
+                accumulated_rewards[idx][k].append(rewards_list[k][idx])
+
+        torch.cuda.empty_cache()
+
+    # Average rewards across K continuations (full float precision)
     # ---------------------------------------------------------------------------
     # Build rows for this combination and append to CSV immediately,
     # instead of accumulating in all_rows for a single end-of-script write.
     # ---------------------------------------------------------------------------
     rows_this_combination = []
-    for idx in range(len(full_prompts_decoded)):
+    for idx in range(len(all_prompts_decoded)):
         row = {'prompt_idx': shard_start + idx,
-               'prompt_text': full_prompts_decoded[idx].replace('\r', '').replace('\n', ' ')}
+               'prompt_text': all_prompts_decoded[idx].replace('\r', '').replace('\n', ' ')}
         if script_args.block_mode == 'uniform':
             for k, w in enumerate(sample):
                 row[f'w{k}'] = w
@@ -309,7 +347,7 @@ for sample in SAMPLE_WEIGHTS:
             for k, w in enumerate(late_w):
                 row[f'w{k}_late'] = w
         for k, name in enumerate(reward_names):
-            row[f'reward_{name}'] = rewards_list[k][idx]
+            row[f'reward_{name}'] = float(np.mean(accumulated_rewards[idx][k]))
         rows_this_combination.append(row)
 
     df_chunk = pd.DataFrame(rows_this_combination)

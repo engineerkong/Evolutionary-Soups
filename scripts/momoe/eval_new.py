@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import List, Optional
 import numpy as np
 import pandas as pd
+import datetime
+
 import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
@@ -73,7 +75,7 @@ def parse_manual_weights(spec, num_experts):
 def predict_weights_all(preference):
     """Return per-prompt predicted weight tuples for the full eval dataset."""
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    loader   = DataLoader(valid_dataset, batch_size=128, shuffle=False,
+    loader   = DataLoader(valid_dataset, batch_size=64, shuffle=False,
                           drop_last=False, collate_fn=collator)
     if gating_net is None:
         flat = tuple(_round_and_renorm(manual_weights))
@@ -132,7 +134,7 @@ def evaluate_model(subset_indices=None):
     dataset = dataset.add_column("orig_idx", orig_indices_col)
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    loader   = DataLoader(dataset, batch_size=128, drop_last=False, collate_fn=collator)
+    loader   = DataLoader(dataset, batch_size=64, drop_last=False, collate_fn=collator)
     loader   = accelerator.prepare(loader)
 
     gen_kwargs = {
@@ -197,6 +199,7 @@ output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 os.makedirs(output_dir, exist_ok=True)
 
 set_seed(8888)
+torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=60))
 accelerator = Accelerator()
 process_id  = accelerator.local_process_index
 gpu_id      = process_id
@@ -309,10 +312,10 @@ if script_args.dataset_csv_test and os.path.exists(script_args.dataset_csv_test)
 
 # ── Dataset ────────────────────────────────────────────────────────────────────
 if script_args.exp_type == 'assistant':
-    # valid_dataset = build_dataset_eval_ppo(
-    #     'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
-    valid_dataset = build_dataset_ppo(
-        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers[0], split='train')  # TODO
+    valid_dataset = build_dataset_eval_ppo(
+        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
+    # valid_dataset = build_dataset_ppo(
+    #     'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers[0], split='train')  # TODO
     instructions = Instructions()
 else:
     valid_dataset = build_dataset_summary_eval_ppo(
@@ -384,6 +387,17 @@ for k, preference in enumerate(sampled_preferences):
     print(f'    naive={[round(v,2) for v in naive_w]} | '
           f'pred: {len(groups)} unique group(s) | '
           f'opt: {len(opt_groups_by_k.get(k, {}))} unique group(s)')
+
+# Phase 1 complete — feature_models are no longer needed (all predictions done).
+# Delete them now to free GPU memory before Phase 4 loads base_model per iteration.
+if gating_net is not None and not script_args.use_reward_features:
+    for _m in feature_models:
+        del _m
+    feature_models.clear()
+    expert_models.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    print('Freed feature_models from GPU.')
 
 # =============================================================================
 # Phase 2 — Collect all unique weight combinations across all preferences

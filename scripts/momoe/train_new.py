@@ -48,15 +48,18 @@ class ScriptArguments:
     reward_names:         str       = 'harmless,helpful'
     block_mode:           str       = 'uniform'    # 'uniform' | 'custom'
     loss_mode:            str       = 'weight'     # 'weight' | 'reward' | 'chebyshev'
-    use_reward_features:  bool      = True
+    use_reward_features:  bool      = False
     use_lora:             bool      = True    # True → expert paths are LoRA adapters
                                               # False → expert paths are full models on disk
-    lr:                   float     = 1e-4    
-    weight_decay:         float     = 1e-4
-    dropout:              float     = 0.1
+    lr:                   float     = 1e-4
+    weight_decay:         float     = 5e-4    # increased from 1e-4 for better regularisation
+    dropout:              float     = 0.2     # increased from 0.1 for better regularisation
     hidden_dim:           int       = 256
     epochs:               int       = 100
     batch_size:           int       = 128
+    val_frac:             float     = 0.15    # fraction of prompts held out for validation
+    patience:             int       = 20      # early stopping patience (epochs)
+    grad_clip:            float     = 1.0     # max gradient norm (0 = disabled)
     log_with:             str       = 'none'
     save_directory:       str       = './models/new/'
     wandb_name:           str       = 'new_assistant'
@@ -147,16 +150,38 @@ if script_args.loss_mode in ('reward', 'chebyshev'):
     print(f'  Done. {len(reward_basis_map)} prompts.')
 
 # ── Dataset and loader ────────────────────────────────────────────────────────
-dataset_df    = pd.read_csv(script_args.dataset_csv)
-train_dataset = GatingDataset(dataset_df, reward_names, tokenizer,
+dataset_df = pd.read_csv(script_args.dataset_csv)
+
+# Prompt-level train/val split — held-out prompts test generalisation to new inputs.
+# Splitting at the prompt level (not sample level) prevents the model from seeing
+# a prompt in training and then evaluating on a different preference for that same prompt.
+all_prompt_ids = dataset_df['prompt_idx'].unique()
+rng = np.random.default_rng(42)
+rng.shuffle(all_prompt_ids)
+n_val         = max(1, int(len(all_prompt_ids) * script_args.val_frac))
+val_ids       = set(all_prompt_ids[:n_val].tolist())
+train_ids_set = set(all_prompt_ids[n_val:].tolist())
+
+train_df = dataset_df[dataset_df['prompt_idx'].isin(train_ids_set)].reset_index(drop=True)
+val_df   = dataset_df[dataset_df['prompt_idx'].isin(val_ids)].reset_index(drop=True)
+print(f'Prompts  — train: {len(train_ids_set)}, val: {len(val_ids)}')
+
+train_dataset = GatingDataset(train_df, reward_names, tokenizer,
                                block_mode=script_args.block_mode,
                                reward_basis_map=reward_basis_map,
                                opt_r_map=opt_r_map,
                                r_star_map=r_star_map)
-print(f'Training dataset size: {len(train_dataset)}')
+val_dataset   = GatingDataset(val_df, reward_names, tokenizer,
+                               block_mode=script_args.block_mode,
+                               reward_basis_map=reward_basis_map,
+                               opt_r_map=opt_r_map,
+                               r_star_map=r_star_map)
+print(f'Samples  — train: {len(train_dataset)}, val: {len(val_dataset)}')
 
 train_loader = DataLoader(train_dataset, batch_size=script_args.batch_size,
                           shuffle=True, drop_last=True)
+val_loader   = DataLoader(val_dataset,   batch_size=script_args.batch_size,
+                          shuffle=False, drop_last=False)
 
 # ── Gating network ────────────────────────────────────────────────────────────
 gating_net = GatingNetwork(
@@ -170,7 +195,10 @@ gating_net = GatingNetwork(
 optimizer = torch.optim.AdamW(gating_net.parameters(),
                                lr=script_args.lr,
                                weight_decay=script_args.weight_decay)
-gating_net, optimizer, train_loader = accelerator.prepare(gating_net, optimizer, train_loader)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=script_args.epochs, eta_min=script_args.lr * 0.01)
+gating_net, optimizer, train_loader, val_loader = accelerator.prepare(
+    gating_net, optimizer, train_loader, val_loader)
 
 wandb_run = None
 if accelerator.is_main_process and script_args.log_with == 'wandb':
@@ -182,50 +210,57 @@ print_trainable_parameters(gating_net)
 print(f'loss_mode = {script_args.loss_mode}')
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-global_step = 0
+
+def compute_loss(batch, gating_net, is_val=False):
+    """Forward pass + loss for a single batch. Shared by train and val loops."""
+    input_ids       = batch['input_ids'].to(f'cuda:{gpu_id}')
+    attention_mask  = batch['attention_mask'].to(f'cuda:{gpu_id}')
+    preference      = batch['preference'].to(f'cuda:{gpu_id}')
+    optimal_weights = batch['optimal_weights'].to(f'cuda:{gpu_id}')
+
+    if use_reward_features:
+        prompt_texts  = list(batch['prompt_text'])
+        prompt_hidden = get_prompt_hidden_from_reward_models(
+            feature_models, feature_tokenizers, prompt_texts, f'cuda:{gpu_id}')
+    else:
+        prompt_hidden = get_prompt_hidden(feature_models, input_ids, attention_mask)
+
+    pred_weights = gating_net(prompt_hidden, preference)
+
+    if is_val or script_args.loss_mode == 'weight':
+        return F.mse_loss(pred_weights, optimal_weights)
+
+    elif script_args.loss_mode == 'reward':
+        reward_basis = batch['reward_basis'].to(f'cuda:{gpu_id}')
+        opt_r        = batch['opt_r'].to(f'cuda:{gpu_id}')
+        pred_r = torch.einsum('be,ber->br', pred_weights, reward_basis)
+        return F.mse_loss(pred_r, opt_r)
+
+    else:  # 'chebyshev'
+        reward_basis = batch['reward_basis'].to(f'cuda:{gpu_id}')
+        r_star       = batch['r_star'].to(f'cuda:{gpu_id}')
+        pred_r = torch.einsum('be,ber->br', pred_weights, reward_basis)
+        gaps   = preference * (pred_r - r_star).abs()
+        return gaps.max(dim=1).values.mean()
+
+
+global_step  = 0
+best_val_loss = float('inf')
+epochs_no_improve = 0
+
 for epoch in range(script_args.epochs):
+    # ── Train ──────────────────────────────────────────────────────────────────
     gating_net.train()
     epoch_losses = []
     progress = tqdm(train_loader, desc=f'Epoch {epoch+1}/{script_args.epochs}')
 
     for batch in progress:
-        input_ids       = batch['input_ids'].to(f'cuda:{gpu_id}')
-        attention_mask  = batch['attention_mask'].to(f'cuda:{gpu_id}')
-        preference      = batch['preference'].to(f'cuda:{gpu_id}')
-        optimal_weights = batch['optimal_weights'].to(f'cuda:{gpu_id}')
-
-        # Solution 1: choose feature extractor
-        if use_reward_features:
-            prompt_texts  = list(batch['prompt_text'])
-            prompt_hidden = get_prompt_hidden_from_reward_models(
-                feature_models, feature_tokenizers, prompt_texts, f'cuda:{gpu_id}')
-        else:
-            prompt_hidden = get_prompt_hidden(feature_models, input_ids, attention_mask)
-
-        pred_weights = gating_net(prompt_hidden, preference)
-
-        if script_args.loss_mode == 'weight':
-            loss = F.mse_loss(pred_weights, optimal_weights)
-
-        elif script_args.loss_mode == 'reward':
-            # pred_r = pred_weights @ reward_basis  (differentiable)
-            reward_basis = batch['reward_basis'].to(f'cuda:{gpu_id}')
-            opt_r        = batch['opt_r'].to(f'cuda:{gpu_id}')
-            pred_r = torch.einsum('be,ber->br', pred_weights, reward_basis)
-            loss   = F.mse_loss(pred_r, opt_r)
-
-        else:  # 'chebyshev' — Solution 2
-            # Directly maximise Chebyshev utility: -max_k(pref_k * |pred_r_k - r_star_k|)
-            # pred_r = pred_weights @ reward_basis  (differentiable)
-            reward_basis = batch['reward_basis'].to(f'cuda:{gpu_id}')
-            r_star       = batch['r_star'].to(f'cuda:{gpu_id}')
-            pred_r = torch.einsum('be,ber->br', pred_weights, reward_basis)
-            gaps   = preference * (pred_r - r_star).abs()   # (B, n_rewards)
-            # loss = mean max weighted gap  →  minimising = maximising Chebyshev utility
-            loss   = gaps.max(dim=1).values.mean()
+        loss = compute_loss(batch, gating_net)
 
         optimizer.zero_grad()
         accelerator.backward(loss)
+        if script_args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(gating_net.parameters(), script_args.grad_clip)
         optimizer.step()
 
         loss_val = loss.item()
@@ -237,13 +272,43 @@ for epoch in range(script_args.epochs):
             wandb_run.log({'train/loss': loss_val, 'train/step': global_step,
                            'train/epoch': epoch+1})
 
-    mean_loss = np.mean(epoch_losses)
-    print(f'Epoch {epoch+1}: mean_loss={mean_loss:.4f}')
+    scheduler.step()
+    mean_train_loss = np.mean(epoch_losses)
 
+    # ── Validation ─────────────────────────────────────────────────────────────
+    gating_net.eval()
+    val_losses = []
+    with torch.no_grad():
+        for batch in val_loader:
+            val_losses.append(compute_loss(batch, gating_net, is_val=True).item())
+    mean_val_loss = np.mean(val_losses)
+
+    print(f'Epoch {epoch+1}: train_loss={mean_train_loss:.4f}  val_loss={mean_val_loss:.4f}  '
+          f'lr={scheduler.get_last_lr()[0]:.2e}')
+
+    if wandb_run is not None:
+        wandb_run.log({'val/loss': mean_val_loss, 'val/epoch': epoch+1})
+
+    # ── Checkpoint + early stopping ────────────────────────────────────────────
     if accelerator.is_main_process:
+        # Always save periodic checkpoint
         save_path = os.path.join(output_dir, f'epoch_{epoch+1}_step_{global_step}')
         save_gating_network(accelerator.unwrap_model(gating_net), save_path)
-        print(f'Saved checkpoint to {save_path}')
+        print(f'  Saved checkpoint → {save_path}')
+
+        # Save best-val checkpoint (overwrites previous best)
+        if mean_val_loss < best_val_loss:
+            best_val_loss = mean_val_loss
+            epochs_no_improve = 0
+            best_path = os.path.join(output_dir, 'best_val')
+            save_gating_network(accelerator.unwrap_model(gating_net), best_path)
+            print(f'  New best val_loss={best_val_loss:.4f} → saved to {best_path}')
+        else:
+            epochs_no_improve += 1
+            print(f'  No improvement for {epochs_no_improve}/{script_args.patience} epochs')
+            if epochs_no_improve >= script_args.patience:
+                print(f'Early stopping at epoch {epoch+1}.')
+                break
 
 if wandb_run is not None:
     wandb_run.finish()

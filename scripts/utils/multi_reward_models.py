@@ -20,7 +20,7 @@ class RewardModels():
             self.rm_tokenizers.append(AutoTokenizer.from_pretrained(self.rm_tokenizer_path_list[i]))
     
     # add normalize_rewards flag to control reward normalization
-    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True, round_digits=1):
+    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True, round_digits=None):
         texts_for_rewards = []
         for i in range(self.num_rewards):
             if i >= 1 and self.rm_tokenizer_path_list[i] == self.rm_tokenizer_path_list[i-1]:

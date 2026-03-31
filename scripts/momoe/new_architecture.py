@@ -61,12 +61,18 @@ def chebyshev_optimal_weights(reward_matrix, preference, sample_weights):
 class GatingNetwork(nn.Module):
     """Maps (prompt_hidden, preference) -> merging weights over experts.
 
-    prompt_hidden : mean-pooled hidden states (from expert LLMs or reward models),
+    prompt_hidden : last-token hidden states (from expert LLMs or reward models),
                     shape (batch, lm_hidden_size)
     preference    : shape (batch, num_experts)
 
     uniform  output : (batch, num_experts),     sums to 1 via softmax
     custom   output : (batch, num_experts * 3), each block of num_experts sums to 1
+
+    Architecture uses FiLM (Feature-wise Linear Modulation): the preference vector
+    generates per-channel scale and shift parameters that modulate the prompt
+    representation before the output head. This allows the preference to
+    meaningfully condition how the prompt features are interpreted, rather than
+    simply being concatenated and processed in parallel.
     """
 
     def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_dim=256,
@@ -78,37 +84,55 @@ class GatingNetwork(nn.Module):
         self.hidden_dim     = hidden_dim
         n_out = num_experts * 3 if block_mode == 'custom' else num_experts
 
-        # Solution 4: Dropout + LayerNorm for better regularisation
+        # Project prompt hidden states to a compact representation
         self.prompt_proj = nn.Sequential(
-            nn.Linear(lm_hidden_size, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(lm_hidden_size, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.LayerNorm(hidden_dim),    nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-        self.pref_proj = nn.Sequential(
-            nn.Linear(num_experts, 64),
+
+        # FiLM generator: preference → (gamma, beta) for each hidden unit.
+        # gamma and beta modulate the prompt features channel-wise, allowing
+        # the preference to redirect which prompt features are amplified.
+        self.pref_expand = nn.Sequential(
+            nn.Linear(num_experts, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(64, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.ReLU(),
         )
-        self.fusion = nn.Sequential(
+        self.film_gen = nn.Linear(hidden_dim, hidden_dim * 2)
+        nn.init.zeros_(self.film_gen.weight)
+        nn.init.zeros_(self.film_gen.bias)
+
+        # Output head applied to FiLM-modulated prompt features
+        self.output_head = nn.Sequential(
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim // 2, n_out),
         )
 
+        self.temperature = nn.Parameter(torch.ones(1))
+
     def forward(self, prompt_hidden, preference):
-        p      = self.prompt_proj(prompt_hidden)
-        r      = self.pref_proj(preference)
-        logits = self.fusion(torch.cat([p, r], dim=-1))
+        p = self.prompt_proj(prompt_hidden)          # (B, hidden_dim)
+
+        # FiLM modulation: preference conditions the prompt representation
+        preference = torch.log(preference.clamp(min=1e-6))
+        pref = self.pref_expand(preference)          # (B, hidden_dim)
+        film = self.film_gen(pref)                   # (B, hidden_dim * 2)
+        gamma, beta = film.chunk(2, dim=-1)          # each (B, hidden_dim)
+        p = p * (1.0 + gamma) + beta                 # channel-wise scale + shift
+
+        logits = self.output_head(p)
         if self.block_mode == 'custom':
             B = logits.shape[0]
             logits = logits.view(B, 3, self.num_experts)
-            return F.softmax(logits, dim=-1).view(B, 3 * self.num_experts)
-        return F.softmax(logits, dim=-1)
+            return F.softmax(logits / self.temperature.clamp(min=0.1), dim=-1).view(B, 3 * self.num_experts)
+        return F.softmax(logits / self.temperature.clamp(min=0.1), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -198,18 +222,27 @@ class GatingDataset(torch.utils.data.Dataset):
 
 
 def get_prompt_hidden(expert_models, input_ids, attention_mask):
-    """Frozen mean-pool hidden states averaged over all expert LLMs."""
+    """Mean-pooled hidden states averaged over all expert LLMs.
+
+    Uses attention-mask-weighted mean pooling over the sequence dimension.
+    Mean pooling is preferred over last-token for causal LLMs used as general-purpose
+    encoders: the last token is optimized for next-token prediction, not sequence
+    summarization, so mean pooling gives a more stable sequence-level representation.
+
+    All expert LLMs share the same hidden size, so we average across experts
+    (keeping lm_hidden_size = single expert hidden size, not sum).
+    """
     all_hidden = []
     with torch.no_grad():
         for model in expert_models:
             out = model(input_ids=input_ids,
                         attention_mask=attention_mask,
                         output_hidden_states=True)
-            h = out.hidden_states[-1]
-            mask = attention_mask.unsqueeze(-1).float()
-            pooled = (h * mask).sum(1) / mask.sum(1)
+            h    = out.hidden_states[-1]                          # (B, seq, hidden)
+            mask = attention_mask.unsqueeze(-1).float()           # (B, seq, 1)
+            pooled = (h * mask).sum(1) / mask.sum(1)              # (B, hidden)
             all_hidden.append(pooled)
-    return torch.stack(all_hidden).mean(0)
+    return torch.stack(all_hidden).mean(0).float()
 
 
 def get_prompt_hidden_from_reward_models(reward_models, reward_tokenizers,
@@ -217,8 +250,9 @@ def get_prompt_hidden_from_reward_models(reward_models, reward_tokenizers,
     """Solution 1: Use reward model hidden states as prompt features.
 
     Handles both decoder-only (GPT-2) and encoder-decoder (BART/T5) reward models:
-    - Decoder-only: uses last hidden state from output.hidden_states[-1]
-    - Encoder-decoder: uses encoder_last_hidden_state (always computed, no extra flag needed)
+    - Decoder-only: uses the last non-padded token's hidden state (aligned with how
+      AutoModelForSequenceClassification computes its score for causal models).
+    - Encoder-decoder: uses mean-pooled encoder_last_hidden_state.
 
     Args:
         reward_models      : list of AutoModelForSequenceClassification (frozen)
@@ -228,7 +262,7 @@ def get_prompt_hidden_from_reward_models(reward_models, reward_tokenizers,
         max_length         : tokenisation truncation length
 
     Returns:
-        Tensor (batch, hidden_size) — mean-pooled over reward models
+        Tensor (batch, hidden_size) — concatenated pooled hidden states from all models
     """
     all_hidden = []
     with torch.no_grad():
@@ -242,29 +276,35 @@ def get_prompt_hidden_from_reward_models(reward_models, reward_tokenizers,
             ).to(device)
 
             out  = model(**enc, output_hidden_states=True)
-            mask = enc['attention_mask'].unsqueeze(-1).float()
+            mask = enc['attention_mask']                        # (B, seq)
 
-            # Encoder-decoder models (BART, T5, etc.)
-            # encoder_last_hidden_state is always present in Seq2SeqSequenceClassifierOutput
+            # Encoder-decoder models (BART, T5, etc.) — mean pool encoder states
             if (hasattr(out, 'encoder_last_hidden_state')
                     and out.encoder_last_hidden_state is not None):
                 h = out.encoder_last_hidden_state              # (B, seq, hidden)
+                pooled = (h * mask.unsqueeze(-1).float()).sum(1) / mask.sum(1, keepdim=True).float()
 
-            # Decoder-only models (GPT-2, etc.) — need output_hidden_states=True
+            # Decoder-only models (GPT-2, etc.) — last non-padded token pooling.
+            # This is aligned with how AutoModelForSequenceClassification scores
+            # causal LMs: it uses the representation at the last non-padding position.
             elif (hasattr(out, 'hidden_states')
                   and out.hidden_states is not None):
                 h = out.hidden_states[-1]                      # (B, seq, hidden)
+                # Index of the last non-padding token per batch item
+                last_idx = mask.sum(dim=1) - 1                 # (B,)
+                pooled   = h[torch.arange(h.shape[0], device=device), last_idx]  # (B, hidden)
 
             else:
                 raise ValueError(
                     f'Cannot extract hidden states from {type(out).__name__}. '
                     'Ensure the model supports output_hidden_states=True.')
 
-            pooled = (h * mask).sum(1) / mask.sum(1)           # mean pool over tokens
             all_hidden.append(pooled)
     # Concatenate along feature dim so different hidden sizes are handled correctly.
     # lm_hidden_size = sum of each model's hidden_size.
-    return torch.cat(all_hidden, dim=-1)
+    # Cast to float32: reward models are loaded in bfloat16 but GatingNetwork
+    # and loss computations expect float32.
+    return torch.cat(all_hidden, dim=-1).float()
 
 
 # ---------------------------------------------------------------------------
