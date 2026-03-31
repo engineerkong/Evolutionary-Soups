@@ -49,7 +49,7 @@ class ScriptArguments:
     block_mode:           str       = 'uniform'    # 'uniform' | 'custom'
     loss_mode:            str       = 'weight'     # 'weight' | 'reward' | 'chebyshev'
     use_reward_features:  bool      = False
-    use_lora:             bool      = True    # True → expert paths are LoRA adapters
+    use_lora:             bool      = False    # True → expert paths are LoRA adapters
                                               # False → expert paths are full models on disk
     lr:                   float     = 1e-4
     weight_decay:         float     = 5e-4    # increased from 1e-4 for better regularisation

@@ -61,7 +61,7 @@ def chebyshev_optimal_weights(reward_matrix, preference, sample_weights):
 class GatingNetwork(nn.Module):
     """Maps (prompt_hidden, preference) -> merging weights over experts.
 
-    prompt_hidden : last-token hidden states (from expert LLMs or reward models),
+    prompt_hidden : mean-pooled or last-token hidden states (from expert LLMs or reward models),
                     shape (batch, lm_hidden_size)
     preference    : shape (batch, num_experts)
 

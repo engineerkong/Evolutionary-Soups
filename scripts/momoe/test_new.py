@@ -42,8 +42,8 @@ class ScriptArguments:
     dataset_csv:         str       = './data/new/new_assistant/gating_dataset.csv'
     reward_names:        str       = 'harmless,helpful'
     block_mode:          str       = 'uniform'   # 'uniform' | 'custom'
-    use_reward_features: bool      = True
-    use_lora:            bool      = True    # True → expert paths are LoRA adapters
+    use_reward_features: bool      = False
+    use_lora:            bool      = False    # True → expert paths are LoRA adapters
                                              # False → expert paths are full models on disk
     hidden_dim:          int       = 256
     batch_size:          int       = 128

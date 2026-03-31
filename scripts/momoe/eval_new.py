@@ -186,8 +186,8 @@ class ScriptArguments:
     block_mode:            str           = 'uniform'   # 'uniform' | 'custom'
     exp_type:              str           = 'assistant'
     hidden_dim:            int           = 256
-    use_reward_features:   bool          = True
-    use_lora:              bool          = True   # True → in-memory LoRA swap
+    use_reward_features:   bool          = False
+    use_lora:              bool          = False   # True → in-memory LoRA swap
     save_directory:        str           = './results/new/'
     wandb_name:            str           = 'new_assistant_eval'
 

@@ -71,9 +71,9 @@ class ScriptArguments:
     split:              str       = 'train'
     block_mode:         str       = 'uniform'
     simplex_step:       float     = 0.1
-    use_lora:           bool      = True    # True → in-memory LoRA swap
+    use_lora:           bool      = False    # True → in-memory LoRA swap
                                             # False → original disk merge
-    do_sample:          bool      = True    # passed to generate(); if False, rewards will be deterministic but less smooth
+    do_sample:          bool      = False    # passed to generate(); if False, rewards will be deterministic but less smooth
     num_continuations:  int       = 3       # K continuations per (prompt, weight); rewards averaged
     save_directory:     str       = './results/new/'
     wandb_name:         str       = 'new_assistant'
