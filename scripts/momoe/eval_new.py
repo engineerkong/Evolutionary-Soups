@@ -123,7 +123,12 @@ def _wt_to_str(wt):
 
 def evaluate_model(subset_indices=None):
     """Generate + score on full dataset or a subset. Returns (rewards, prompts, responses, orig_indices).
-    Expects base_model weights to already be patched by _apply_weights_for_group."""
+    Expects base_model weights to already be patched by _apply_weights_for_group.
+
+    When do_sample=True, runs num_continuations independent stochastic passes and
+    averages rewards across them (GRPO / RLOO style). When do_sample=False, greedy
+    decoding is deterministic so a single pass is used regardless of num_continuations.
+    """
     dataset = valid_dataset.select(subset_indices) if subset_indices is not None \
               else valid_dataset
     if len(dataset) == 0:
@@ -139,39 +144,72 @@ def evaluate_model(subset_indices=None):
 
     gen_kwargs = {
         'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
-        'min_length': -1, 'top_k': 0.0, 'top_p': 0.9, 'do_sample': False,
+        'min_length': -1,
+        'top_k': 0.0,
+        'top_p': 0.9,
+        'temperature': 0.7,
+        'do_sample': script_args.do_sample,
     }
     tokenizer.padding_side = 'left'
 
-    full_responses, full_prompts, full_orig_indices = [], [], []
+    n_continuations = script_args.num_continuations if script_args.do_sample else 1
+
+    # accumulated_rewards[prompt_idx][obj_idx] = list of K reward values
+    accumulated_rewards = None
+    saved_prompts       = None
+    saved_orig_indices  = None
+
     base_model.eval()
-    with torch.no_grad():
-        for batch in tqdm(loader, desc='Generating', leave=False):
-            out = accelerator.unwrap_model(base_model).generate(
-                batch['input_ids'], attention_mask=batch['attention_mask'], **gen_kwargs)
-            full_responses.extend(out)
-            full_prompts.extend(batch['input_ids'])
-            full_orig_indices.extend(batch['orig_idx'].tolist())
+    for cont_idx in range(n_continuations):
+        full_responses, full_prompts, full_orig_indices = [], [], []
+        with torch.no_grad():
+            for batch in tqdm(loader,
+                              desc=f'Generating cont={cont_idx+1}/{n_continuations}',
+                              leave=False):
+                out = accelerator.unwrap_model(base_model).generate(
+                    batch['input_ids'], attention_mask=batch['attention_mask'], **gen_kwargs)
+                full_responses.extend(out)
+                full_prompts.extend(batch['input_ids'])
+                full_orig_indices.extend(batch['orig_idx'].tolist())
 
-    full_responses = tokenizer.batch_decode(full_responses)
-    full_prompts   = tokenizer.batch_decode(full_prompts)
-    full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
+        full_responses = tokenizer.batch_decode(full_responses)
+        full_prompts   = tokenizer.batch_decode(full_prompts)
+        full_prompts, full_responses = get_clean_data(full_responses, full_prompts)
 
-    qr = [(instructions.get_input(r), instructions.get_response(r)) for r in full_responses]
-    if hasattr(instructions, 'get_post'):
-        rewards_list = reward_models.get_reward_model_scores(
-            qr, instructions.get_post, normalize_rewards=False)
-    else:
-        rewards_list = reward_models.get_reward_model_scores(qr, normalize_rewards=False)
+        qr = [(instructions.get_input(r), instructions.get_response(r)) for r in full_responses]
+        if hasattr(instructions, 'get_post'):
+            rewards_list = reward_models.get_reward_model_scores(
+                qr, instructions.get_post, normalize_rewards=False)
+        else:
+            rewards_list = reward_models.get_reward_model_scores(qr, normalize_rewards=False)
 
-    all_rewards      = [accelerator.gather_for_metrics(r) for r in rewards_list]
-    all_prompts      = accelerator.gather_for_metrics(full_prompts)
-    all_responses    = accelerator.gather_for_metrics(full_responses)
-    all_orig_indices = accelerator.gather_for_metrics(
-        torch.tensor(full_orig_indices, dtype=torch.long, device=f'cuda:{gpu_id}')
-    ).cpu().tolist()
+        all_rewards      = [accelerator.gather_for_metrics(r) for r in rewards_list]
+        all_prompts_g    = accelerator.gather_for_metrics(full_prompts)
+        all_responses_g  = accelerator.gather_for_metrics(full_responses)
+        all_orig_idx_g   = accelerator.gather_for_metrics(
+            torch.tensor(full_orig_indices, dtype=torch.long, device=f'cuda:{gpu_id}')
+        ).cpu().tolist()
 
-    return all_rewards, all_prompts, all_responses, all_orig_indices
+        n_prompts = len(all_orig_idx_g)
+        n_obj     = len(reward_names)
+        if accumulated_rewards is None:
+            accumulated_rewards = [[[] for _ in range(n_obj)] for _ in range(n_prompts)]
+            saved_prompts      = all_prompts_g
+            saved_orig_indices = all_orig_idx_g
+
+        for idx in range(n_prompts):
+            for k in range(n_obj):
+                accumulated_rewards[idx][k].append(all_rewards[k][idx])
+
+        torch.cuda.empty_cache()
+
+    # Average rewards across continuations
+    avg_rewards = [
+        [float(np.mean(accumulated_rewards[idx][k])) for idx in range(len(saved_orig_indices))]
+        for k in range(len(reward_names))
+    ]
+    # Return last continuation's responses (representative sample)
+    return avg_rewards, saved_prompts, all_responses_g, saved_orig_indices
 
 @dataclass
 class ScriptArguments:
@@ -187,7 +225,9 @@ class ScriptArguments:
     exp_type:              str           = 'assistant'
     hidden_dim:            int           = 256
     use_reward_features:   bool          = False
-    use_lora:              bool          = False   # True → in-memory LoRA swap
+    use_lora:              bool          = False  # True → in-memory LoRA swap
+    do_sample:             bool          = False  # passed to generate(); True → stochastic, use num_continuations
+    num_continuations:     int           = 3      # K passes averaged when do_sample=True; forced to 1 if do_sample=False
     save_directory:        str           = './results/new/'
     wandb_name:            str           = 'new_assistant_eval'
 
@@ -199,7 +239,8 @@ output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
 os.makedirs(output_dir, exist_ok=True)
 
 set_seed(8888)
-torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=60))
+if 'RANK' in os.environ:
+    torch.distributed.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=60))
 accelerator = Accelerator()
 process_id  = accelerator.local_process_index
 gpu_id      = process_id
