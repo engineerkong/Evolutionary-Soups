@@ -81,7 +81,7 @@ class ScriptArguments:
     split:                str       = 'train'
     do_sample:            bool      = True           # stochastic generation
     num_continuations:    int       = 3              # reward averaging over K generations
-    eval_prompts:         int       = 1024             # total prompts sampled per fitness evaluation
+    eval_prompts:         int       = 4096             # total prompts sampled per fitness evaluation
     eval_batch_size:      int       = 64               # generation batch size within each eval
     max_new_tokens:       int       = 128
 
