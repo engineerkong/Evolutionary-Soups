@@ -81,7 +81,7 @@ class ScriptArguments:
     split:                str       = 'train'
     do_sample:            bool      = True           # stochastic generation
     num_continuations:    int       = 3              # reward averaging over K generations
-    eval_prompts:         int       = 4096             # total prompts sampled per fitness evaluation
+    eval_prompts:         int       = 8192             # total prompts sampled per fitness evaluation
     eval_batch_size:      int       = 64               # generation batch size within each eval
     max_new_tokens:       int       = 128
 
@@ -91,12 +91,13 @@ class ScriptArguments:
     # ── MOEA/D hyper-parameters ───────────────────────────────────────────
     pref_step:            float     = 0.1            # simplex grid step
     neighborhood_size:    int       = 5
-    num_generations:      int       = 100
-    mutation_sigma:       float     = 0.05
-    mutation_rate:        float     = 0.15
-    sigma_decay:          float     = 0.999
+    num_generations:      int       = 200
+    mutation_sigma:       float     = 0.02
+    mutation_rate:        float     = 0.05
+    sigma_decay:          float     = 0.99
     full_neighbor_eval:   bool      = False          # re-eval child per neighbour λ
-    mu:                   int       = 3              # individuals per sub-problem
+    mu:                   int       = 1              # individuals per sub-problem
+    full_eval_every:      int       = 10             # use full dataset every N gens (0=off)
 
     # ── Hardware ──────────────────────────────────────────────────────────
     gpu_id:               int       = -1            # GPU node id; -1 → use accelerator rank
@@ -222,7 +223,7 @@ class MOEAD:
         template_net:      GatingNetwork,
         weight_vectors:    np.ndarray,
         neighborhood_size: int  = 5,
-        mu:                int  = 3,
+        mu:                int  = 1,
         device:            str  = 'cpu',
     ):
         self.template  = template_net.eval()
@@ -304,6 +305,8 @@ class MOEAD:
         output_dir:           str   = '.',
         poll_interval:        float = 2.0,    # seconds between queue polls
         verbose:              bool  = False,  # detailed per-batch debug logs
+        eval_seed:            int   = 42,     # base seed; gen g uses eval_seed+g
+        full_eval_every:      int   = 10,     # use full dataset every N gens (0=off)
     ) -> List[np.ndarray]:
         """Run MOEA/D with an async file-based work queue.
 
@@ -378,17 +381,19 @@ class MOEAD:
 
         # ── Eval helper ───────────────────────────────────────────────────
 
-        def _sample_loader():
-            idx      = np.random.choice(len(dataset),
-                                        size=min(eval_prompts, len(dataset)),
-                                        replace=False)
+        def _sample_loader(seed=None, full=False):
+            if full or eval_prompts >= len(dataset):
+                return DataLoader(dataset, batch_size=eval_batch_size,
+                                  collate_fn=data_collator, drop_last=False)
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(len(dataset), size=eval_prompts, replace=False)
             batch_ds = dataset.select(idx.tolist())
             return DataLoader(batch_ds, batch_size=eval_batch_size,
                               collate_fn=data_collator, drop_last=False)
 
-        def _eval_individual(params, label=''):
-            log( f'eval start [{label}]')
-            loader = _sample_loader()
+        def _eval_individual(params, label='', seed=None, full=False):
+            log( f'eval start [{label}]{"[FULL]" if full else ""}')
+            loader = _sample_loader(seed=seed, full=full)
             net    = params_to_net(params, self.template, self.device)
             net.eval()
             moe_model.gating_net = net
@@ -416,7 +421,11 @@ class MOEAD:
             Rank 0 exits when all num_tasks result files exist (then applies results and
             writes the done file).  All other ranks exit when the done file appears.
             """
-            log( f'gen {gen} worker loop start (num_tasks={num_tasks})')
+            gen_seed = eval_seed + gen   # all tasks in this gen share the same eval subset
+            is_full  = (full_eval_every > 0 and gen > 0 and gen % full_eval_every == 0)
+            if is_main and is_full:
+                print(f'  [gen {gen}] full-dataset eval', flush=True)
+            log( f'gen {gen} worker loop start (num_tasks={num_tasks}, seed={gen_seed}, full={is_full})')
             while True:
                 # Exit condition differs by role
                 if is_main:
@@ -440,7 +449,8 @@ class MOEAD:
                         task = json.load(f)
                     child_params = np.array(task['child_params'])
                     log( f'gen {gen} task {i} (λ={task["lambda"]}) claimed')
-                    r = _eval_individual(child_params, label=f'g{gen}/t{i}')
+                    r = _eval_individual(child_params, label=f'g{gen}/t{i}',
+                                         seed=gen_seed, full=is_full)
                     _write_result(gen, i, r)
                     log( f'gen {gen} task {i} result written, r={np.round(r,3)}')
                     break   # restart scan from beginning after each eval (avoids stale cache)
@@ -730,6 +740,8 @@ final_population = moead.run(
     save_every=script_args.save_every,
     output_dir=output_dir,
     verbose=script_args.verbose,
+    eval_seed=script_args.seed,
+    full_eval_every=script_args.full_eval_every,
 )
 
 # ── Save final population (rank 0 only) ──────────────────────────────────────
