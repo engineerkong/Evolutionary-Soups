@@ -23,6 +23,7 @@ import time
 import gc
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,7 +82,7 @@ class ScriptArguments:
     split:                str       = 'train'
     do_sample:            bool      = True           # stochastic generation
     num_continuations:    int       = 3              # reward averaging over K generations
-    eval_prompts:         int       = 8192             # total prompts sampled per fitness evaluation
+    eval_prompts:         int       = 8192            # total prompts sampled per fitness evaluation
     eval_batch_size:      int       = 64               # generation batch size within each eval
     max_new_tokens:       int       = 128
 
@@ -91,13 +92,12 @@ class ScriptArguments:
     # ── MOEA/D hyper-parameters ───────────────────────────────────────────
     pref_step:            float     = 0.1            # simplex grid step
     neighborhood_size:    int       = 5
-    num_generations:      int       = 200
-    mutation_sigma:       float     = 0.02
+    num_generations:      int       = 100
+    mutation_sigma:       float     = 0.005
     mutation_rate:        float     = 0.05
-    sigma_decay:          float     = 0.99
+    sigma_decay:          float     = 0.995
     full_neighbor_eval:   bool      = False          # re-eval child per neighbour λ
     mu:                   int       = 1              # individuals per sub-problem
-    full_eval_every:      int       = 10             # use full dataset every N gens (0=off)
 
     # ── Hardware ──────────────────────────────────────────────────────────
     gpu_id:               int       = -1            # GPU node id; -1 → use accelerator rank
@@ -220,11 +220,12 @@ class MOEAD:
 
     def __init__(
         self,
-        template_net:      GatingNetwork,
-        weight_vectors:    np.ndarray,
-        neighborhood_size: int  = 5,
-        mu:                int  = 1,
-        device:            str  = 'cpu',
+        template_net:        GatingNetwork,
+        weight_vectors:      np.ndarray,
+        neighborhood_size:   int   = 5,
+        mu:                  int   = 3,
+        device:              str   = 'cpu',
+        diversity_threshold: float = 0.01,
     ):
         self.template  = template_net.eval()
         self.lambdas   = weight_vectors.astype(np.float64)
@@ -246,6 +247,7 @@ class MOEAD:
             for _ in range(self.N)
         ]
 
+        self.diversity_threshold = diversity_threshold
         self.z_star       = np.full(self.M, -np.inf, dtype=np.float64)
         # reward_cache[i][k] / fitness[i][k]: per-individual cache
         self.reward_cache = [[None] * self.mu for _ in range(self.N)]
@@ -270,8 +272,11 @@ class MOEAD:
         self.z_star[improved] = r[improved]
 
     @staticmethod
-    def _crossover(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
-        beta = np.random.uniform(0.0, 1.0, size=p1.shape)
+    def _crossover(p1: np.ndarray, p2: np.ndarray,
+                   f1: float, f2: float) -> np.ndarray:
+        """Fitness-proportional crossover: better parent contributes more."""
+        alpha = f1 / (f1 + f2 + 1e-8)
+        beta  = np.random.uniform(alpha * 0.5, min(alpha * 1.5, 1.0), size=p1.shape)
         return beta * p1 + (1.0 - beta) * p2
 
     @staticmethod
@@ -305,8 +310,7 @@ class MOEAD:
         output_dir:           str   = '.',
         poll_interval:        float = 2.0,    # seconds between queue polls
         verbose:              bool  = False,  # detailed per-batch debug logs
-        eval_seed:            int   = 42,     # base seed; gen g uses eval_seed+g
-        full_eval_every:      int   = 10,     # use full dataset every N gens (0=off)
+        seed:                 int   = 42,
     ) -> List[np.ndarray]:
         """Run MOEA/D with an async file-based work queue.
 
@@ -336,7 +340,9 @@ class MOEAD:
 
         queue_root = os.path.join(output_dir, 'queue')
         if is_main:
-            os.makedirs(queue_root, exist_ok=True)
+            if os.path.exists(queue_root):
+                shutil.rmtree(queue_root)
+            os.makedirs(queue_root)
 
         # ── Queue path helpers ────────────────────────────────────────────
 
@@ -379,21 +385,32 @@ class MOEAD:
                 json.dump({'task_id': i, 'reward_vec': r.tolist()}, f)
             os.replace(tmp, _result_path(gen, i))
 
+        # ── Dataset chunks (pre-computed, deterministic) ──────────────────
+        # Shuffle once with fixed seed, split into ceil(N/eval_prompts) chunks.
+        # Each generation/task indexes into chunks by chunk_idx, cycling when
+        # num_generations > num_chunks.  All workers share the same shuffled
+        # order (same seed), so chunk_idx in the task JSON is sufficient —
+        # no runtime coordination needed.
+
+        _chunk_size  = min(eval_prompts, len(dataset))
+        _rng         = np.random.default_rng(seed)
+        _shuffled    = _rng.permutation(len(dataset)).tolist()
+        _num_chunks  = max(1, (len(dataset) + _chunk_size - 1) // _chunk_size)
+        dataset_chunks = [
+            _shuffled[c * _chunk_size : (c + 1) * _chunk_size]
+            for c in range(_num_chunks)
+        ]
+        print(f'Dataset chunks: {_num_chunks} × {_chunk_size} prompts '
+              f'(full cycle every {_num_chunks} generations)', flush=True)
+
         # ── Eval helper ───────────────────────────────────────────────────
 
-        def _sample_loader(seed=None, full=False):
-            if full or eval_prompts >= len(dataset):
-                return DataLoader(dataset, batch_size=eval_batch_size,
+        def _eval_individual(params, chunk_idx: int, label=''):
+            log( f'eval start [{label}] chunk={chunk_idx % _num_chunks}')
+            idxs     = dataset_chunks[chunk_idx % _num_chunks]
+            batch_ds = dataset.select(idxs)
+            loader   = DataLoader(batch_ds, batch_size=eval_batch_size,
                                   collate_fn=data_collator, drop_last=False)
-            rng = np.random.default_rng(seed)
-            idx = rng.choice(len(dataset), size=eval_prompts, replace=False)
-            batch_ds = dataset.select(idx.tolist())
-            return DataLoader(batch_ds, batch_size=eval_batch_size,
-                              collate_fn=data_collator, drop_last=False)
-
-        def _eval_individual(params, label='', seed=None, full=False):
-            log( f'eval start [{label}]{"[FULL]" if full else ""}')
-            loader = _sample_loader(seed=seed, full=full)
             net    = params_to_net(params, self.template, self.device)
             net.eval()
             moe_model.gating_net = net
@@ -421,11 +438,7 @@ class MOEAD:
             Rank 0 exits when all num_tasks result files exist (then applies results and
             writes the done file).  All other ranks exit when the done file appears.
             """
-            gen_seed = eval_seed + gen   # all tasks in this gen share the same eval subset
-            is_full  = (full_eval_every > 0 and gen > 0 and gen % full_eval_every == 0)
-            if is_main and is_full:
-                print(f'  [gen {gen}] full-dataset eval', flush=True)
-            log( f'gen {gen} worker loop start (num_tasks={num_tasks}, seed={gen_seed}, full={is_full})')
+            log( f'gen {gen} worker loop start (num_tasks={num_tasks})')
             while True:
                 # Exit condition differs by role
                 if is_main:
@@ -448,9 +461,9 @@ class MOEAD:
                     with open(_task_path(gen, i)) as f:
                         task = json.load(f)
                     child_params = np.array(task['child_params'])
+                    chunk_idx    = task['chunk_idx']
                     log( f'gen {gen} task {i} (λ={task["lambda"]}) claimed')
-                    r = _eval_individual(child_params, label=f'g{gen}/t{i}',
-                                         seed=gen_seed, full=is_full)
+                    r = _eval_individual(child_params, chunk_idx, label=f'g{gen}/t{i}')
                     _write_result(gen, i, r)
                     log( f'gen {gen} task {i} result written, r={np.round(r,3)}')
                     break   # restart scan from beginning after each eval (avoids stale cache)
@@ -473,6 +486,7 @@ class MOEAD:
                     task = {'task_id':      tid,
                             'sub_idx':      i,
                             'ind_idx':      k,
+                            'chunk_idx':    tid % _num_chunks,
                             'lambda':       self.lambdas[i].tolist(),
                             'child_params': self.population[i][k].tolist()}
                     _write_task(gen, tid, task)
@@ -505,17 +519,36 @@ class MOEAD:
 
             if is_main:
                 os.makedirs(_gen_dir(gen), exist_ok=True)
+
+                # Adaptive neighborhood: shrink/expand T based on population diversity
+                all_params = np.array([self.population[i][k]
+                                       for i in range(self.N) for k in range(self.mu)])
+                diversity  = np.std(all_params, axis=0).mean()
+                T_adaptive = max(2, min(self.T,
+                                        int(self.T * diversity / self.diversity_threshold)))
+                dists_cur  = cdist(self.lambdas, self.lambdas, metric='euclidean')
+                B_adaptive = [np.argsort(dists_cur[i])[:T_adaptive].tolist()
+                              for i in range(self.N)]
+                log(f'gen {gen} diversity={diversity:.5f} T_adaptive={T_adaptive}')
+
                 for i in range(self.N):
-                    # Parents drawn from the combined pool of all individuals in the neighborhood
-                    pool = [self.population[j][k]
-                            for j in self.B[i] for k in range(self.mu)]
-                    p1, p2 = pool[np.random.randint(len(pool))], pool[np.random.randint(len(pool))]
-                    child  = self._crossover(p1, p2)
+                    # Parents drawn from fitness-weighted pool in adaptive neighborhood
+                    pool = [(self.population[j][k], self.fitness[j][k])
+                            for j in B_adaptive[i] for k in range(self.mu)]
+                    idx1, idx2 = (np.random.randint(len(pool)),
+                                  np.random.randint(len(pool)))
+                    p1, f1 = pool[idx1]
+                    p2, f2 = pool[idx2]
+                    # Shift fitness to positive range before weighting
+                    f1_pos = f1 - min(f1, f2) + 1e-8
+                    f2_pos = f2 - min(f1, f2) + 1e-8
+                    child  = self._crossover(p1, p2, f1_pos, f2_pos)
                     child  = self._mutate(child, sigma, mutation_rate)
                     task   = {'task_id':      i,
                               'sub_idx':      i,
+                              'chunk_idx':    (gen - 1 + i) % _num_chunks,
                               'lambda':       self.lambdas[i].tolist(),
-                              'neighbors':    self.B[i],
+                              'neighbors':    B_adaptive[i],
                               'child_params': child.tolist()}
                     _write_task(gen, i, task)
                 log( f'gen {gen} all {self.N} tasks written')
@@ -555,7 +588,8 @@ class MOEAD:
                     f'best_fit={max(all_fit):.4f} | '
                     f'mean_fit={np.mean(all_fit):.4f} | '
                     f'z*={np.round(self.z_star, 3)} | '
-                    f'σ={sigma:.5f}',
+                    f'σ={sigma:.5f} | '
+                    f'div={diversity:.5f} | T={T_adaptive}',
                     flush=True,
                 )
                 if gen % save_every == 0:
@@ -740,8 +774,7 @@ final_population = moead.run(
     save_every=script_args.save_every,
     output_dir=output_dir,
     verbose=script_args.verbose,
-    eval_seed=script_args.seed,
-    full_eval_every=script_args.full_eval_every,
+    seed=script_args.seed,
 )
 
 # ── Save final population (rank 0 only) ──────────────────────────────────────
