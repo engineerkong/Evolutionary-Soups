@@ -15,6 +15,11 @@ Evaluation approximation (for computational tractability):
   while still propagating useful gradient information across the neighbourhood.
   Set --full_neighbor_eval to override and re-evaluate the child under every
   neighbour's λ.
+
+TO RUN: 
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/moead.py --sft_model_name './models/sft/assistant_sft/model/' \
+    --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' './models/ppo/assistant_ppo_helpful_2701/batch_832/' \
+    --run_name 'moead_gating_0904' 2>&1 | tee ./logs/moead_0904.log
 """
 
 import copy
@@ -79,12 +84,12 @@ class ScriptArguments:
     expert_model_paths:   List[str] = field(default_factory=list)
     reward_names:         str       = 'harmless,helpful'
     exp_type:             str       = 'assistant'    # 'assistant' | 'summary'
-    split:                str       = 'train'
-    do_sample:            bool      = True           # stochastic generation
-    num_continuations:    int       = 3              # reward averaging over K generations
+    do_sample:            bool      = False           # stochastic/deterministic generation
+    num_continuations:    int       = 1              # reward averaging over K generations
     eval_prompts:         int       = 8192            # total prompts sampled per fitness evaluation
-    eval_batch_size:      int       = 64               # generation batch size within each eval
+    eval_batch_size:      int       = 128               # generation batch size within each eval
     max_new_tokens:       int       = 128
+    normalize_rewards:    bool      = False            # zero mean/unit std per reward for stability
 
     # ── GatingNetwork architecture ────────────────────────────────────────
     warm_start_path:      str       = ''             # optional pre-trained checkpoint
@@ -93,11 +98,10 @@ class ScriptArguments:
     pref_step:            float     = 0.1            # simplex grid step
     neighborhood_size:    int       = 5
     num_generations:      int       = 100
-    mutation_sigma:       float     = 0.005
-    mutation_rate:        float     = 0.05
-    sigma_decay:          float     = 0.995
+    mutation_sigma:       float     = 0.05
+    mutation_rate:        float     = 0.3
+    sigma_decay:          float     = 0.999
     full_neighbor_eval:   bool      = False          # re-eval child per neighbour λ
-    mu:                   int       = 1              # individuals per sub-problem
 
     # ── Hardware ──────────────────────────────────────────────────────────
     gpu_id:               int       = -1            # GPU node id; -1 → use accelerator rank
@@ -158,7 +162,9 @@ def generate_and_score(
     -------
     mean_rewards : (num_rewards,) ndarray — mean reward per objective.
     """
-    accumulated = None   # list[list[float]] — [prompt][reward]
+    accumulated     = None   # list[list[float]] — [prompt][reward]
+    # Decode prompts once — they are identical across all continuations
+    prompts_decoded = sft_tokenizer.batch_decode(prompt_input_ids.cpu())
 
     for _ in range(num_continuations):
         outputs = moe_model.generate(
@@ -166,8 +172,7 @@ def generate_and_score(
             attention_mask=prompt_attention.to(f'cuda:{gpu_id}'),
             **generation_kwargs,
         )
-        responses       = sft_tokenizer.batch_decode(outputs.cpu())
-        prompts_decoded = sft_tokenizer.batch_decode(prompt_input_ids.cpu())
+        responses = sft_tokenizer.batch_decode(outputs.cpu())
         del outputs
 
         prompts_clean, responses_clean = get_clean_data(responses, prompts_decoded)
@@ -175,10 +180,10 @@ def generate_and_score(
                  for r in responses_clean]
         if hasattr(instructions, 'get_post'):
             scores_per_reward = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post, normalize_rewards=False, round_digits=None)
+                pairs, instructions.get_post, normalize_rewards=script_args.normalize_rewards, round_digits=None)
         else:
             scores_per_reward = reward_models.get_reward_model_scores(
-                pairs, normalize_rewards=False, round_digits=None)
+                pairs, normalize_rewards=script_args.normalize_rewards, round_digits=None)
         # scores_per_reward: list[num_rewards] of list[num_prompts]
 
         n_prompts  = len(prompts_clean)
@@ -189,7 +194,7 @@ def generate_and_score(
             for k in range(n_rewards):
                 accumulated[p][k].append(scores_per_reward[k][p])
 
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()   # once after all continuations, not per-continuation
 
     # Mean per prompt, then mean over prompts
     per_prompt_mean = np.array(
@@ -203,6 +208,11 @@ def chebyshev_scalar(reward_vec: np.ndarray, lam: np.ndarray,
                      z_star: np.ndarray) -> float:
     """Chebyshev fitness: higher = better (negated gap)."""
     return -float(np.max(lam * np.abs(reward_vec - z_star)))
+
+
+def weighted_sum_scalar(reward_vec: np.ndarray, lam: np.ndarray) -> float:
+    """Weighted-sum fitness: higher = better. No reference point needed."""
+    return float(np.dot(lam, reward_vec))
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +233,6 @@ class MOEAD:
         template_net:        GatingNetwork,
         weight_vectors:      np.ndarray,
         neighborhood_size:   int   = 5,
-        mu:                  int   = 3,
         device:              str   = 'cpu',
         diversity_threshold: float = 0.01,
     ):
@@ -231,7 +240,6 @@ class MOEAD:
         self.lambdas   = weight_vectors.astype(np.float64)
         self.N         = len(weight_vectors)
         self.T         = min(neighborhood_size, self.N)
-        self.mu        = mu
         self.device    = device
         self.M         = weight_vectors.shape[1]
 
@@ -240,18 +248,17 @@ class MOEAD:
 
         base_params    = net_to_params(template_net)
         self.param_dim = len(base_params)
-        # population[i][k]: k-th individual of sub-problem i
+        # population[i]: one individual (params array) per sub-problem
         self.population = [
-            [base_params + np.random.randn(self.param_dim) * 0.05
-             for _ in range(self.mu)]
+            base_params + np.random.randn(self.param_dim) * 0.05
             for _ in range(self.N)
         ]
 
         self.diversity_threshold = diversity_threshold
         self.z_star       = np.full(self.M, -np.inf, dtype=np.float64)
-        # reward_cache[i][k] / fitness[i][k]: per-individual cache
-        self.reward_cache = [[None] * self.mu for _ in range(self.N)]
-        self.fitness      = [np.full(self.mu, -np.inf) for _ in range(self.N)]
+        # reward_cache[i] / fitness[i]: per-sub-problem cache
+        self.reward_cache = [None] * self.N
+        self.fitness      = [-np.inf] * self.N
 
         # Per-generation snapshots for post-hoc analysis
         # z_star_history[g]  : z* at the end of generation g  (shape M)
@@ -272,11 +279,8 @@ class MOEAD:
         self.z_star[improved] = r[improved]
 
     @staticmethod
-    def _crossover(p1: np.ndarray, p2: np.ndarray,
-                   f1: float, f2: float) -> np.ndarray:
-        """Fitness-proportional crossover: better parent contributes more."""
-        alpha = f1 / (f1 + f2 + 1e-8)
-        beta  = np.random.uniform(alpha * 0.5, min(alpha * 1.5, 1.0), size=p1.shape)
+    def _crossover(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        beta = np.random.uniform(0.0, 1.0, size=p1.shape)
         return beta * p1 + (1.0 - beta) * p2
 
     @staticmethod
@@ -311,6 +315,7 @@ class MOEAD:
         poll_interval:        float = 2.0,    # seconds between queue polls
         verbose:              bool  = False,  # detailed per-batch debug logs
         seed:                 int   = 42,
+        val_dataset                 = None,   # test-split dataset for periodic validation
     ) -> List[np.ndarray]:
         """Run MOEA/D with an async file-based work queue.
 
@@ -400,17 +405,29 @@ class MOEAD:
             _shuffled[c * _chunk_size : (c + 1) * _chunk_size]
             for c in range(_num_chunks)
         ]
+        # Pre-build one DataLoader per chunk — avoids reconstructing on every eval call
+        chunk_loaders = [
+            DataLoader(dataset.select(idxs), batch_size=eval_batch_size,
+                       collate_fn=data_collator, drop_last=False)
+            for idxs in dataset_chunks
+        ]
         print(f'Dataset chunks: {_num_chunks} × {_chunk_size} prompts '
               f'(full cycle every {_num_chunks} generations)', flush=True)
+
+        # ── Validation loader (fixed, test split, sampled once) ───────────
+        if val_dataset is not None:
+            val_loader = DataLoader(
+                val_dataset, batch_size=eval_batch_size,
+                collate_fn=data_collator, drop_last=False)
+            print(f'Validation loader: {len(val_dataset)} prompts (test split)', flush=True)
+        else:
+            val_loader = None
 
         # ── Eval helper ───────────────────────────────────────────────────
 
         def _eval_individual(params, chunk_idx: int, label=''):
             log( f'eval start [{label}] chunk={chunk_idx % _num_chunks}')
-            idxs     = dataset_chunks[chunk_idx % _num_chunks]
-            batch_ds = dataset.select(idxs)
-            loader   = DataLoader(batch_ds, batch_size=eval_batch_size,
-                                  collate_fn=data_collator, drop_last=False)
+            loader = chunk_loaders[chunk_idx % _num_chunks]
             net    = params_to_net(params, self.template, self.device)
             net.eval()
             moe_model.gating_net = net
@@ -473,37 +490,119 @@ class MOEAD:
 
             log( f'gen {gen} worker loop done')
 
+        # ── Validation helpers ────────────────────────────────────────────
+
+        def _val_individual(params):
+            net = params_to_net(params, self.template, self.device)
+            net.eval()
+            moe_model.gating_net = net
+            reward_vecs = []
+            for batch in val_loader:
+                r = generate_and_score(
+                    moe_model, batch['input_ids'], batch['attention_mask'],
+                    [], sft_tokenizer, reward_models, instructions,
+                    generation_kwargs, gpu_id, num_continuations)
+                reward_vecs.append(r)
+            return np.mean(reward_vecs, axis=0)
+
+        def _val_worker_loop(gen):
+            vdir     = os.path.join(queue_root, f'val_{gen:04d}')
+            _vtask   = lambda i: os.path.join(vdir, f'task_{i:03d}.json')
+            _vclaim  = lambda i: os.path.join(vdir, f'claimed_{i:03d}')
+            _vresult = lambda i: os.path.join(vdir, f'result_{i:03d}.json')
+            _vdone   = os.path.join(vdir, 'done')
+
+            if is_main:
+                os.makedirs(vdir, exist_ok=True)
+                for i in range(self.N):
+                    tmp = _vtask(i) + '.tmp'
+                    with open(tmp, 'w') as f:
+                        json.dump({'task_id': i,
+                                   'lambda':  self.lambdas[i].tolist(),
+                                   'child_params': self.population[i].tolist()}, f)
+                    os.replace(tmp, _vtask(i))
+
+            while True:
+                if is_main:
+                    if all(os.path.exists(_vresult(i)) for i in range(self.N)):
+                        break
+                else:
+                    if os.path.exists(_vdone):
+                        break
+
+                claimed = False
+                for i in range(self.N):
+                    if not os.path.exists(_vtask(i)) or os.path.exists(_vresult(i)):
+                        continue
+                    try:
+                        fd = os.open(_vclaim(i), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        os.write(fd, str(rank).encode())
+                        os.close(fd)
+                    except FileExistsError:
+                        continue
+                    claimed = True
+                    with open(_vtask(i)) as f:
+                        task = json.load(f)
+                    r   = _val_individual(np.array(task['child_params']))
+                    tmp = _vresult(i) + f'.tmp_rank{rank}'
+                    with open(tmp, 'w') as f:
+                        json.dump({'task_id': i, 'reward_vec': r.tolist()}, f)
+                    os.replace(tmp, _vresult(i))
+                    break
+
+                if not claimed:
+                    time.sleep(poll_interval)
+
+            if is_main:
+                val_rewards = []
+                for i in range(self.N):
+                    with open(_vresult(i)) as f:
+                        r = np.array(json.load(f)['reward_vec'])
+                    val_rewards.append(r)
+                    if verbose:
+                        f_val = chebyshev_scalar(r, self.lambdas[i], self.z_star)
+                        print(f'  [Val] sub_{i:03d} λ={np.round(self.lambdas[i],2)} '
+                              f'r={np.round(r,3)} cheb={f_val:.4f}', flush=True)
+
+                val_arr = np.array(val_rewards)
+                print(f'  [Val] gen {gen} | '
+                      f'mean_r={np.round(val_arr.mean(axis=0),3)} | '
+                      f'best_per_obj={np.round(val_arr.max(axis=0),3)}',
+                      flush=True)
+                with open(os.path.join(output_dir, 'val_history.jsonl'), 'a') as f:
+                    json.dump({'gen': gen, 'lambdas': self.lambdas.tolist(),
+                               'val_rewards': val_arr.tolist()}, f)
+                    f.write('\n')
+                open(_vdone, 'w').close()
+            else:
+                while not os.path.exists(_vdone):
+                    time.sleep(poll_interval)
+
         # ── Phase 0: initial population evaluation ────────────────────────
-        # Write N*mu tasks (one per individual), apply results into population[i][k].
+        # Write N tasks (one per sub-problem), apply results into population[i].
         gen = 0
-        num_init_tasks = self.N * self.mu
         if is_main:
-            print(f'MOEA/D — initialising population ({num_init_tasks} individuals) …')
+            print(f'MOEA/D — initialising population ({self.N} individuals) …')
             os.makedirs(_gen_dir(gen), exist_ok=True)
             for i in range(self.N):
-                for k in range(self.mu):
-                    tid = i * self.mu + k
-                    task = {'task_id':      tid,
-                            'sub_idx':      i,
-                            'ind_idx':      k,
-                            'chunk_idx':    tid % _num_chunks,
-                            'lambda':       self.lambdas[i].tolist(),
-                            'child_params': self.population[i][k].tolist()}
-                    _write_task(gen, tid, task)
-            log( f'gen {gen} all {num_init_tasks} init tasks written')
+                task = {'task_id':      i,
+                        'sub_idx':      i,
+                        'chunk_idx':    i % _num_chunks,
+                        'lambda':       self.lambdas[i].tolist(),
+                        'child_params': self.population[i].tolist()}
+                _write_task(gen, i, task)
+            log(f'gen {gen} all {self.N} init tasks written')
 
-        _worker_loop(gen, num_init_tasks)
+        _worker_loop(gen, self.N)
 
         if is_main:
-            log( 'gen 0 applying init results')
+            log('gen 0 applying init results')
             for i in range(self.N):
-                for k in range(self.mu):
-                    tid = i * self.mu + k
-                    with open(_result_path(gen, tid)) as f:
-                        r = np.array(json.load(f)['reward_vec'])
-                    self.reward_cache[i][k] = r
-                    self._update_z_star(r)
-                    self.fitness[i][k] = chebyshev_scalar(r, self.lambdas[i], self.z_star)
+                with open(_result_path(gen, i)) as f:
+                    r = np.array(json.load(f)['reward_vec'])
+                self.reward_cache[i] = r
+                self._update_z_star(r)
+                self.fitness[i] = weighted_sum_scalar(r, self.lambdas[i])
             # Signal workers that gen 0 is complete
             open(_done_path(gen), 'w').close()
             log( f'gen 0 done, z*={np.round(self.z_star,3)}')
@@ -513,6 +612,9 @@ class MOEAD:
                 time.sleep(poll_interval)
 
         # ── Generational loop ─────────────────────────────────────────────
+        # Lambda distances are fixed — precompute once
+        _lambda_dists = cdist(self.lambdas, self.lambdas, metric='euclidean')
+
         sigma = mutation_sigma
         for gen in range(1, num_generations + 1):
             log( f'gen {gen}/{num_generations} start')
@@ -520,45 +622,60 @@ class MOEAD:
             if is_main:
                 os.makedirs(_gen_dir(gen), exist_ok=True)
 
-                # Adaptive neighborhood: shrink/expand T based on population diversity
-                all_params = np.array([self.population[i][k]
-                                       for i in range(self.N) for k in range(self.mu)])
+                # Adaptive neighborhood: expand T when diversity is low to import
+                # diverse solutions; shrink T when diversity is high to keep
+                # each sub-problem focused on its own region.
+                all_params = np.array([self.population[i]
+                                       for i in range(self.N)])
                 diversity  = np.std(all_params, axis=0).mean()
-                T_adaptive = max(2, min(self.T,
-                                        int(self.T * diversity / self.diversity_threshold)))
-                dists_cur  = cdist(self.lambdas, self.lambdas, metric='euclidean')
-                B_adaptive = [np.argsort(dists_cur[i])[:T_adaptive].tolist()
+                if diversity < self.diversity_threshold:
+                    T_adaptive = self.T          # full neighborhood — pull in diverse parents
+                else:
+                    T_adaptive = max(2, int(self.T * self.diversity_threshold / diversity))
+                B_adaptive = [np.argsort(_lambda_dists[i])[:T_adaptive].tolist()
                               for i in range(self.N)]
                 log(f'gen {gen} diversity={diversity:.5f} T_adaptive={T_adaptive}')
 
                 for i in range(self.N):
-                    # Parents drawn from fitness-weighted pool in adaptive neighborhood
-                    pool = [(self.population[j][k], self.fitness[j][k])
-                            for j in B_adaptive[i] for k in range(self.mu)]
+                    # Parents drawn from neighborhood pool
+                    pool = [(self.population[j], self.fitness[j]) for j in B_adaptive[i]]
                     idx1, idx2 = (np.random.randint(len(pool)),
                                   np.random.randint(len(pool)))
                     p1, f1 = pool[idx1]
                     p2, f2 = pool[idx2]
                     # Shift fitness to positive range before weighting
-                    f1_pos = f1 - min(f1, f2) + 1e-8
-                    f2_pos = f2 - min(f1, f2) + 1e-8
-                    child  = self._crossover(p1, p2, f1_pos, f2_pos)
+                    # f1_pos = f1 - min(f1, f2) + 1e-8
+                    # f2_pos = f2 - min(f1, f2) + 1e-8
+                    child  = self._crossover(p1, p2)
                     child  = self._mutate(child, sigma, mutation_rate)
                     task   = {'task_id':      i,
                               'sub_idx':      i,
-                              'chunk_idx':    (gen - 1 + i) % _num_chunks,
+                              'chunk_idx':    (gen + i) % _num_chunks,
                               'lambda':       self.lambdas[i].tolist(),
                               'neighbors':    B_adaptive[i],
                               'child_params': child.tolist()}
                     _write_task(gen, i, task)
-                log( f'gen {gen} all {self.N} tasks written')
+                # Parent re-eval tasks: IDs N..2N-1, same chunk as child i
+                for i in range(self.N):
+                    _write_task(gen, self.N + i, {'task_id': self.N + i,
+                                                  'chunk_idx': (gen + i) % _num_chunks,
+                                                  'lambda': self.lambdas[i].tolist(), 'neighbors': [],
+                                                  'child_params': self.population[i].tolist()})
+                log(f'gen {gen} all {2 * self.N} tasks written')
 
-            # All ranks evaluate tasks
-            _worker_loop(gen, self.N)
+            # All ranks evaluate tasks (children + parent re-evals)
+            _worker_loop(gen, 2 * self.N)
 
             # Rank 0 applies results and advances population
             if is_main:
-                log( f'gen {gen} applying results')
+                log(f'gen {gen} applying results')
+                # Refresh parent fitness on this gen's chunk before child comparison
+                for i in range(self.N):
+                    with open(_result_path(gen, self.N + i)) as f:
+                        r = np.array(json.load(f)['reward_vec'])
+                    self.reward_cache[i] = r
+                    self._update_z_star(r)
+                    self.fitness[i] = weighted_sum_scalar(r, self.lambdas[i])
                 for i in range(self.N):
                     with open(_task_path(gen, i)) as f:
                         task = json.load(f)
@@ -567,22 +684,18 @@ class MOEAD:
                     child_params = np.array(task['child_params'])
                     self._update_z_star(r_child)
                     for j in task['neighbors']:
-                        f_j = chebyshev_scalar(r_child, self.lambdas[j], self.z_star)
-                        # Replace the worst individual in neighbor j's pool if child is better
-                        worst_k = int(np.argmin(self.fitness[j]))
-                        if f_j > self.fitness[j][worst_k]:
-                            self.population[j][worst_k]   = child_params.copy()
-                            self.reward_cache[j][worst_k] = r_child
-                            self.fitness[j][worst_k]      = f_j
+                        f_j = weighted_sum_scalar(r_child, self.lambdas[j])
+                        # Replace individual in neighbor j if child is better
+                        if f_j > self.fitness[j]:
+                            self.population[j]   = child_params.copy()
+                            self.reward_cache[j] = r_child
+                            self.fitness[j]      = f_j
 
                 sigma *= sigma_decay
                 self.z_star_history.append(self.z_star.copy())
-                # Store best fitness per sub-problem for history
-                self.fitness_history.append(
-                    np.array([np.max(self.fitness[i]) for i in range(self.N)]))
+                self.fitness_history.append(np.array(self.fitness))
 
-                all_fit = [self.fitness[i][k]
-                           for i in range(self.N) for k in range(self.mu)]
+                all_fit = self.fitness
                 print(
                     f'Gen {gen:4d}/{num_generations} | '
                     f'best_fit={max(all_fit):.4f} | '
@@ -603,6 +716,10 @@ class MOEAD:
                 while not os.path.exists(_done_path(gen)):
                     time.sleep(poll_interval)
 
+            # Periodic validation on test split (all ranks participate)
+            if gen % save_every == 0 and val_loader is not None:
+                _val_worker_loop(gen)
+
         return self.population
 
     def _save_checkpoint(self, output_dir: str, gen: int):
@@ -611,17 +728,15 @@ class MOEAD:
         os.makedirs(ckpt_dir, exist_ok=True)
         for i in range(self.N):
             lam_str = '_'.join(f'{v:.2f}' for v in self.lambdas[i])
-            for k in range(self.mu):
-                subdir = os.path.join(ckpt_dir, f'sub_{i:03d}_ind_{k:02d}_lam_{lam_str}')
-                net    = params_to_net(self.population[i][k], self.template, 'cpu')
-                save_gating_network(net, subdir)
+            subdir = os.path.join(ckpt_dir, f'sub_{i:03d}_lam_{lam_str}')
+            net    = params_to_net(self.population[i], self.template, 'cpu')
+            save_gating_network(net, subdir)
         meta = {
             'generation':     gen,
             'z_star':         self.z_star.tolist(),
-            'fitness':        [self.fitness[i].tolist() for i in range(self.N)],
-            'reward_cache':   [[r.tolist() if r is not None else None
-                                for r in self.reward_cache[i]]
-                               for i in range(self.N)],
+            'fitness':        self.fitness,
+            'reward_cache':   [r.tolist() if r is not None else None
+                               for r in self.reward_cache],
             'weight_vectors': self.lambdas.tolist(),
         }
         with open(os.path.join(ckpt_dir, 'moead_state.json'), 'w') as f:
@@ -644,7 +759,7 @@ np.random.seed(script_args.seed)
 
 if 'RANK' in os.environ:
     torch.distributed.init_process_group(
-        backend='nccl', timeout=datetime.timedelta(minutes=60))
+        backend='nccl', timeout=datetime.timedelta(minutes=600))
 accelerator = Accelerator()
 gpu_id      = (script_args.gpu_id if script_args.gpu_id >= 0
                else accelerator.local_process_index)
@@ -662,29 +777,28 @@ sft_tokenizer              = load_main_tokenizer(script_args.sft_model_name)
 sft_tokenizer.padding_side = 'left'
 
 if script_args.exp_type == 'assistant':
-    if script_args.split == 'test':
-        dataset = build_dataset_eval_ppo(
-            'Anthropic/hh-rlhf', sft_tokenizer,
-            reward_models.rm_tokenizers, split='test')
-    else:
-        dataset = build_dataset_ppo(
-            'Anthropic/hh-rlhf', sft_tokenizer,
-            reward_models.rm_tokenizers[0], split='train')
+    dataset = build_dataset_ppo(
+        'Anthropic/hh-rlhf', sft_tokenizer,
+        reward_models.rm_tokenizers[0], split='train')
+    val_dataset = build_dataset_eval_ppo(
+        'Anthropic/hh-rlhf', sft_tokenizer,
+        reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 else:
-    if script_args.split == 'test':
-        dataset = build_dataset_summary_eval_ppo(
-            'openai/summarize_from_feedback', sft_tokenizer,
-            reward_models.rm_tokenizers, split='test')
-    else:
-        dataset = build_dataset_summary_ppo(
-            'openai/summarize_from_feedback', sft_tokenizer,
-            reward_models.rm_tokenizers[0], split='train')
+    dataset = build_dataset_summary_ppo(
+        'openai/summarize_from_feedback', sft_tokenizer,
+        reward_models.rm_tokenizers[0], split='train')
+    val_dataset = build_dataset_summary_eval_ppo(
+        'openai/summarize_from_feedback', sft_tokenizer,
+        reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:
         dataset = dataset.remove_columns(key)
+for key in ['key', 'text', 'prompt', 'response', 'query']:
+    if key in val_dataset.column_names:
+        val_dataset = val_dataset.remove_columns(key)
 
 data_collator = DataCollatorWithPadding(tokenizer=sft_tokenizer)
 print(f'Dataset size: {len(dataset)} | eval_prompts per call: {script_args.eval_prompts}')
@@ -703,8 +817,10 @@ print(f'Loading {len(script_args.expert_model_paths)} expert models …')
 expert_models = []
 for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
+    _attn_impl = 'sdpa'   # PyTorch built-in, no extra package needed
     m = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, device_map=device)
+        path, torch_dtype=torch.bfloat16, device_map=device,
+        attn_implementation=_attn_impl)
     m.resize_token_embeddings(len(sft_tokenizer))
     m.eval()
     for p in m.parameters():
@@ -749,7 +865,6 @@ moead = MOEAD(
     template_net=template_net,
     weight_vectors=weight_vectors,
     neighborhood_size=script_args.neighborhood_size,
-    mu=script_args.mu,
     device=device,
 )
 
@@ -775,6 +890,7 @@ final_population = moead.run(
     output_dir=output_dir,
     verbose=script_args.verbose,
     seed=script_args.seed,
+    val_dataset=val_dataset,
 )
 
 # ── Save final population (rank 0 only) ──────────────────────────────────────
@@ -786,25 +902,22 @@ if is_main:
     os.makedirs(final_dir, exist_ok=True)
     for i in range(len(weight_vectors)):
         lam_str = '_'.join(f'{v:.2f}' for v in weight_vectors[i])
-        for k in range(moead.mu):
-            subdir = os.path.join(final_dir, f'sub_{i:03d}_ind_{k:02d}_lam_{lam_str}')
-            net    = params_to_net(final_population[i][k], template_net, 'cpu')
-            save_gating_network(net, subdir)
-            with open(os.path.join(subdir, 'lambda.json'), 'w') as f:
-                json.dump({'lambda':  weight_vectors[i].tolist(),
-                           'fitness': float(moead.fitness[i][k]),
-                           'z_star':  moead.z_star.tolist()}, f, indent=2)
+        subdir = os.path.join(final_dir, f'sub_{i:03d}_lam_{lam_str}')
+        net    = params_to_net(final_population[i], template_net, 'cpu')
+        save_gating_network(net, subdir)
+        with open(os.path.join(subdir, 'lambda.json'), 'w') as f:
+            json.dump({'lambda':  weight_vectors[i].tolist(),
+                       'fitness': float(moead.fitness[i]),
+                       'z_star':  moead.z_star.tolist()}, f, indent=2)
 
-    best_i = max(range(len(weight_vectors)), key=lambda i: float(np.max(moead.fitness[i])))
-    best_k = int(np.argmax(moead.fitness[best_i]))
-    best_net = params_to_net(final_population[best_i][best_k], template_net, 'cpu')
+    best_i = max(range(len(weight_vectors)), key=lambda i: float(moead.fitness[i]))
+    best_net = params_to_net(final_population[best_i], template_net, 'cpu')
     best_dir = os.path.join(output_dir, 'best')
     save_gating_network(best_net, best_dir)
     with open(os.path.join(best_dir, 'lambda.json'), 'w') as f:
         json.dump({'lambda':        weight_vectors[best_i].tolist(),
-                   'fitness':       float(moead.fitness[best_i][best_k]),
+                   'fitness':       float(moead.fitness[best_i]),
                    'subproblem_id': best_i,
-                   'ind_id':        best_k,
                    'z_star':        moead.z_star.tolist()}, f, indent=2)
 
     with open(os.path.join(output_dir, 'moead_meta.json'), 'w') as f:
@@ -812,19 +925,17 @@ if is_main:
             'reward_names':      reward_names,
             'weight_vectors':    weight_vectors.tolist(),
             'z_star':            moead.z_star.tolist(),
-            'final_fitness':     [moead.fitness[i].tolist() for i in range(len(weight_vectors))],
+            'final_fitness':     [float(moead.fitness[i]) for i in range(len(weight_vectors))],
             'fitness_history':   [f.tolist() for f in moead.fitness_history],
             'z_star_history':    [z.tolist() for z in moead.z_star_history],
-            'reward_cache':      [[r.tolist() if r is not None else None
-                                   for r in moead.reward_cache[i]]
-                                  for i in range(len(weight_vectors))],
+            'reward_cache':      [r.tolist() if r is not None else None
+                                  for r in moead.reward_cache],
             'num_generations':   script_args.num_generations,
             'eval_prompts':      script_args.eval_prompts,
             'lm_hidden_size':    lm_hidden_size,
-            'mu':                moead.mu,
         }, f, indent=2)
 
-    print(f'\nDone. Best sub-problem: idx={best_i}, ind={best_k}, '
+    print(f'\nDone. Best sub-problem: idx={best_i}, '
           f'λ={weight_vectors[best_i].round(3)}, '
-          f'fitness={moead.fitness[best_i][best_k]:.4f}')
+          f'fitness={moead.fitness[best_i]:.4f}')
     print(f'Final ideal point z* = {np.round(moead.z_star, 4)}')

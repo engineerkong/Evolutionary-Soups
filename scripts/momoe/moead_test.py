@@ -4,23 +4,13 @@
   2. MoE with fixed merging coefficients (sanity check: [1,0] should match expert[0])
   3. MoE with a trained GatingNetwork from MOEA/D (--gating_paths)
 
-Single-GPU usage:
-    python moead_test.py \
-        --expert_model_paths ./models/ppo/harmless/batch_832/ \
-                             ./models/ppo/helpful/batch_832/ \
-        --sft_model_name ./models/sft/model/ \
-        --gating_paths ./models/moead/moead_gating_0304/gen_0030/
-
-Multi-GPU usage (configs sharded across ranks):
-    torchrun --nproc_per_node=4 moead_test.py \
-        --expert_model_paths ./models/ppo/harmless/batch_832/ \
-                             ./models/ppo/helpful/batch_832/ \
-        --sft_model_name ./models/sft/model/ \
-        --gating_paths ./models/moead/moead_gating_0304/gen_0030/
-
 gating_paths accepts:
   - A dir that directly contains gating_network.pt  (e.g. best/)
   - A dir containing sub-dirs with gating_network.pt (e.g. gen_0030/ or final/)
+
+TO RUN:
+python ./scripts/momoe/moead_test.py --expert_model_paths ./models/ppo/assistant_ppo_harmless_2701/batch_832/ ./models/ppo/assistant_ppo_helpful_2701/batch_832/ --sft_model_name ./models/sft/assistant_sft/model/
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/moead_test.py --sft_model_name ./models/sft/assistant_sft/model/ --expert_model_paths ./models/ppo/assistant_ppo_harmless_2701/batch_832/ ./models/ppo/assistant_ppo_helpful_2701/batch_832/ --gating_paths ./models/moead/moead_gating_0904/gen_0020/ --run_name 'moead_test_0904' 2>&1 | tee ./logs/moead_test_0904.log
 """
 
 import datetime
@@ -60,9 +50,9 @@ class Args:
     gating_paths:       List[str] = field(default_factory=list)
     reward_names:       str       = 'harmless,helpful'
     eval_prompts:       int       = 0
-    batch_size:         int       = 64
+    batch_size:         int       = 128
     max_new_tokens:     int       = 128
-    do_sample:          bool      = True
+    do_sample:          bool      = False
     num_continuations:  int       = 1
     gpu_id:             int       = -1     # used only when not running under torchrun
     save_directory:     str       = './results/'

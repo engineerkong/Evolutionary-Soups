@@ -27,7 +27,7 @@ class GatingNetwork(nn.Module):
     Output: (batch, num_experts)  — combination coefficients summing to 1
     """
 
-    def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_size=64):
+    def __init__(self, lm_hidden_size=4096, num_experts=2, hidden_size=256):
         super().__init__()
         self.num_experts    = num_experts
         self.lm_hidden_size = lm_hidden_size
@@ -95,6 +95,11 @@ class MoEForCausalLM(nn.Module):
             for p in exp.parameters():
                 p.requires_grad = False
 
+        # One CUDA stream per expert for concurrent FFN execution
+        self._expert_streams = [torch.cuda.Stream() for _ in range(self.num_experts)]
+        # Event used to signal that ln_hidden is ready on the main stream
+        self._ln_ready = torch.cuda.Event()
+
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -119,9 +124,9 @@ class MoEForCausalLM(nn.Module):
 
         # Lower-triangular causal mask: query i attends to keys 0 … past_len+i
         mask = torch.full((seq_len, total_len), min_val, dtype=dtype, device=device)
-        causal_idx = torch.arange(seq_len, device=device)
-        for q in range(seq_len):
-            mask[q, : past_len + q + 1] = 0.0
+        col  = torch.arange(total_len, device=device).unsqueeze(0)   # (1, total_len)
+        row  = torch.arange(seq_len,   device=device).unsqueeze(1)   # (seq_len, 1)
+        mask[col <= (past_len + row)] = 0.0
         mask = mask.unsqueeze(0).unsqueeze(0).expand(B, 1, -1, -1).clone()
 
         # Mask padded key positions
@@ -199,13 +204,25 @@ class MoEForCausalLM(nn.Module):
                 coeff = seq_coefficients[l]
             coefficients = coeff.to(hidden_states.dtype)
 
+            # post_attention_layernorm is a frozen, LoRA-unadapted weight —
+            # identical across all experts; compute once and share.
+            ln_hidden = self.experts[0].model.layers[l].post_attention_layernorm(
+                hidden_states)
+            # Record event so expert streams know ln_hidden is fully written
+            self._ln_ready.record()
+
+            # Dispatch each expert's FFN onto its own CUDA stream (concurrent execution)
             residual    = hidden_states
-            ffn_outputs = [
-                expert.model.layers[l].mlp(
-                    expert.model.layers[l].post_attention_layernorm(hidden_states)
-                )
-                for expert in self.experts
-            ]
+            ffn_outputs = [None] * self.num_experts
+            for i, (expert, stream) in enumerate(
+                    zip(self.experts, self._expert_streams)):
+                stream.wait_event(self._ln_ready)   # wait for ln_hidden before reading
+                with torch.cuda.stream(stream):
+                    ffn_outputs[i] = expert.model.layers[l].mlp(ln_hidden)
+            # Wait for all expert streams before combining
+            cur = torch.cuda.current_stream()
+            for stream in self._expert_streams:
+                cur.wait_stream(stream)
             hidden_states = residual + sum(
                 coefficients[:, i].view(B, 1, 1) * ffn_outputs[i]
                 for i in range(self.num_experts)
