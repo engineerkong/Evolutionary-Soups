@@ -134,8 +134,13 @@ def generate_and_score(model, input_ids, attention_mask, tokenizer,
         prompts_clean, responses_clean = get_clean_data(responses, prompts_decoded)
         pairs = [(instructions.get_input(r), instructions.get_response(r))
                  for r in responses_clean]
-        scores = reward_models.get_reward_model_scores(
-            pairs, normalize_rewards=False, round_digits=None)
+        if hasattr(instructions, 'get_post'):
+            scores = reward_models.get_reward_model_scores(
+                pairs, instructions.get_post,
+                normalize_rewards=False, round_digits=None)
+        else:
+            scores = reward_models.get_reward_model_scores(
+                pairs, normalize_rewards=False, round_digits=None)
 
         n_prompts, n_rewards = len(prompts_clean), len(scores)
         if accumulated is None:
@@ -250,7 +255,7 @@ if args.use_train_split:
     else:
         ds = build_dataset_summary_ppo(
             'openai/summarize_from_feedback', tokenizer,
-            reward_models.rm_tokenizers[0], split=train_split)
+            reward_models.rm_tokenizers[0], split=train_split, size=128)
         instructions = Instructions_summary()
 else:
     eval_split = f'test[:{args.eval_prompts}]' if args.eval_prompts > 0 else 'test'
@@ -299,11 +304,11 @@ lm_hidden_size = experts[0].config.hidden_size
 # all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
 all_configs = []
 
-# 1. Fixed-coefficient baselines
-simplex = get_simplex_samples(len(reward_names), step=0.1)
-for coeffs in simplex:
-    all_configs.append((f'MoE fixed {coeffs}',
-                        MoEForCausalLM(experts, FixedGating(coeffs)).to(device)))
+# # 1. Fixed-coefficient baselines
+# simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
+# for coeffs in simplex:
+#     all_configs.append((f'MoE fixed {coeffs}',
+#                         MoEForCausalLM(experts, FixedGating(coeffs)).to(device)))
 
 # 2. NSGA-II GatingNetwork checkpoints — each evaluated ONCE.
 #    At inference: select best individual via argmax dot(λ, reward_i).

@@ -70,9 +70,13 @@ def _sample_token(logits: torch.Tensor, temperature: float,
 
 
 class MoEForCausalLM(nn.Module):
-    """Mixture-of-Experts LM: N frozen expert LLMs combined at each transformer layer."""
+    """Mixture-of-Experts LM: N frozen expert LLMs combined at each transformer layer.
 
-    def __init__(self, expert_models: list, gating_net: GatingNetwork):
+    Gating is per-sequence (prefill coefficients reused for every decode step)
+    on post-attention hidden states (before FFN).
+    """
+
+    def __init__(self, expert_models: list, gating_net):
         super().__init__()
         self.experts     = nn.ModuleList(expert_models)
         self.gating_net  = gating_net
@@ -123,6 +127,7 @@ class MoEForCausalLM(nn.Module):
         for l in range(self.num_layers):
             layer0 = self.experts[0].model.layers[l]
 
+            # ── Attention sub-layer (shared across experts) ──────────────────
             residual       = hidden_states
             hidden_ln      = layer0.input_layernorm(hidden_states)
             attn_out, _, _ = layer0.self_attn(
@@ -132,13 +137,14 @@ class MoEForCausalLM(nn.Module):
             )
             hidden_states = residual + attn_out
 
+            # ── Gate on post-attn hidden states (before FFN) ─────────────────
             if is_prefill:
                 coeff = self.gating_net(hidden_states.float())
                 seq_coefficients.append(coeff)
             else:
                 coeff = seq_coefficients[l]
-            coefficients = coeff.to(hidden_states.dtype)
 
+            # ── FFN sub-layer (all experts in parallel) ───────────────────────
             ln_hidden = self.experts[0].model.layers[l].post_attention_layernorm(hidden_states)
             self._ln_ready.record()
 
@@ -151,6 +157,9 @@ class MoEForCausalLM(nn.Module):
             cur = torch.cuda.current_stream()
             for stream in self._expert_streams:
                 cur.wait_stream(stream)
+
+            # ── Merge expert FFN outputs ──────────────────────────────────────
+            coefficients  = coeff.to(hidden_states.dtype)
             hidden_states = residual + sum(
                 coefficients[:, i].view(B, 1, 1) * ffn_outputs[i]
                 for i in range(self.num_experts)

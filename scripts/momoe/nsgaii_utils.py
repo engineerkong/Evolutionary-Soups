@@ -39,10 +39,11 @@ def get_simplex_samples(n_objectives: int, step: float = 0.2) -> List[List[float
 # Gating network save / load
 # ---------------------------------------------------------------------------
 
-def save_gating_network(gating_net: GatingNetwork, save_path: str) -> None:
+def save_gating_network(gating_net, save_path: str) -> None:
     os.makedirs(save_path, exist_ok=True)
     torch.save(gating_net.state_dict(), os.path.join(save_path, 'gating_network.pt'))
     config = {
+        'type':           type(gating_net).__name__,
         'lm_hidden_size': gating_net.lm_hidden_size,
         'num_experts':    gating_net.num_experts,
         'hidden_size':    gating_net.hidden_size,
@@ -52,20 +53,22 @@ def save_gating_network(gating_net: GatingNetwork, save_path: str) -> None:
 
 
 def load_gating_network(save_path: str, lm_hidden_size: int = 4096,
-                        num_experts: int = 2, device: str = 'cuda') -> GatingNetwork | None:
+                        num_experts: int = 2, device: str = 'cuda'):
     resolved  = _resolve_checkpoint(save_path, 'gating_network.pt')
     ckpt_file = os.path.join(resolved, 'gating_network.pt')
     if not os.path.exists(ckpt_file):
         return None
 
+    net_type    = 'GatingNetwork'
     hidden_size = 256
     cfg_file = os.path.join(resolved, 'gating_config.json')
     if os.path.exists(cfg_file):
         with open(cfg_file) as f:
             cfg = json.load(f)
+        net_type       = cfg.get('type',           net_type)
         lm_hidden_size = cfg.get('lm_hidden_size', lm_hidden_size)
-        num_experts    = cfg.get('num_experts',    num_experts)
-        hidden_size    = cfg.get('hidden_size',    hidden_size)
+        num_experts    = cfg.get('num_experts',     num_experts)
+        hidden_size    = cfg.get('hidden_size',     hidden_size)
 
     net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
                         hidden_size=hidden_size)

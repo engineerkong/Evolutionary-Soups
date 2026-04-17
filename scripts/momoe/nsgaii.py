@@ -25,7 +25,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -66,13 +66,21 @@ class ScriptArguments:
     max_new_tokens:       int       = 128
     normalize_rewards:    bool      = False
     warm_start_path:      str       = ''
+    # Algorithm selection
+    algorithm:            str       = 'nsgaii'   # 'nsgaii' | 'nsgaiii'
+    n_reference_divisions: int      = 12         # Das-Dennis divisions for NSGA-III reference points
 
-    # NSGA-II hyper-parameters
+    # Evolutionary hyper-parameters
     population_size:      int       = 20
     num_generations:      int       = 100
     mutation_sigma:       float     = 0.05
     mutation_rate:        float     = 0.3
     sigma_decay:          float     = 0.999
+    use_reward_map:       bool      = False
+    use_guided_crossover: bool      = False
+    crossover_front_decay: float    = 0.5   # P(fi_level=k) ∝ decay^k; 1.0=uniform, 0→only F1
+    fitness_ema_alpha:    float     = 0.5   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
+                                            # 1.0 = no smoothing (raw fitness used directly)
 
     gpu_id:               int       = -1
     save_directory:       str       = './models/nsgaii/'
@@ -215,6 +223,182 @@ def _nsga2_select(rewards: np.ndarray, pop_size: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
+# NSGA-III helpers
+# ---------------------------------------------------------------------------
+
+def _generate_reference_points(n_objectives: int, n_divisions: int) -> np.ndarray:
+    """Das-Dennis structured reference points on the unit hyperplane (sum=1, ≥0).
+
+    Returns array of shape (C(n_objectives+n_divisions-1, n_divisions), n_objectives).
+    Typical n_divisions: 12 for M=2 (13 pts), 12 for M=3 (91 pts), 7 for M=4 (120 pts).
+    """
+    def _gen(n_obj: int, n_div: int, cur: list, result: list) -> None:
+        if n_obj == 1:
+            result.append(cur + [n_div])
+        else:
+            for i in range(n_div + 1):
+                _gen(n_obj - 1, n_div - i, cur + [i], result)
+    pts: list = []
+    _gen(n_objectives, n_divisions, [], pts)
+    return np.array(pts, dtype=float) / n_divisions
+
+
+def _nsga3_select(rewards: np.ndarray, pop_size: int,
+                  reference_points: np.ndarray) -> List[int]:
+    """NSGA-III selection: non-dominated sorting + niche-preservation on the last front.
+
+    Core idea (Deb & Jain, 2014):
+      1. Fill selection with complete fronts until the last (critical) front.
+      2. Normalize the combined fitness onto a unit hyperplane using the ideal
+         point and per-objective intercepts.
+      3. Associate every individual to its nearest reference *line* (through the
+         origin) by minimum perpendicular distance.
+      4. Pick n_needed individuals from the last front by iteratively selecting
+         the reference point with the smallest niche count, then choosing the
+         individual closest to that line (first use) or randomly (subsequent uses).
+    """
+    fronts   = _non_dominated_sort(rewards)
+    selected: List[int] = []
+    last_front: List[int] = []
+
+    for front in fronts:
+        if len(selected) + len(front) <= pop_size:
+            selected.extend(front)
+        else:
+            last_front = list(front)
+            break
+
+    n_needed = pop_size - len(selected)
+    if n_needed == 0 or not last_front:
+        return selected[:pop_size]
+
+    # ── Normalize fitness onto unit hyperplane ────────────────────────────────
+    all_idx    = selected + last_front
+    fit_all    = rewards[all_idx]                          # (N_all, M)
+    ideal      = fit_all.min(axis=0)                       # (M,)
+    translated = fit_all - ideal
+
+    # Nadir: per-objective max among already-accepted (non-last-front) individuals;
+    # fall back to max of all if no individuals were accepted yet.
+    if selected:
+        nadir = (rewards[selected] - ideal).max(axis=0)
+    else:
+        nadir = translated.max(axis=0)
+    nadir      = np.where(nadir < 1e-10, 1.0, nadir)
+    normalized = translated / nadir                        # (N_all, M)
+
+    # ── Associate each individual to its nearest reference line ───────────────
+    # Perpendicular distance from point p to line through origin with direction r:
+    #   d_perp² = ||p||² - (p·r̂)²
+    # We compute this for all (individual, ref_point) pairs vectorised.
+    R       = reference_points                             # (R, M)
+    r_norms = np.linalg.norm(R, axis=1, keepdims=True)    # (R, 1)
+    r_norms = np.where(r_norms < 1e-10, 1.0, r_norms)
+    R_hat   = R / r_norms                                  # (R, M) unit reference directions
+
+    dot      = normalized @ R_hat.T                        # (N_all, R)  scalar projections
+    proj     = dot[:, :, None] * R_hat[None, :, :]        # (N_all, R, M) projected vectors
+    diff     = normalized[:, None, :] - proj               # (N_all, R, M) perpendicular components
+    perp_dist = np.sqrt(np.maximum((diff ** 2).sum(axis=2), 0.0))  # (N_all, R)
+
+    assoc_ref  = perp_dist.argmin(axis=1)                  # (N_all,) closest ref index
+    assoc_dist = perp_dist.min(axis=1)                     # (N_all,) perp distance
+
+    # ── Niche counts from already-accepted individuals (before last front) ─────
+    n_sel       = len(selected)
+    niche_count = np.zeros(len(R), dtype=int)
+    for j in range(n_sel):
+        niche_count[assoc_ref[j]] += 1
+
+    # Associations for individuals in last_front (offset n_sel in all_idx)
+    lf_assoc = assoc_ref[n_sel:]                           # (|last_front|,)
+    lf_dist  = assoc_dist[n_sel:]
+
+    # ── Niche-based selection from last_front ─────────────────────────────────
+    remaining        = list(range(len(last_front)))
+    chosen_from_last: List[int] = []
+
+    for _ in range(n_needed):
+        # Map each active reference point to candidate local indices
+        ref_to_cands: dict = {}
+        for loc in remaining:
+            ref_to_cands.setdefault(lf_assoc[loc], []).append(loc)
+
+        if not ref_to_cands:
+            break
+
+        # Reference point with minimum niche count (ties broken randomly)
+        min_nc    = min(niche_count[r] for r in ref_to_cands)
+        min_refs  = [r for r in ref_to_cands if niche_count[r] == min_nc]
+        chosen_r  = min_refs[np.random.randint(len(min_refs))]
+
+        cands = ref_to_cands[chosen_r]
+        if niche_count[chosen_r] == 0:
+            # First occupant of this niche: pick the closest individual to the line
+            loc = cands[int(np.argmin(lf_dist[cands]))]
+        else:
+            # Niche already occupied: pick randomly among candidates
+            loc = cands[np.random.randint(len(cands))]
+
+        chosen_from_last.append(last_front[loc])
+        niche_count[chosen_r] += 1
+        remaining.remove(loc)
+
+    return selected + chosen_from_last
+
+
+# ---------------------------------------------------------------------------
+# Reward map — per-chunk Pareto archive
+# ---------------------------------------------------------------------------
+
+class RewardMap:
+    """Per-chunk Pareto archive: maps chunk_idx → Pareto-optimal (params, fitness) pairs.
+
+    When the evolutionary loop revisits a chunk (every _num_chunks generations),
+    stored candidates are injected into the parent pool so that historical best
+    solutions can participate in crossover and NSGA selection — without re-evaluation,
+    because same chunk_idx means the same set of prompts.
+    """
+
+    def __init__(self) -> None:
+        self._chunks: dict = {}   # int → List[Tuple[np.ndarray, np.ndarray]]
+
+    def update(self, chunk_idx: int, params: np.ndarray, fitness: np.ndarray) -> bool:
+        """Add (params, fitness) to the Pareto front for chunk_idx.
+
+        Prunes dominated entries; returns True if the point was accepted.
+        """
+        front = self._chunks.get(chunk_idx, [])
+        for _, ef in front:
+            if _dominates(ef, fitness):
+                return False
+        front = [(p, f) for p, f in front if not _dominates(fitness, f)]
+        front.append((params.copy(), fitness.copy()))
+        self._chunks[chunk_idx] = front
+        return True
+
+    def get_candidates(self, chunk_idx: int,
+                       exclude: Optional[List[np.ndarray]] = None
+                       ) -> List[tuple]:
+        """Return stored (params, fitness) pairs for chunk_idx.
+
+        Entries whose params exactly match any array in `exclude` are filtered out,
+        preventing injection of individuals already present in the current population.
+        """
+        stored = self._chunks.get(chunk_idx, [])
+        if not stored or not exclude:
+            return list(stored)
+        return [(p, f) for p, f in stored
+                if not any(np.array_equal(p, ep) for ep in exclude)]
+
+    def chunk_size(self, chunk_idx: int) -> int:
+        return len(self._chunks.get(chunk_idx, []))
+
+    def __len__(self) -> int:
+        return sum(len(v) for v in self._chunks.values())
+
+
+# ---------------------------------------------------------------------------
 # NSGA-II
 # ---------------------------------------------------------------------------
 
@@ -248,8 +432,10 @@ class NSGAII:
             for _ in range(self.P)
         ]
 
-        # fitness[i]: M-dim reward vector from a single evaluation
-        self.fitness    = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        # fitness[i]:     raw reward vector from the latest evaluation
+        # ema_fitness[i]: EMA-smoothed fitness used for dominance / selection
+        self.fitness     = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        self.ema_fitness = [np.full(self.M, -np.inf) for _ in range(self.P)]
 
         self.z_star          = np.full(self.M, -np.inf, dtype=np.float64)
         self.fitness_history = []
@@ -314,11 +500,31 @@ class NSGAII:
         poll_interval:     float = 2.0,
         verbose:           bool  = False,
         seed:              int   = 42,
+        use_reward_map:    bool  = False,
+        use_guided_crossover: bool = True,
+        crossover_front_decay: float = 0.5,
+        fitness_ema_alpha:    float = 0.5,
+        algorithm:         str   = 'nsgaii',
+        n_reference_divisions: int = 12,
     ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
         rank    = torch.distributed.get_rank() if dist_on else 0
         is_main = rank == 0
+
+        reward_map = RewardMap()  # accumulates Pareto-optimal (params, fitness) across all gens
+
+        # ── Algorithm-specific setup ──────────────────────────────────────────
+        assert algorithm in ('nsgaii', 'nsgaiii'), \
+            f"algorithm must be 'nsgaii' or 'nsgaiii', got {algorithm!r}"
+        if algorithm == 'nsgaiii':
+            ref_pts = _generate_reference_points(self.M, n_reference_divisions)
+            _select = lambda fit, n: _nsga3_select(fit, n, ref_pts)
+            if is_main:
+                print(f'NSGA-III: {len(ref_pts)} reference points '
+                      f'(M={self.M}, divisions={n_reference_divisions})')
+        else:
+            _select = _nsga2_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -333,7 +539,8 @@ class NSGAII:
         def _task_path(g, i):   return os.path.join(_gen_dir(g), f'task_{i:03d}.json')
         def _claim_path(g, i):  return os.path.join(_gen_dir(g), f'claimed_{i:03d}')
         def _result_path(g, i): return os.path.join(_gen_dir(g), f'result_{i:03d}.json')
-        def _done_path(g):      return os.path.join(_gen_dir(g), 'done')
+        def _done_path(g):       return os.path.join(_gen_dir(g), 'done')
+        def _phaseA_done_path(g): return os.path.join(_gen_dir(g), 'phaseA_done')
 
         def _try_claim(g, i):
             try:
@@ -382,16 +589,16 @@ class NSGAII:
             return np.mean(reward_vecs, axis=0)
 
         # ── Worker loop ───────────────────────────────────────────────────────
-        def _worker_loop(gen, num_tasks):
+        def _worker_loop(gen, task_start, task_end, exit_signal):
             while True:
                 if is_main:
-                    if all(os.path.exists(_result_path(gen, i)) for i in range(num_tasks)):
+                    if all(os.path.exists(_result_path(gen, i)) for i in range(task_start, task_end)):
                         break
                 else:
-                    if os.path.exists(_done_path(gen)):
+                    if os.path.exists(exit_signal):
                         break
                 claimed = False
-                for i in range(num_tasks):
+                for i in range(task_start, task_end):
                     if not os.path.exists(_task_path(gen, i)): continue
                     if os.path.exists(_result_path(gen, i)):   continue
                     if not _try_claim(gen, i):                 continue
@@ -423,11 +630,16 @@ class NSGAII:
                                      'child_params': self.population[i].tolist()})
             log(f'gen 0 all {self.P} init tasks written (chunk 0)')
 
-        _worker_loop(gen, self.P)
+        _worker_loop(gen, 0, self.P, _done_path(gen))
 
         if is_main:
             for i in range(self.P):
-                self.fitness[i] = _collect_fitness(gen, i)
+                self.fitness[i]     = _collect_fitness(gen, i)
+                self.ema_fitness[i] = self.fitness[i].copy()   # gen-0: ema = raw
+            if use_reward_map:
+                for i in range(self.P):
+                    reward_map.update(0, self.population[i], self.fitness[i])
+                log(f'gen 0 reward_map[chunk=0]: {reward_map.chunk_size(0)} Pareto entries')
             open(_done_path(gen), 'w').close()
             log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
             print(f'Gen {gen:4d}/{num_generations}')
@@ -437,80 +649,201 @@ class NSGAII:
                 time.sleep(poll_interval)
 
         # ── Generational loop ─────────────────────────────────────────────────
-        # Task layout: P children (IDs 0..P-1) + P parent re-evals (IDs P..2P-1)
-        total_tasks = 2 * self.P
+        # use_guided_crossover=True  (two-phase):
+        #   phase A  task IDs  0 .. P-1   : parent re-evals
+        #   phase B  task IDs  P .. 2P-1  : children bred via stratified crossover
+        #                                   (p1∈F1, p2∈F1..Fk, alpha shifts with front level)
+        # use_guided_crossover=False (single-phase):
+        #   task IDs  0 .. P-1  : children bred from all parents using _crossover
+        #   parent fitness kept from previous generation (no re-eval)
 
         sigma = mutation_sigma
         for gen in range(1, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
 
+            if use_guided_crossover:
+                # ── Phase A: re-evaluate current parents ──────────────────────
+                if is_main:
+                    os.makedirs(_gen_dir(gen), exist_ok=True)
+                    chunk_idx = gen % _num_chunks
+                    diversity = np.std(np.array(self.population), axis=0).mean()
+
+                    for i in range(self.P):
+                        _write_task(gen, i, {'task_id': i,
+                                             'chunk_idx': chunk_idx,
+                                             'child_params': self.population[i].tolist()})
+                    log(f'gen {gen} phase-A: {self.P} parent re-eval tasks written (chunk={chunk_idx})')
+
+                _worker_loop(gen, 0, self.P, _phaseA_done_path(gen))
+
+                if is_main:
+                    # Collect refreshed parent fitness and update EMA
+                    for i in range(self.P):
+                        raw = _collect_fitness(gen, i)
+                        self.fitness[i] = raw
+                        if fitness_ema_alpha >= 1.0 or np.all(self.ema_fitness[i] == -np.inf):
+                            self.ema_fitness[i] = raw.copy()
+                        else:
+                            self.ema_fitness[i] = (fitness_ema_alpha * raw
+                                                   + (1.0 - fitness_ema_alpha) * self.ema_fitness[i])
+
+                    # Update reward_map with freshly evaluated parents
+                    if use_reward_map:
+                        for i in range(self.P):
+                            reward_map.update(chunk_idx, self.population[i], self.fitness[i])
+
+                    # Inject stored candidates from reward_map for this chunk.
+                    # They carry fitness from a previous visit to the same chunk_idx
+                    # (same prompts) so no re-evaluation is needed.
+                    stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
+                              if use_reward_map else [])
+                    if stored:
+                        log(f'gen {gen} injecting {len(stored)} stored candidates '
+                            f'(chunk={chunk_idx}, map total={len(reward_map)})')
+
+                    # Augmented parent pool = current parents + stored candidates
+                    aug_params  = list(self.population) + [p for p, _ in stored]
+                    aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
+
+                    # All Pareto fronts on augmented pool for stratified crossover
+                    fronts   = _non_dominated_sort(aug_fitness)
+                    front0   = fronts[0]
+                    n_fronts = len(fronts)
+
+                    # ── Phase B: probability-weighted crossover across all fronts ─
+                    # p1 always from F1 for quality pressure.
+                    # p2 sampled from front k with P ∝ decay^k, so F1 is most
+                    # likely, but deeper fronts still contribute at a decaying rate.
+                    # All crossovers use the same alpha [0.3, 0.7] — diversity is
+                    # controlled by selection probability, not by shrinking alpha.
+                    raw_w    = np.array([crossover_front_decay ** k for k in range(n_fronts)])
+                    front_w  = raw_w / raw_w.sum()
+
+                    child_params_list = []
+                    for i in range(self.P):
+                        pi1      = front0[np.random.randint(len(front0))]
+                        fi_level = int(np.random.choice(n_fronts, p=front_w))
+                        pi2      = fronts[fi_level][np.random.randint(len(fronts[fi_level]))]
+                        base_child = self._crossover(aug_params[pi1], aug_params[pi2])
+                        child = self._mutate(base_child, sigma, mutation_rate)
+                        child_params_list.append(child)
+                        _write_task(gen, self.P + i, {'task_id': self.P + i,
+                                                       'chunk_idx': chunk_idx,
+                                                       'child_params': child.tolist()})
+                    log(f'gen {gen} phase-B: {self.P} child tasks written '
+                        f'(aug={len(aug_params)}, fronts={n_fronts}, '
+                        f'front0={len(front0)}, chunk={chunk_idx})')
+
+                    # Signal non-main ranks: phase-A done, phase-B tasks are ready
+                    open(_phaseA_done_path(gen), 'w').close()
+                else:
+                    while not os.path.exists(_phaseA_done_path(gen)):
+                        time.sleep(poll_interval)
+
+                _worker_loop(gen, self.P, 2 * self.P, _done_path(gen))
+
+                if is_main:
+                    # Collect child fitness
+                    child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
+
+                    # Update reward_map with evaluated children
+                    if use_reward_map:
+                        for i in range(self.P):
+                            reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
+                        log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
+                            f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
+
+                    # Selection on full merged pool:
+                    #   aug_params (0..aug_size-1) = current parents + stored candidates
+                    #   child_params_list (aug_size..) = newly evaluated children
+                    merged_params  = aug_params + child_params_list
+                    merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
+
+                    # EMA fitness for selection:
+                    #   parents have accumulated EMA across previous gens (updated in Phase A)
+                    #   stored candidates: no EMA history → use their stored fitness directly
+                    #   children: first evaluation → ema = raw
+                    aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
+                    child_ema_list = [f.copy() for f in child_fitness]
+                    merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
+
+                    selected        = _select(merged_ema, self.P)
+                    n_parents_kept  = sum(1 for k in selected if k < len(aug_params))
+                    self.population  = [merged_params[k]  for k in selected]
+                    self.fitness     = [merged_fitness[k]  for k in selected]
+                    self.ema_fitness = [merged_ema[k]      for k in selected]
+
+            else:
+                # ── Single-phase: evaluate children only, all parents eligible ─
+                if is_main:
+                    os.makedirs(_gen_dir(gen), exist_ok=True)
+                    chunk_idx = gen % _num_chunks
+                    diversity = np.std(np.array(self.population), axis=0).mean()
+
+                    # Inject stored candidates from reward_map for this chunk
+                    stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
+                              if use_reward_map else [])
+                    if stored:
+                        log(f'gen {gen} injecting {len(stored)} stored candidates '
+                            f'(chunk={chunk_idx}, map total={len(reward_map)})')
+
+                    # Augmented parent pool = current parents + stored candidates
+                    aug_params  = list(self.population) + [p for p, _ in stored]
+                    aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
+                    aug_size    = len(aug_params)
+
+                    child_params_list = []
+                    for i in range(self.P):
+                        pi1 = np.random.randint(aug_size)
+                        pi2 = np.random.randint(aug_size)
+                        base_child = self._crossover(aug_params[pi1], aug_params[pi2])
+                        child = self._mutate(base_child, sigma, mutation_rate)
+                        child_params_list.append(child)
+                        _write_task(gen, i, {'task_id': i,
+                                             'chunk_idx': chunk_idx,
+                                             'child_params': child.tolist()})
+                    log(f'gen {gen} single-phase: {self.P} child tasks written '
+                        f'(aug={aug_size}, chunk={chunk_idx})')
+
+                _worker_loop(gen, 0, self.P, _done_path(gen))
+
+                if is_main:
+                    child_fitness = [_collect_fitness(gen, i) for i in range(self.P)]
+
+                    # Update reward_map with evaluated children
+                    if use_reward_map:
+                        for i in range(self.P):
+                            reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
+                        log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
+                            f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
+
+                    # Selection on full merged pool:
+                    #   aug_params (0..aug_size-1) = current parents + stored candidates
+                    #   child_params_list (aug_size..) = newly evaluated children
+                    merged_params  = aug_params + child_params_list
+                    merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
+
+                    # EMA fitness for selection:
+                    #   parents: ema from previous gen (no re-eval in single-phase)
+                    #   stored candidates: use stored fitness directly
+                    #   children: first evaluation → ema = raw
+                    aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
+                    child_ema_list = [f.copy() for f in child_fitness]
+                    merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
+
+                    selected         = _select(merged_ema, self.P)
+                    n_parents_kept   = sum(1 for k in selected if k < aug_size)
+                    self.population  = [merged_params[k]  for k in selected]
+                    self.fitness     = [merged_fitness[k]  for k in selected]
+                    self.ema_fitness = [merged_ema[k]      for k in selected]
+
+            # ── Shared post-selection bookkeeping ─────────────────────────────
             if is_main:
-                os.makedirs(_gen_dir(gen), exist_ok=True)
-                diversity = np.std(np.array(self.population), axis=0).mean()
-
-                # NSGA-II rank + crowding on current population
-                fit_arr   = np.array(self.fitness)
-                fronts    = _non_dominated_sort(fit_arr)
-                rank_arr  = np.zeros(self.P, dtype=int)
-                crowd_arr = np.zeros(self.P)
-                for fi, front in enumerate(fronts):
-                    for idx in front: rank_arr[idx] = fi
-                    cd = _crowding_distance(fit_arr, front)
-                    for k, idx in enumerate(front): crowd_arr[idx] = cd[k]
-
-                def _tournament():
-                    a, b = np.random.choice(self.P, size=2, replace=False)
-                    if rank_arr[a] != rank_arr[b]:
-                        return a if rank_arr[a] < rank_arr[b] else b
-                    return a if crowd_arr[a] >= crowd_arr[b] else b
-
-                # All individuals in this generation use the same chunk → fair comparison
-                chunk_idx = gen % _num_chunks
-
-                # Write P child tasks
-                child_params_list = []
-                for i in range(self.P):
-                    p1    = self.population[_tournament()]
-                    p2    = self.population[_tournament()]
-                    child = self._mutate(self._crossover(p1, p2), sigma, mutation_rate)
-                    child_params_list.append(child)
-                    _write_task(gen, i, {'task_id': i,
-                                         'chunk_idx': chunk_idx,
-                                         'child_params': child.tolist()})
-
-                # Write P parent re-eval tasks — same chunk as children
-                for i in range(self.P):
-                    _write_task(gen, self.P + i,
-                                {'task_id': self.P + i,
-                                 'chunk_idx': chunk_idx,
-                                 'child_params': self.population[i].tolist()})
-                log(f'gen {gen} all {total_tasks} tasks written '
-                    f'({self.P} children + {self.P} parent re-evals, chunk={chunk_idx})')
-
-            _worker_loop(gen, total_tasks)
-
-            if is_main:
-                # Refresh parent fitness
-                for i in range(self.P):
-                    self.fitness[i] = _collect_fitness(gen, self.P + i)
-
-                # Collect child fitness
-                child_fitness = [_collect_fitness(gen, i) for i in range(self.P)]
-
-                # NSGA-II selection on merged (2P) population
-                merged_params  = self.population + child_params_list
-                merged_fitness = np.array(list(self.fitness) + child_fitness)
-
-                selected        = _nsga2_select(merged_fitness, self.P)
-                n_parents_kept  = sum(1 for k in selected if k < self.P)
-                self.population = [merged_params[k]  for k in selected]
-                self.fitness    = [merged_fitness[k]  for k in selected]
-
                 sigma *= sigma_decay
 
-                # Logging
-                fit_arr  = np.array(self.fitness)
-                fronts   = _non_dominated_sort(fit_arr)
+                fit_arr  = np.array(self.fitness)      # raw (for z*, history)
+                ema_arr  = np.array(self.ema_fitness)  # smoothed (drives selection/display)
+                fronts   = _non_dominated_sort(ema_arr)
                 n_front0 = len(fronts[0]) if fronts else 0
                 self.fitness_history.append(fit_arr.tolist())
                 self.front_history.append(n_front0)
@@ -519,8 +852,8 @@ class NSGAII:
                     f'Gen {gen:4d}/{num_generations} | '
                     f'front0={n_front0}/{self.P} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
-                    f'mean_fit={np.round(fit_arr.mean(axis=0), 3)} | '
-                    f'best_fit={np.round(fit_arr.max(axis=0), 3)} | '
+                    f'mean_fit={np.round(ema_arr.mean(axis=0), 3)} | '
+                    f'best_fit={np.round(ema_arr.max(axis=0), 3)} | '
                     f'z*={np.round(self.z_star, 3)} | '
                     f'σ={sigma:.5f} | div={diversity:.5f}',
                     flush=True,
@@ -569,7 +902,7 @@ sft_tokenizer.padding_side = 'left'
 if script_args.exp_type == 'assistant':
     dataset = build_dataset_ppo(
         'Anthropic/hh-rlhf', sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train')
+        reward_models.rm_tokenizers[0], split='train[:512]')
     instructions = Instructions()
 else:
     dataset = build_dataset_summary_ppo(
@@ -640,6 +973,12 @@ final_population = nsgaii.run(
     sigma_decay=script_args.sigma_decay, num_continuations=script_args.num_continuations,
     save_every=script_args.save_every, output_dir=output_dir,
     verbose=script_args.verbose, seed=script_args.seed,
+    use_reward_map=script_args.use_reward_map,
+    use_guided_crossover=script_args.use_guided_crossover,
+    crossover_front_decay=script_args.crossover_front_decay,
+    fitness_ema_alpha=script_args.fitness_ema_alpha,
+    algorithm=script_args.algorithm,
+    n_reference_divisions=script_args.n_reference_divisions,
 )
 
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
