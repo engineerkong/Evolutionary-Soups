@@ -1,0 +1,31 @@
+# HoE (Hierarchy of Experts) configuration
+
+# ---- PPO training ----
+learning_rate: 5.0e-6
+mini_batch_size: 2
+batch_size: 64
+gradient_accumulation_steps: 8
+epochs: 1
+ppo_epochs: 3
+early_stopping: true
+target_kl: 9.0
+init_kl_coef: 0.2
+kl_penalty: abs           # kl | abs | mse | full
+max_grad_norm: 0.5
+
+# ---- Architecture ----
+# lora_target_modules is derived automatically from expert adapter_config.json
+router_version: v1        # v0=bias-only, v1=concat-pref (original default), v2=modulated, v3=dual-path
+router_hidden_dim: 32     # hidden dim for v3 dual-path router MLP
+
+# ---- Preference sampling (WeightSampler) ----
+# uniform_ratio controls how much of each batch uses uniform [0,1] preference
+# vs. bimodal peaks at 0 and 1; starts high for broad coverage.
+uniform_ratio: 1.0
+
+# ---- Reward blending ----
+# r_blend = preference_blend_ratio * r_pref + (1-preference_blend_ratio) * r_uniform
+preference_blend_ratio: 0.8
+
+# ---- Evaluation ----
+eval_simplex_steps: 5     # num_pref_samples passed to sample_preferences_uniform

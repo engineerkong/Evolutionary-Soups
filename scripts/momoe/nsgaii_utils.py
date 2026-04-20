@@ -8,7 +8,6 @@ from typing import List
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM
 
 from nsgaii_architecture import GatingNetwork
 

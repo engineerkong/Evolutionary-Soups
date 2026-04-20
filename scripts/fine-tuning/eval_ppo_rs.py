@@ -1,3 +1,4 @@
+import shutil
 import sys
 from pathlib import Path
 import os
@@ -6,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
 import torch
+from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
 from tqdm import tqdm
 from transformers import HfArgumentParser, AutoModelForCausalLM, DataCollatorWithPadding
 from trl import set_seed
@@ -17,24 +19,62 @@ script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, merge_weights_with_preference, sample_preferences_uniform, \
-                                Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo
+from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, sample_preferences_uniform, \
+    Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo, \
+    build_dataset_news_summary_ppo
 tqdm.pandas()
 
-# ========== define paths for two datasets ==========
-hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
-summary_dataset_path = 'openai/summarize_from_feedback'
+
+def _load_adapter_sd(adapter_dir: str) -> dict:
+    p = Path(adapter_dir)
+    st_path = p / 'adapter_model.safetensors'
+    bin_path = p / 'adapter_model.bin'
+    if st_path.exists():
+        from safetensors import safe_open
+        sd = {}
+        with safe_open(str(st_path), framework='pt', device='cpu') as f:
+            for k in f.keys():
+                sd[k] = f.get_tensor(k)
+        return sd
+    elif bin_path.exists():
+        return torch.load(str(bin_path), map_location='cpu')
+    raise FileNotFoundError(f'No adapter weights found in {adapter_dir}')
+
+
+def _merge_and_save_rewarded_soup(base_model_name, sft_model_name, ppo_model_list, preference, save_path):
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_name, torch_dtype=torch.float16, device_map='cpu')
+    base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
+
+    expert_sds  = [_load_adapter_sd(p) for p in ppo_model_list]
+    peft_config = LoraConfig.from_pretrained(ppo_model_list[0])
+    blended_sd  = {
+        k: sum(preference[i] * expert_sds[i][k].to(torch.float16) for i in range(len(preference)))
+        for k in expert_sds[0]
+    }
+    model = get_peft_model(base, peft_config)
+    set_peft_model_state_dict(model, blended_sd)
+    model = model.merge_and_unload()
+
+    if os.path.exists(save_path):
+        shutil.rmtree(save_path, ignore_errors=True)
+    model.save_pretrained(save_path)
+
+    del model, base, expert_sds, blended_sd
+    gc.collect()
+    torch.cuda.empty_cache()
 
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    sft_model_name: Optional[str] = field(default="./models/sft/model/", metadata={"help": "local path to the base model or the huggingface id"})
+    base_model_name: Optional[str] = field(default='meta-llama/Llama-2-7b-hf', metadata={"help": "base LLaMA model path or HF id"})
+    sft_model_name: Optional[str] = field(default="./models/sft/model/", metadata={"help": "SFT LoRA adapter path (tokenizer lives here)"})
     ppo_model_name1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
     ppo_model_name2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
     ppo_model_name3: Optional[str]=field(default='')
     num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input"})
-    reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "comma separated list of reward names"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
+    reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"})
+    dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     save_directory: Optional[str] = field(default='./results/ppo_rs/', metadata={"help": "directory to save results"})
     wandb_name: Optional[str] = field(default='assistant_ppo_rs_eval', metadata={"help": "name for this experiment"})
 
@@ -56,20 +96,20 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
 reward_path_tokenizer_dict = {
-    'harmless': ['Ray2333/gpt2-large-harmless-reward_model'],
-    'helpful': ['Ray2333/gpt2-large-helpful-reward_model'],
-    'deberta': ['OpenAssistant/reward-model-deberta-v3-large-v2'],
-    'summary': ['Tristan/gpt2_reward_summarization'],
-    'faithful':['CogComp/bart-faithful-summary-detector'],
-    'humor': ['mohameddhiab/humor-no-humor'],
+    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':  'Tristan/gpt2_reward_summarization',
+    'faithful': 'CogComp/bart-faithful-summary-detector',
+    'humor':    'mohameddhiab/humor-no-humor',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []
 for name in reward_names:
-    if name not in reward_path_tokenizer_dict.keys():
-        raise NotImplementedError
-    reward_model_path_list.append(reward_path_tokenizer_dict[name][0])
-    rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
+    if name not in reward_path_tokenizer_dict:
+        raise NotImplementedError(f'Unknown reward name: {name!r}')
+    reward_model_path_list.append(reward_path_tokenizer_dict[name])
+    rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name])
 
 save_info = {
     'tokenizer_name': script_args.sft_model_name,
@@ -86,12 +126,20 @@ reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu
 
 # ========== prepare evaluation dataset and dataloader ==========
 tokenizer = load_main_tokenizer(script_args.sft_model_name)
-if script_args.exp_type == 'assistant':
-    valid_dataset = build_dataset_eval_ppo(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test') 
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
+    valid_dataset = build_dataset_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
-else:
-    valid_dataset = build_dataset_summary_eval_ppo(summary_dataset_path, tokenizer, reward_models.rm_tokenizers, split='test')
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
+    valid_dataset = build_dataset_summary_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'argilla/news-summary':
+    valid_dataset = build_dataset_news_summary_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers[0], split='train')
+    instructions = Instructions_summary()
+else:
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 print(f"Size of the validation set: {len(valid_dataset)}")
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
@@ -101,12 +149,13 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
 # ========== evaluation function ==========
 def evaluate_model(temp_save_path, tokenizer, valid_dataset):
     mini_batch_size = 8
+    valid_dataset = valid_dataset.with_format("numpy")
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    valid_data_loader = DataLoader(valid_dataset, mini_batch_size, drop_last=True, collate_fn=data_collator)
+    valid_data_loader = DataLoader(valid_dataset, mini_batch_size, drop_last=False, collate_fn=data_collator)
     # load_merged_model
     model = AutoModelForCausalLM.from_pretrained(
         temp_save_path,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         device_map=gpu_id
         )
     model.resize_token_embeddings(len(tokenizer))
@@ -116,7 +165,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
 
     # define generation kwargs
     generation_kwargs = {
-        "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48, 
+        "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
         "min_length": -1,
         "do_sample": False,
     }
@@ -173,7 +222,9 @@ for k in range(0, len(sampled_preferences)):
             ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2, script_args.ppo_model_name3]
         else:
             ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2]
-        merge_weights_with_preference(ppo_model_list, preference, temp_save_path)
+        _merge_and_save_rewarded_soup(
+            script_args.base_model_name, script_args.sft_model_name,
+            ppo_model_list, preference, temp_save_path)
         print("merged model saved to {}".format(temp_save_path))
 
     accelerator.wait_for_everyone()

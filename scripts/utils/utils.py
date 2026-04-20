@@ -196,6 +196,46 @@ def build_dataset_summary_sft(path, tokenizer, split='train', size=None):
     return ds
 
 
+def build_dataset_news_summary_sft(path, tokenizer, split='train', size=None):
+    """SFT dataset builder for argilla/news-summary (full prompt+summary pairs)."""
+    ds = load_dataset(path, split=split)
+    ds = ds.filter(
+        lambda x: x['text'] is not None and 100 < len(x['text']) < 2000
+                  and x['prediction'] is not None and len(x['prediction']) > 0,
+        batched=False, num_proc=20)
+
+    if size is not None:
+        ds = ds.select(range(size))
+
+    def _extract_summary(pred_item: dict) -> str:
+        # argilla datasets use 'label' for text generation predictions;
+        # fall back to 'value' or 'text' for other possible schemas
+        for key in ('label', 'value', 'text'):
+            v = pred_item.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.replace('\n', ' ').strip()
+        return ''
+
+    def tokenize(sample):
+        article = sample['text'].replace('\n', ' ')
+        prompt_summary = Instructions_summary.prompt_input(article)
+        summary = _extract_summary(sample['prediction'][0])
+        sample['prompt'] = prompt_summary
+        sample['response'] = summary
+        sample['input_ids'] = tokenizer.encode(prompt_summary + summary) + [tokenizer.eos_token_id]
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: len(x['input_ids']) <= 512 and len(x['input_ids']) >= 8
+                             and len(x['response']) > 0)
+    keep = {'input_ids', 'query', 'prompt', 'response'}
+    remove = [c for c in ds.column_names if c not in keep]
+    ds = ds.remove_columns(remove)
+    ds.set_format(type='torch')
+    return ds
+
+
 def build_dataset_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
     ds = load_dataset(path, 'comparisons')
     ds = ds[split]
@@ -217,6 +257,32 @@ def build_dataset_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size
     remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
     ds = ds.remove_columns(remove_columns)
     ds.set_format(type="torch")
+    return ds
+
+
+def build_dataset_news_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
+    """Dataset builder for argilla/news-summary (PPO / NSGA-II prompt-only format)."""
+    ds = load_dataset(path, split=split)
+    ds = ds.filter(lambda x: x['text'] is not None and 100 < len(x['text']) < 2000,
+                   batched=False, num_proc=30)
+
+    if size is not None:
+        ds = ds.select(range(size))
+
+    def tokenize(sample):
+        article = sample['text'].replace('\n', ' ')
+        prompt_summary = Instructions_summary.prompt_input(article)
+        sample['prompt'] = prompt_summary
+        sample['input_ids'] = tokenizer.encode(prompt_summary)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: len(x['input_ids']) <= 512 and len(x['input_ids']) >= 8)
+    keep = {'input_ids', 'query', 'prompt'}
+    remove = [c for c in ds.column_names if c not in keep]
+    ds = ds.remove_columns(remove)
+    ds.set_format(type='torch')
     return ds
 
 
@@ -375,7 +441,9 @@ def load_reward_model(reward_peft_path, gpu_id):
 
 # Load main tokenizer without adding special tokens
 def load_main_tokenizer(tokenizer_name):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    # use_fast=False avoids tokenizers-version mismatch when tokenizer.json was
+    # saved with a newer tokenizers library than is installed (ModelWrapper parse error)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id

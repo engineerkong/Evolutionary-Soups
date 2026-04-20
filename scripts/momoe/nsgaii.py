@@ -30,6 +30,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 from accelerate import Accelerator
+from peft import PeftModel
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from trl import set_seed
@@ -42,7 +43,7 @@ sys.path.insert(0, str(script_dir))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_ppo, build_dataset_summary_ppo,
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
     get_clean_data, load_main_tokenizer,
 )
 from nsgaii_architecture import GatingNetwork, MoEForCausalLM
@@ -55,15 +56,16 @@ from nsgaii_utils import save_gating_network, get_simplex_samples, REWARD_PATHS
 
 @dataclass
 class ScriptArguments:
+    base_model_name:      str       = 'meta-llama/Llama-2-7b-hf'
     sft_model_name:       str       = './models/sft/model/'
     expert_model_paths:   List[str] = field(default_factory=list)
-    reward_names:         str       = 'harmless,helpful'
-    exp_type:             str       = 'assistant'
+    reward_names:         str       = 'harmless,helpful'          # auto-selected from dataset_name if empty
+    dataset_name:         str       = 'Anthropic/hh-rlhf'         # 'Anthropic/hh-rlhf' | 'openai/summarize_from_feedback' | 'argilla/news-summary'
     do_sample:            bool      = False
     num_continuations:    int       = 1
     eval_prompts:         int       = 8192
     eval_batch_size:      int       = 128
-    max_new_tokens:       int       = 128
+    max_new_tokens:       int       = -1   # -1 = auto-derive from dataset_name (128 hh-rlhf, 48 summary)
     normalize_rewards:    bool      = False
     warm_start_path:      str       = ''
     # Algorithm selection
@@ -77,16 +79,18 @@ class ScriptArguments:
     mutation_rate:        float     = 0.3
     sigma_decay:          float     = 0.999
     use_reward_map:       bool      = False
-    use_guided_crossover: bool      = False
-    crossover_front_decay: float    = 0.5   # P(fi_level=k) ∝ decay^k; 1.0=uniform, 0→only F1
-    fitness_ema_alpha:    float     = 0.5   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
-                                            # 1.0 = no smoothing (raw fitness used directly)
+    use_guided_crossover: bool      = False  # True → p1 from F1, p2 front-decay weighted
+                                             # False → both parents uniform-random (recommended)
+    crossover_front_decay: float    = 0.5   # only used when use_guided_crossover=True
+    fitness_ema_alpha:    float     = 1.0   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
+                                            # <1.0 triggers Phase A (parent re-eval every gen)
+                                            # 1.0 = no EMA, no Phase A (pure single-phase)
 
     gpu_id:               int       = -1
     save_directory:       str       = './models/nsgaii/'
     run_name:             str       = 'nsgaii_gating'
     save_every:           int       = 5
-    seed:                 int       = 42
+    seed:                 int       = 8888
     verbose:              bool      = False
 
 
@@ -501,9 +505,9 @@ class NSGAII:
         verbose:           bool  = False,
         seed:              int   = 42,
         use_reward_map:    bool  = False,
-        use_guided_crossover: bool = True,
+        use_guided_crossover: bool = False,
         crossover_front_decay: float = 0.5,
-        fitness_ema_alpha:    float = 0.5,
+        fitness_ema_alpha:    float = 1.0,
         algorithm:         str   = 'nsgaii',
         n_reference_divisions: int = 12,
     ) -> List[np.ndarray]:
@@ -649,35 +653,41 @@ class NSGAII:
                 time.sleep(poll_interval)
 
         # ── Generational loop ─────────────────────────────────────────────────
-        # use_guided_crossover=True  (two-phase):
-        #   phase A  task IDs  0 .. P-1   : parent re-evals
-        #   phase B  task IDs  P .. 2P-1  : children bred via stratified crossover
-        #                                   (p1∈F1, p2∈F1..Fk, alpha shifts with front level)
-        # use_guided_crossover=False (single-phase):
-        #   task IDs  0 .. P-1  : children bred from all parents using _crossover
-        #   parent fitness kept from previous generation (no re-eval)
+        # Phase A (parent re-eval) is triggered independently by two flags:
+        #   fitness_ema_alpha < 1.0  → re-eval to accumulate EMA across gens
+        #   use_guided_crossover     → re-eval to get fresh parent fitness for
+        #                              front-weighted crossover strategy
+        # Phase A task IDs: 0 .. P-1   (parent re-evals)
+        # Phase B task IDs: P .. 2P-1  (children)  — only when Phase A is active
+        # Single-phase task IDs: 0 .. P-1 (children) — when Phase A is skipped
+        #
+        # Crossover strategy (Phase B or single-phase):
+        #   use_guided_crossover=True  → p1 from F1, p2 weighted by front decay
+        #   use_guided_crossover=False → both parents uniform-random from aug pool
 
         sigma = mutation_sigma
         for gen in range(1, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
 
-            if use_guided_crossover:
+            do_phase_a = use_guided_crossover or (fitness_ema_alpha < 1.0)
+
+            if is_main:
+                os.makedirs(_gen_dir(gen), exist_ok=True)
+                chunk_idx = gen % _num_chunks
+                diversity = np.std(np.array(self.population), axis=0).mean()
+
+            if do_phase_a:
                 # ── Phase A: re-evaluate current parents ──────────────────────
                 if is_main:
-                    os.makedirs(_gen_dir(gen), exist_ok=True)
-                    chunk_idx = gen % _num_chunks
-                    diversity = np.std(np.array(self.population), axis=0).mean()
-
                     for i in range(self.P):
                         _write_task(gen, i, {'task_id': i,
                                              'chunk_idx': chunk_idx,
                                              'child_params': self.population[i].tolist()})
-                    log(f'gen {gen} phase-A: {self.P} parent re-eval tasks written (chunk={chunk_idx})')
+                    log(f'gen {gen} phase-A: {self.P} parent re-eval tasks (chunk={chunk_idx})')
 
                 _worker_loop(gen, 0, self.P, _phaseA_done_path(gen))
 
                 if is_main:
-                    # Collect refreshed parent fitness and update EMA
                     for i in range(self.P):
                         raw = _collect_fitness(gen, i)
                         self.fitness[i] = raw
@@ -687,155 +697,88 @@ class NSGAII:
                             self.ema_fitness[i] = (fitness_ema_alpha * raw
                                                    + (1.0 - fitness_ema_alpha) * self.ema_fitness[i])
 
-                    # Update reward_map with freshly evaluated parents
                     if use_reward_map:
                         for i in range(self.P):
                             reward_map.update(chunk_idx, self.population[i], self.fitness[i])
 
-                    # Inject stored candidates from reward_map for this chunk.
-                    # They carry fitness from a previous visit to the same chunk_idx
-                    # (same prompts) so no re-evaluation is needed.
-                    stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
-                              if use_reward_map else [])
-                    if stored:
-                        log(f'gen {gen} injecting {len(stored)} stored candidates '
-                            f'(chunk={chunk_idx}, map total={len(reward_map)})')
+            # ── Build augmented parent pool (shared by both crossover strategies) ─
+            if is_main:
+                stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
+                          if use_reward_map else [])
+                if stored:
+                    log(f'gen {gen} injecting {len(stored)} reward_map candidates '
+                        f'(chunk={chunk_idx}, total={len(reward_map)})')
 
-                    # Augmented parent pool = current parents + stored candidates
-                    aug_params  = list(self.population) + [p for p, _ in stored]
-                    aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
+                aug_params  = list(self.population) + [p for p, _ in stored]
+                aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
+                aug_size    = len(aug_params)
 
-                    # All Pareto fronts on augmented pool for stratified crossover
+                # ── Crossover ──────────────────────────────────────────────────
+                task_offset = self.P if do_phase_a else 0
+                child_params_list = []
+
+                if use_guided_crossover:
                     fronts   = _non_dominated_sort(aug_fitness)
                     front0   = fronts[0]
                     n_fronts = len(fronts)
-
-                    # ── Phase B: probability-weighted crossover across all fronts ─
-                    # p1 always from F1 for quality pressure.
-                    # p2 sampled from front k with P ∝ decay^k, so F1 is most
-                    # likely, but deeper fronts still contribute at a decaying rate.
-                    # All crossovers use the same alpha [0.3, 0.7] — diversity is
-                    # controlled by selection probability, not by shrinking alpha.
                     raw_w    = np.array([crossover_front_decay ** k for k in range(n_fronts)])
                     front_w  = raw_w / raw_w.sum()
-
-                    child_params_list = []
                     for i in range(self.P):
                         pi1      = front0[np.random.randint(len(front0))]
                         fi_level = int(np.random.choice(n_fronts, p=front_w))
                         pi2      = fronts[fi_level][np.random.randint(len(fronts[fi_level]))]
-                        base_child = self._crossover(aug_params[pi1], aug_params[pi2])
-                        child = self._mutate(base_child, sigma, mutation_rate)
+                        child = self._mutate(self._crossover(aug_params[pi1], aug_params[pi2]),
+                                             sigma, mutation_rate)
                         child_params_list.append(child)
-                        _write_task(gen, self.P + i, {'task_id': self.P + i,
-                                                       'chunk_idx': chunk_idx,
-                                                       'child_params': child.tolist()})
-                    log(f'gen {gen} phase-B: {self.P} child tasks written '
-                        f'(aug={len(aug_params)}, fronts={n_fronts}, '
-                        f'front0={len(front0)}, chunk={chunk_idx})')
-
-                    # Signal non-main ranks: phase-A done, phase-B tasks are ready
-                    open(_phaseA_done_path(gen), 'w').close()
+                        _write_task(gen, task_offset + i,
+                                    {'task_id': task_offset + i, 'chunk_idx': chunk_idx,
+                                     'child_params': child.tolist()})
+                    log(f'gen {gen} guided crossover: front0={len(front0)}, fronts={n_fronts}')
                 else:
-                    while not os.path.exists(_phaseA_done_path(gen)):
-                        time.sleep(poll_interval)
-
-                _worker_loop(gen, self.P, 2 * self.P, _done_path(gen))
-
-                if is_main:
-                    # Collect child fitness
-                    child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
-
-                    # Update reward_map with evaluated children
-                    if use_reward_map:
-                        for i in range(self.P):
-                            reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
-                        log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
-                            f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
-
-                    # Selection on full merged pool:
-                    #   aug_params (0..aug_size-1) = current parents + stored candidates
-                    #   child_params_list (aug_size..) = newly evaluated children
-                    merged_params  = aug_params + child_params_list
-                    merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
-
-                    # EMA fitness for selection:
-                    #   parents have accumulated EMA across previous gens (updated in Phase A)
-                    #   stored candidates: no EMA history → use their stored fitness directly
-                    #   children: first evaluation → ema = raw
-                    aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
-                    child_ema_list = [f.copy() for f in child_fitness]
-                    merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
-
-                    selected        = _select(merged_ema, self.P)
-                    n_parents_kept  = sum(1 for k in selected if k < len(aug_params))
-                    self.population  = [merged_params[k]  for k in selected]
-                    self.fitness     = [merged_fitness[k]  for k in selected]
-                    self.ema_fitness = [merged_ema[k]      for k in selected]
-
-            else:
-                # ── Single-phase: evaluate children only, all parents eligible ─
-                if is_main:
-                    os.makedirs(_gen_dir(gen), exist_ok=True)
-                    chunk_idx = gen % _num_chunks
-                    diversity = np.std(np.array(self.population), axis=0).mean()
-
-                    # Inject stored candidates from reward_map for this chunk
-                    stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
-                              if use_reward_map else [])
-                    if stored:
-                        log(f'gen {gen} injecting {len(stored)} stored candidates '
-                            f'(chunk={chunk_idx}, map total={len(reward_map)})')
-
-                    # Augmented parent pool = current parents + stored candidates
-                    aug_params  = list(self.population) + [p for p, _ in stored]
-                    aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
-                    aug_size    = len(aug_params)
-
-                    child_params_list = []
                     for i in range(self.P):
                         pi1 = np.random.randint(aug_size)
                         pi2 = np.random.randint(aug_size)
-                        base_child = self._crossover(aug_params[pi1], aug_params[pi2])
-                        child = self._mutate(base_child, sigma, mutation_rate)
+                        child = self._mutate(self._crossover(aug_params[pi1], aug_params[pi2]),
+                                             sigma, mutation_rate)
                         child_params_list.append(child)
-                        _write_task(gen, i, {'task_id': i,
-                                             'chunk_idx': chunk_idx,
-                                             'child_params': child.tolist()})
-                    log(f'gen {gen} single-phase: {self.P} child tasks written '
-                        f'(aug={aug_size}, chunk={chunk_idx})')
+                        _write_task(gen, task_offset + i,
+                                    {'task_id': task_offset + i, 'chunk_idx': chunk_idx,
+                                     'child_params': child.tolist()})
+                    log(f'gen {gen} uniform crossover: aug={aug_size}, chunk={chunk_idx}')
 
-                _worker_loop(gen, 0, self.P, _done_path(gen))
+                # Signal non-main ranks that child tasks are written
+                open(_phaseA_done_path(gen), 'w').close()
+            else:
+                while not os.path.exists(_phaseA_done_path(gen)):
+                    time.sleep(poll_interval)
 
-                if is_main:
-                    child_fitness = [_collect_fitness(gen, i) for i in range(self.P)]
+            # task_offset is known to all ranks from do_phase_a (no is_main guard needed)
+            task_offset = self.P if do_phase_a else 0
+            _worker_loop(gen, task_offset, task_offset + self.P, _done_path(gen))
 
-                    # Update reward_map with evaluated children
-                    if use_reward_map:
-                        for i in range(self.P):
-                            reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
-                        log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
-                            f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
+            if is_main:
+                child_fitness = [_collect_fitness(gen, task_offset + i) for i in range(self.P)]
 
-                    # Selection on full merged pool:
-                    #   aug_params (0..aug_size-1) = current parents + stored candidates
-                    #   child_params_list (aug_size..) = newly evaluated children
-                    merged_params  = aug_params + child_params_list
-                    merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
+                if use_reward_map:
+                    for i in range(self.P):
+                        reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
+                    log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
+                        f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
 
-                    # EMA fitness for selection:
-                    #   parents: ema from previous gen (no re-eval in single-phase)
-                    #   stored candidates: use stored fitness directly
-                    #   children: first evaluation → ema = raw
-                    aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
-                    child_ema_list = [f.copy() for f in child_fitness]
-                    merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
+                merged_params  = aug_params + child_params_list
+                merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
 
-                    selected         = _select(merged_ema, self.P)
-                    n_parents_kept   = sum(1 for k in selected if k < aug_size)
-                    self.population  = [merged_params[k]  for k in selected]
-                    self.fitness     = [merged_fitness[k]  for k in selected]
-                    self.ema_fitness = [merged_ema[k]      for k in selected]
+                # EMA for selection: parents accumulated via Phase A (if active),
+                # stored candidates use stored fitness, children start with raw.
+                aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
+                child_ema_list = [f.copy() for f in child_fitness]
+                merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
+
+                selected         = _select(merged_ema, self.P)
+                n_parents_kept   = sum(1 for k in selected if k < aug_size)
+                self.population  = [merged_params[k]  for k in selected]
+                self.fitness     = [merged_fitness[k]  for k in selected]
+                self.ema_fitness = [merged_ema[k]      for k in selected]
 
             # ── Shared post-selection bookkeeping ─────────────────────────────
             if is_main:
@@ -899,16 +842,26 @@ reward_models      = RewardModels(reward_model_paths, reward_model_paths, gpu_id
 sft_tokenizer              = load_main_tokenizer(script_args.sft_model_name)
 sft_tokenizer.padding_side = 'left'
 
-if script_args.exp_type == 'assistant':
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_ppo(
-        'Anthropic/hh-rlhf', sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train[:512]')
+        script_args.dataset_name, sft_tokenizer,
+        reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions()
-else:
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_ppo(
-        'openai/summarize_from_feedback', sft_tokenizer,
+        script_args.dataset_name, sft_tokenizer,
         reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'argilla/news-summary':
+    # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test
+    dataset = build_dataset_news_summary_ppo(
+        script_args.dataset_name, sft_tokenizer,
+        reward_models.rm_tokenizers[0], split='test')
+    instructions = Instructions_summary()
+else:
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
+                     f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, '
+                     f'argilla/news-summary')
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:     dataset     = dataset.remove_columns(key)
@@ -916,8 +869,10 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
 data_collator = DataCollatorWithPadding(tokenizer=sft_tokenizer)
 print(f'Dataset size: {len(dataset)} | eval_prompts per call: {script_args.eval_prompts}')
 
+_max_new_tokens = (script_args.max_new_tokens if script_args.max_new_tokens > 0
+                   else (128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48))
 generation_kwargs = {
-    'max_new_tokens': script_args.max_new_tokens, 'min_length': -1,
+    'max_new_tokens': _max_new_tokens, 'min_length': -1,
     'top_k': 0, 'top_p': 0.9, 'temperature': 0.7, 'do_sample': script_args.do_sample,
 }
 
@@ -925,8 +880,10 @@ print(f'Loading {len(script_args.expert_model_paths)} expert models …')
 expert_models = []
 for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
-    m = AutoModelForCausalLM.from_pretrained(
-        path, torch_dtype=torch.bfloat16, device_map=device, attn_implementation='sdpa')
+    base = AutoModelForCausalLM.from_pretrained(
+        script_args.base_model_name, torch_dtype=torch.float16, device_map=device)
+    base = PeftModel.from_pretrained(base, script_args.sft_model_name).merge_and_unload()
+    m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(sft_tokenizer))
     m.eval()
     for p in m.parameters(): p.requires_grad = False

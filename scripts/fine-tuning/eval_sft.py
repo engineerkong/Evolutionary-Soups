@@ -18,19 +18,18 @@ project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import load_main_tokenizer, check_lora_in_model_path, Instructions, Instructions_summary, \
-                    build_dataset_eval_sft, build_dataset_summary_eval_sft, get_clean_data
+                    build_dataset_eval_sft, build_dataset_summary_eval_sft, \
+                    build_dataset_news_summary_ppo, get_clean_data
 tqdm.pandas()
 
-# ========== define paths for two datasets ==========
-hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
-summary_dataset_path = 'openai/summarize_from_feedback'
+SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
 
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant' "})
-    reward_names:Optional[str] = field(default='harmless,helpful', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor'"}) 
+    dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
+    reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"}) 
     save_directory: Optional[str] = field(default='./results/sft/', metadata={"help": "directory to save the results"})
     wandb_name: Optional[str] = field(default='assistant_sft_eval', metadata={"help": "name for this experiment"})
 
@@ -48,23 +47,26 @@ gpu_id = process_id
 print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== load reward models ==========
+if not script_args.reward_names:
+    script_args.reward_names = ('summary,faithful' if script_args.dataset_name in SUMMARIZATION_DATASETS
+                                else 'harmless,helpful')
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
 reward_path_tokenizer_dict = {
-    'harmless': ['Ray2333/gpt2-large-harmless-reward_model'],
-    'helpful': ['Ray2333/gpt2-large-helpful-reward_model'],
-    'deberta': ['OpenAssistant/reward-model-deberta-v3-large-v2'],
-    'summary': ['Tristan/gpt2_reward_summarization'],
-    'faithful':['CogComp/bart-faithful-summary-detector'],
-    'humor': ['mohameddhiab/humor-no-humor'],
+    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':  'Tristan/gpt2_reward_summarization',
+    'faithful': 'CogComp/bart-faithful-summary-detector',
+    'humor':    'mohameddhiab/humor-no-humor',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []
 for name in reward_names:
-    if name not in reward_path_tokenizer_dict.keys():
-        raise NotImplementedError
-    reward_model_path_list.append(reward_path_tokenizer_dict[name][0])
-    rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name][0])
+    if name not in reward_path_tokenizer_dict:
+        raise NotImplementedError(f'Unknown reward name: {name!r}')
+    reward_model_path_list.append(reward_path_tokenizer_dict[name])
+    rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name])
 reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id)
 
 # ========== load sft model and tokenizer ==========
@@ -82,21 +84,32 @@ if hasattr(model, 'merge_and_unload'):
 
 # ========== define generation kwargs ==========
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48, 
+    "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
     "min_length": -1,
     "top_k": 0.0,
-    "top_p": 0.9, 
+    "top_p": 0.9,
     "do_sample": True,
 }
 tokenizer.padding_side = "left"
 
 # ========== prepare evaluation dataset and dataloader ==========
-if script_args.exp_type == 'assistant':
-    valid_dataset = build_dataset_eval_sft(hhrlhf_dataset_path, tokenizer, reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test') 
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
+    valid_dataset = build_dataset_eval_sft(
+        script_args.dataset_name, tokenizer,
+        reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test')
     instructions = Instructions()
-else:
-    valid_dataset = build_dataset_summary_eval_sft(summary_dataset_path, tokenizer, reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test') 
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
+    valid_dataset = build_dataset_summary_eval_sft(
+        script_args.dataset_name, tokenizer,
+        reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'argilla/news-summary':
+    valid_dataset = build_dataset_news_summary_ppo(
+        script_args.dataset_name, tokenizer,
+        reward_models.rm_tokenizers[0], split='train')
+    instructions = Instructions_summary()
+else:
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 print(f"Size of the validation set: {len(valid_dataset)}")
 
 valid_batch_size = 8

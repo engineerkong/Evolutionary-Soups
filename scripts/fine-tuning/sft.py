@@ -13,18 +13,17 @@ from peft import LoraConfig
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import load_config, Instructions, Instructions_summary, build_dataset_sft, build_dataset_summary_sft, load_main_tokenizer
+from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
+    build_dataset_sft, build_dataset_summary_sft, build_dataset_news_summary_sft, load_main_tokenizer
 tqdm.pandas()
 
-# ========== define paths for two datasets ==========
-hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
-summary_dataset_path = 'openai/summarize_from_feedback'
+SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
 
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type, 'summary' or 'assistant'"})
+    dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
     log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
     save_directory: Optional[str] = field(default='./models/sft/', metadata={"help": "directory to save the model"})
@@ -79,14 +78,22 @@ else:
 model.resize_token_embeddings(len(tokenizer))
 
 # ========== prepare dataset and data collator ==========
-if script_args.exp_type == 'assistant':
-    dataset = build_dataset_sft(hhrlhf_dataset_path, tokenizer, split='train') 
-    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]  
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
+    dataset = build_dataset_sft(script_args.dataset_name, tokenizer, split='train')
+    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
+    dataset = build_dataset_summary_sft(script_args.dataset_name, tokenizer, split='train')
+    response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+elif script_args.dataset_name == 'argilla/news-summary':
+    # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test for training
+    dataset = build_dataset_news_summary_sft(script_args.dataset_name, tokenizer, split='test')
+    response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 else:
-    dataset = build_dataset_summary_sft(summary_dataset_path, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]  
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
+                     f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary')
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}")
 

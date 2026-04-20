@@ -16,22 +16,27 @@ import matplotlib.pyplot as plt
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import load_config, Instructions, Instructions_summary, build_dataset_ppo, build_dataset_summary_ppo, load_main_tokenizer, print_trainable_parameters                
+from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo, \
+    load_main_tokenizer, print_trainable_parameters
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
 
-# ========== define paths for two datasets ==========
-hhrlhf_dataset_path = 'Anthropic/hh-rlhf'
-summary_dataset_path = 'openai/summarize_from_feedback'
+SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
+
+_PPO_CONFIG_KEY = {
+    'Anthropic/hh-rlhf':              'ppo_assistant',
+    'openai/summarize_from_feedback':  'ppo_summary',
+    'argilla/news-summary':            'ppo_news_summary',
+}
 
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
-    exp_type: Optional[str] = field(default='assistant', metadata={"help": "exp type: 'summary' or 'assistant'"}) 
+    dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     reward_name: Optional[str] = field(default='harmless', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor'"})
-    epochs: Optional[int] = field(default=1, metadata={'help': "Number of training epoches"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
     log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
     save_directory: Optional[str] = field(default='./models/ppo/', metadata={"help": "directory to save the model"})
@@ -39,7 +44,13 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
-cfg = load_config(script_dir / 'config.yaml')['ppo_{}'.format(script_args.exp_type)]
+cfg_key = _PPO_CONFIG_KEY.get(script_args.dataset_name)
+if cfg_key is None:
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
+                     f'Choose from: {list(_PPO_CONFIG_KEY.keys())}')
+cfg = load_config(script_dir / 'config.yaml')[cfg_key]
+# 'epochs' drives the outer training loop; not a valid PPOConfig kwarg in TRL 0.8+
+epochs = cfg.pop('epochs', 1)
 print(f"Script arguments: {script_args}")
 print(f"Training config: {cfg}")
 
@@ -127,25 +138,31 @@ print_trainable_parameters(model)
 model.pretrained_model.resize_token_embeddings(len(tokenizer))
 
 # ========== prepare dataset and dataloader ==========
-if script_args.exp_type == 'assistant':
-    dataset = build_dataset_ppo(hhrlhf_dataset_path, tokenizer, rm_tokenizer, split='train')
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
+    dataset = build_dataset_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions()
-else:
-    dataset = build_dataset_summary_ppo(summary_dataset_path, tokenizer, rm_tokenizer, split='train')
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
+    dataset = build_dataset_summary_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'argilla/news-summary':
+    # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test for training
+    dataset = build_dataset_news_summary_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='test')
+    instructions = Instructions_summary()
+else:
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 train_dataset = dataset.shuffle()
 print(f"Size of the train set: {len(train_dataset)}.")
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
 
 # ========== define ppo trainer and generation kwargs ==========
-optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config.learning_rate)
+optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=float(config.learning_rate))
 ppo_trainer = PPOTrainer(
     config, model, tokenizer=tokenizer, dataset=dataset, data_collator=collator, optimizer=optimizer
 )
 
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.exp_type == 'assistant' else 48,
+    "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
     'min_length': -1, 
     "top_k": 0.0,
     "top_p": 1.0, 
@@ -160,7 +177,6 @@ print("Training........")
 model.gradient_checkpointing_disable()
 model.pretrained_model.config.use_cache = True
 
-epochs = cfg['epochs']
 mean_scores = []
 std_scores = []
 save_data = {
@@ -255,10 +271,6 @@ for epoch in range(epochs):
         print(f"  Policy loss: {stats.get('ppo/loss/policy', 'N/A')}")
         print(f"  Value loss: {stats.get('ppo/loss/value', 'N/A')}")
         print(f"  Entropy: {stats.get('ppo/policy/entropy', 'N/A')}")
-
-        # warn if KL is too high
-        if stats['objective/kl'] > 1.0:
-            print("⚠️ WARNING: KL divergence is high!")
 
         # log stats
         ppo_trainer.log_stats(stats, batch, rewards)

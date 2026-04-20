@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii_test.py \
 """
 
 import datetime
+import gc
 import json
 import os
 import sys
@@ -32,6 +33,7 @@ from typing import List
 import numpy as np
 import torch
 from accelerate import Accelerator
+from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
 from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from torch.utils.data import DataLoader
 
@@ -43,7 +45,7 @@ sys.path.insert(0, str(script_dir))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_ppo, build_dataset_summary_ppo,
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
     build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
     get_clean_data, load_main_tokenizer,
 )
@@ -57,22 +59,22 @@ from nsgaii_utils import REWARD_PATHS, load_gating_network, get_simplex_samples
 
 @dataclass
 class Args:
+    base_model_name:    str       = 'meta-llama/Llama-2-7b-hf'
     sft_model_name:     str       = './models/sft/assistant_sft/model/'
     expert_model_paths: List[str] = field(default_factory=list)
     gating_paths:       List[str] = field(default_factory=list)
-    reward_names:       str       = 'harmless,helpful'
-    exp_type:           str       = 'assistant'
+    reward_names:       str       = ''          # auto-selected from dataset_name if empty
+    dataset_name:       str       = 'Anthropic/hh-rlhf'
     use_train_split:    bool      = False   # if True, use train split + build_dataset_ppo (matches training)
     eval_prompts:       int       = 0
     batch_size:         int       = 128
-    max_new_tokens:     int       = 128
     do_sample:          bool      = False
     num_continuations:  int       = 1
     pref_step:          float     = 0.1   # simplex step for λ-selection table
     gpu_id:             int       = -1
     save_directory:     str       = './results/nsgaii/'
     run_name:           str       = 'nsgaii_test'
-    seed:               int       = 42
+    seed:               int       = 8888
 
 
 # ---------------------------------------------------------------------------
@@ -136,11 +138,9 @@ def generate_and_score(model, input_ids, attention_mask, tokenizer,
                  for r in responses_clean]
         if hasattr(instructions, 'get_post'):
             scores = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post,
-                normalize_rewards=False, round_digits=None)
+                pairs, instructions.get_post)
         else:
-            scores = reward_models.get_reward_model_scores(
-                pairs, normalize_rewards=False, round_digits=None)
+            scores = reward_models.get_reward_model_scores(pairs)
 
         n_prompts, n_rewards = len(prompts_clean), len(scores)
         if accumulated is None:
@@ -240,35 +240,49 @@ reward_models = RewardModels(
     gpu_id,
 )
 
-generation_kwargs = dict(max_new_tokens=args.max_new_tokens, do_sample=args.do_sample)
+_max_new_tokens = 128 if args.dataset_name == 'Anthropic/hh-rlhf' else 48
+generation_kwargs = dict(max_new_tokens=_max_new_tokens, do_sample=args.do_sample)
 if args.do_sample:
     generation_kwargs.update(top_k=0, top_p=0.9, temperature=0.7)
 
 if args.use_train_split:
-    # Match nsgaii.py training exactly: same build_dataset_ppo, same filters (input_ids ≤ 256)
-    train_split = f'train[:{args.eval_prompts}]' if args.eval_prompts > 0 else 'train'
-    if args.exp_type == 'assistant':
+    if args.dataset_name == 'Anthropic/hh-rlhf':
         ds = build_dataset_ppo(
-            'Anthropic/hh-rlhf', tokenizer,
-            reward_models.rm_tokenizers[0], split=train_split)
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
-    else:
+    elif args.dataset_name == 'openai/summarize_from_feedback':
         ds = build_dataset_summary_ppo(
-            'openai/summarize_from_feedback', tokenizer,
-            reward_models.rm_tokenizers[0], split=train_split, size=128)
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
-else:
-    eval_split = f'test[:{args.eval_prompts}]' if args.eval_prompts > 0 else 'test'
-    if args.exp_type == 'assistant':
-        ds = build_dataset_eval_ppo(
-            'Anthropic/hh-rlhf', tokenizer,
-            reward_models.rm_tokenizers, split=eval_split)
-        instructions = Instructions()
+    elif args.dataset_name == 'argilla/news-summary':
+        # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — swap
+        ds = build_dataset_news_summary_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions_summary()
     else:
+        raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
+else:
+    if args.dataset_name == 'Anthropic/hh-rlhf':
+        ds = build_dataset_eval_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
+    elif args.dataset_name == 'openai/summarize_from_feedback':
         ds = build_dataset_summary_eval_ppo(
-            'openai/summarize_from_feedback', tokenizer,
-            reward_models.rm_tokenizers, split=eval_split)
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
+    elif args.dataset_name == 'argilla/news-summary':
+        # argilla/news-summary has no structured eval split — use test split via ppo builder
+        ds = build_dataset_news_summary_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions_summary()
+    else:
+        raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 
 for key in ['text', 'prompt', 'response', 'query']:
     if key in ds.column_names:
@@ -285,7 +299,10 @@ if is_main:
     print(f'\nLoading {len(args.expert_model_paths)} expert models ...', flush=True)
 experts = []
 for i, path in enumerate(args.expert_model_paths):
-    m = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.bfloat16, device_map=device)
+    base = AutoModelForCausalLM.from_pretrained(
+        args.base_model_name, torch_dtype=torch.float16, device_map=device)
+    base = PeftModel.from_pretrained(base, args.sft_model_name).merge_and_unload()
+    m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(tokenizer))
     m.eval()
     for p in m.parameters():
@@ -301,14 +318,10 @@ lm_hidden_size = experts[0].config.hidden_size
 # Build config list
 # ---------------------------------------------------------------------------
 
-# all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
-all_configs = []
+all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
+# all_configs = []
 
-# # 1. Fixed-coefficient baselines
-# simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
-# for coeffs in simplex:
-#     all_configs.append((f'MoE fixed {coeffs}',
-#                         MoEForCausalLM(experts, FixedGating(coeffs)).to(device)))
+# 1. Rewarded soups evaluated separately (see loop below) — too large to hold all in all_configs
 
 # 2. NSGA-II GatingNetwork checkpoints — each evaluated ONCE.
 #    At inference: select best individual via argmax dot(λ, reward_i).
@@ -391,3 +404,121 @@ if is_main:
             best_i = int(np.argmax(scores))
             print(f'{str(lam):<30}  {labels_arr[best_i]:<40}  ' +
                   '  '.join(f'{v:>10.4f}' for v in rewards_arr[best_i]))
+
+# ---------------------------------------------------------------------------
+# Rewarded soups evaluation (true weight blending of LoRA adapters)
+# ---------------------------------------------------------------------------
+
+def _load_adapter_sd(adapter_dir: str) -> dict:
+    p = Path(adapter_dir)
+    st_path = p / 'adapter_model.safetensors'
+    bin_path = p / 'adapter_model.bin'
+    if st_path.exists():
+        from safetensors import safe_open
+        sd = {}
+        with safe_open(str(st_path), framework='pt', device='cpu') as f:
+            for k in f.keys():
+                sd[k] = f.get_tensor(k)
+        return sd
+    elif bin_path.exists():
+        return torch.load(str(bin_path), map_location='cpu')
+    raise FileNotFoundError(f'No adapter weights found in {adapter_dir}')
+
+
+def _build_rewarded_soup(base_model_name, sft_model_name, expert_sds, peft_config, coeffs, device):
+    base = AutoModelForCausalLM.from_pretrained(
+        base_model_name, torch_dtype=torch.float16, device_map=device)
+    base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
+    blended_sd = {
+        k: sum(coeffs[i] * expert_sds[i][k].to(torch.float16) for i in range(len(coeffs)))
+        for k in expert_sds[0]
+    }
+    model = get_peft_model(base, peft_config)
+    set_peft_model_state_dict(model, blended_sd)
+    model = model.merge_and_unload()
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
+
+
+if args.expert_model_paths:
+    if is_main:
+        print('\n' + '=' * 80, flush=True)
+        print('Rewarded Soups evaluation', flush=True)
+        print('=' * 80, flush=True)
+
+    expert_sds   = [_load_adapter_sd(p) for p in args.expert_model_paths]
+    peft_cfg_rs  = LoraConfig.from_pretrained(args.expert_model_paths[0])
+    rs_simplex   = get_simplex_samples(len(reward_names), step=args.pref_step)
+    rs_partial   = os.path.join(output_dir, f'rs_rank{rank}.jsonl')
+
+    rs_done = {}
+    if os.path.exists(rs_partial):
+        with open(rs_partial) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    rs_done[rec['config_idx']] = rec['rewards']
+                except json.JSONDecodeError:
+                    pass
+        if rs_done:
+            print(f'  rs rank{rank}: resuming — {len(rs_done)} pref(s) already done', flush=True)
+
+    rs_results = []
+    with open(rs_partial, 'a') as rs_file:
+        for idx, coeffs in enumerate(rs_simplex):
+            if idx % world_size != rank:
+                continue
+            label = f'RewardedSoups {list(coeffs)}'
+            if idx in rs_done:
+                print(f'  rs rank{rank} skip (cached): {label}', flush=True)
+                rs_results.append((idx, label, rs_done[idx]))
+                continue
+
+            model = _build_rewarded_soup(
+                args.base_model_name, args.sft_model_name,
+                expert_sds, peft_cfg_rs, coeffs, device)
+            model.resize_token_embeddings(len(tokenizer))
+
+            batch_rewards = []
+            for batch in loader:
+                r = generate_and_score(
+                    model, batch['input_ids'], batch['attention_mask'],
+                    tokenizer, reward_models, instructions,
+                    generation_kwargs, gpu_id, args.num_continuations)
+                batch_rewards.append(r)
+            mean_r = np.mean(batch_rewards, axis=0).tolist()
+            rs_results.append((idx, label, mean_r))
+            print(f'  rs rank{rank}: {label}  {mean_r}', flush=True)
+
+            rs_file.write(json.dumps({'config_idx': idx, 'label': label, 'rewards': mean_r,
+                                      'reward_names': reward_names, 'rank': rank}) + '\n')
+            rs_file.flush()
+
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    if world_size > 1:
+        all_rs = [None] * world_size
+        torch.distributed.all_gather_object(all_rs, rs_results)
+    else:
+        all_rs = [rs_results]
+
+    if is_main:
+        flat_rs = sorted([item for sub in all_rs for item in sub], key=lambda x: x[0])
+        rs_path = os.path.join(output_dir, 'results_rs.json')
+        with open(rs_path, 'w') as f:
+            json.dump([{'config_idx': idx, 'label': label, 'rewards': mean_r,
+                        'reward_names': reward_names}
+                       for idx, label, mean_r in flat_rs], f, indent=2)
+        print(f'\nRewarded Soups results saved → {rs_path}', flush=True)
+        col = 52
+        print(f'\n{"Config":<{col}}  ' + '  '.join(f'{rn:>10}' for rn in reward_names))
+        print('-' * (col + 14 * len(reward_names)))
+        for _, label, mean_r in flat_rs:
+            print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))
