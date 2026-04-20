@@ -866,6 +866,7 @@ else:
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:     dataset     = dataset.remove_columns(key)
 
+dataset = dataset.with_format("numpy")
 data_collator = DataCollatorWithPadding(tokenizer=sft_tokenizer)
 print(f'Dataset size: {len(dataset)} | eval_prompts per call: {script_args.eval_prompts}')
 
@@ -881,7 +882,7 @@ expert_models = []
 for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
     base = AutoModelForCausalLM.from_pretrained(
-        script_args.base_model_name, torch_dtype=torch.float16, device_map=device)
+        script_args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
     base = PeftModel.from_pretrained(base, script_args.sft_model_name).merge_and_unload()
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(sft_tokenizer))

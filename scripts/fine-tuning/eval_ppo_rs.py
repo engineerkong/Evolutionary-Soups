@@ -43,13 +43,13 @@ def _load_adapter_sd(adapter_dir: str) -> dict:
 
 def _merge_and_save_rewarded_soup(base_model_name, sft_model_name, ppo_model_list, preference, save_path):
     base = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=torch.float16, device_map='cpu')
+        base_model_name, torch_dtype=torch.bfloat16, device_map='cpu')
     base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
 
     expert_sds  = [_load_adapter_sd(p) for p in ppo_model_list]
     peft_config = LoraConfig.from_pretrained(ppo_model_list[0])
     blended_sd  = {
-        k: sum(preference[i] * expert_sds[i][k].to(torch.float16) for i in range(len(preference)))
+        k: sum(preference[i] * expert_sds[i][k].to(torch.bfloat16) for i in range(len(preference)))
         for k in expert_sds[0]
     }
     model = get_peft_model(base, peft_config)
@@ -155,7 +155,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
     # load_merged_model
     model = AutoModelForCausalLM.from_pretrained(
         temp_save_path,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map=gpu_id
         )
     model.resize_token_embeddings(len(tokenizer))

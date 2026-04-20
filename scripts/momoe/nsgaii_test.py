@@ -284,9 +284,11 @@ else:
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 
-for key in ['text', 'prompt', 'response', 'query']:
+for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in ds.column_names:
         ds = ds.remove_columns(key)
+
+ds = ds.with_format("numpy")
 
 if is_main:
     print(f'  {len(ds)} prompts after filtering', flush=True)
@@ -300,7 +302,7 @@ if is_main:
 experts = []
 for i, path in enumerate(args.expert_model_paths):
     base = AutoModelForCausalLM.from_pretrained(
-        args.base_model_name, torch_dtype=torch.float16, device_map=device)
+        args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
     base = PeftModel.from_pretrained(base, args.sft_model_name).merge_and_unload()
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(tokenizer))
@@ -427,10 +429,10 @@ def _load_adapter_sd(adapter_dir: str) -> dict:
 
 def _build_rewarded_soup(base_model_name, sft_model_name, expert_sds, peft_config, coeffs, device):
     base = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=torch.float16, device_map=device)
+        base_model_name, torch_dtype=torch.bfloat16, device_map=device)
     base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
     blended_sd = {
-        k: sum(coeffs[i] * expert_sds[i][k].to(torch.float16) for i in range(len(coeffs)))
+        k: sum(coeffs[i] * expert_sds[i][k].to(torch.bfloat16) for i in range(len(coeffs)))
         for k in expert_sds[0]
     }
     model = get_peft_model(base, peft_config)

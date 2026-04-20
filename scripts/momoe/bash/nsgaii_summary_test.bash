@@ -10,7 +10,8 @@ expert_model_paths='./models/ppo/summary_ppo_summary_0302/batch_307/ ./models/pp
 gating_paths='./models/nsgaii/nsgaii_summary_1704/gen_0040/'
 reward_names='summary,faithful'
 dataset_name='openai/summarize_from_feedback'
-run_name='nsgaii_test'
+pref_step=0.2
+run_name='nsgaii_summary_test_2004'
 
 mkdir -p ./logs
 
@@ -23,4 +24,5 @@ CUDA_VISIBLE_DEVICES=4,5 accelerate launch \
     --reward_names "${reward_names}" \
     --dataset_name "${dataset_name}" \
     --run_name "${run_name}" \
+    --pref_step "${pref_step}" \
     2>&1 | tee ./logs/${run_name}.log

@@ -75,7 +75,7 @@ reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu
 tokenizer = load_main_tokenizer(script_args.ppo_model_name)
 model = AutoModelForCausalLM.from_pretrained(
     script_args.base_model_name,
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     device_map=gpu_id,
 )
 model = PeftModel.from_pretrained(model, script_args.sft_model_name).merge_and_unload()
@@ -114,6 +114,7 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)
 
+valid_dataset = valid_dataset.with_format("numpy")
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 valid_data_loader = DataLoader(valid_dataset, batch_size=mini_batch_size, drop_last=False, collate_fn=data_collator)
 accelerator = Accelerator()
