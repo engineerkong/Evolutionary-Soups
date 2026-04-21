@@ -19,27 +19,13 @@ sft:
   gradient_checkpointing: false
   ddp_find_unused_parameters: false
 
-ppo_summary:
-  epochs: 3
-  learning_rate: 5e-6
-  mini_batch_size: 8
-  batch_size: 64
-  gradient_accumulation_steps: 8
-  early_stopping: false
-  target: 6
-  max_grad_norm: 0.5
-  optimize_cuda_cache: true
-  init_kl_coef: 0.05
-  adap_kl_ctrl: true
-  tracker_project_name: "ppo-summary"
-
 ppo_assistant:
   epochs: 1
   learning_rate: 1e-5
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 8
-  early_stopping: false
+  early_stopping: true
   target: 3
   max_grad_norm: 0.5
   optimize_cuda_cache: true
@@ -47,27 +33,27 @@ ppo_assistant:
   adap_kl_ctrl: true
   tracker_project_name: "ppo-assistant"
 
-ppo_news_summary:
-  epochs: 5
-  learning_rate: 1e-6
+ppo_summary:
+  epochs: 3
+  learning_rate: 5e-6
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 8
-  early_stopping: false
-  target: 2
-  max_grad_norm: 0.1
+  early_stopping: true
+  target: 6
+  max_grad_norm: 0.5
   optimize_cuda_cache: true
-  init_kl_coef: 0.2
+  init_kl_coef: 0.05
   adap_kl_ctrl: true
-  tracker_project_name: "ppo-news-summary"
-
+  tracker_project_name: "ppo-summary"
+  
 ppo_beaver:
   epochs: 1
   learning_rate: 1e-5
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 8
-  early_stopping: false
+  early_stopping: true
   target: 3
   max_grad_norm: 0.5
   optimize_cuda_cache: true
@@ -81,10 +67,25 @@ ppo_steer:
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 8
-  early_stopping: false
+  early_stopping: true
   target: 3
   max_grad_norm: 0.5
   optimize_cuda_cache: true
   init_kl_coef: 0.05
   adap_kl_ctrl: true
   tracker_project_name: "ppo-steer"
+
+# unused configs
+ppo_news_summary:
+  epochs: 5
+  learning_rate: 1e-6
+  mini_batch_size: 8
+  batch_size: 64
+  gradient_accumulation_steps: 8
+  early_stopping: true
+  target: 3
+  max_grad_norm: 0.1
+  optimize_cuda_cache: true
+  init_kl_coef: 0.2
+  adap_kl_ctrl: true
+  tracker_project_name: "ppo-news-summary"

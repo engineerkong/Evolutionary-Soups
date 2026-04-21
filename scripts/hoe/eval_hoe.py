@@ -49,6 +49,9 @@ from scripts.utils.utils import (
     Instructions_summary,
     build_dataset_eval_ppo,
     build_dataset_summary_eval_ppo,
+    build_dataset_news_summary_ppo,
+    build_dataset_beaver_eval_ppo,
+    build_dataset_steer_eval_ppo,
     get_clean_data,
     load_config,
     load_main_tokenizer,
@@ -57,13 +60,30 @@ from scripts.utils.utils import (
 
 os.environ['WANDB_DISABLED'] = 'true'
 
+_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
 REWARD_PATHS = {
-    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':  'Tristan/gpt2_reward_summarization',
-    'faithful': 'CogComp/bart-faithful-summary-detector',
-    'humor':    'mohameddhiab/humor-no-humor',
+    'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':           'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':           'Tristan/gpt2_reward_summarization',
+    'faithful':          'CogComp/bart-faithful-summary-detector',
+    'humor':             'mohameddhiab/humor-no-humor',
+    'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness': f'{_ARMORM}#0',
+    'steer_correctness': f'{_ARMORM}#1',
+    'steer_coherence':   f'{_ARMORM}#2',
+    'steer_complexity':  f'{_ARMORM}#3',
+    'steer_verbosity':   f'{_ARMORM}#4',
+}
+
+_DEFAULT_REWARD_NAMES = {
+    'Anthropic/hh-rlhf':                    'harmless,helpful',
+    'openai/summarize_from_feedback':        'summary,faithful',
+    'argilla/news-summary':                  'summary,faithful',
+    'PKU-Alignment/PKU-SafeRLHF-10K':        'beaver_reward,beaver_cost',
+    'nvidia/HelpSteer':                      'steer_helpfulness,steer_correctness',
+    'nvidia/HelpSteer2':                     'steer_helpfulness,steer_correctness',
 }
 
 
@@ -73,8 +93,8 @@ class ScriptArguments:
     sft_model_name: str = field(default='', metadata={'help': 'Path to the SFT LoRA adapter (tokenizer lives here too)'})
     expert_model_paths: str = field(default='', metadata={'help': 'Comma-separated paths to per-objective PPO LoRA adapters, one per reward (order must match reward_names)'})
     checkpoint_path: str = field(default='', metadata={'help': 'Path to trained HoE router checkpoint directory'})
-    reward_names: str = field(default='harmless,helpful', metadata={'help': 'Comma-separated reward names'})
-    exp_type: str = field(default='assistant', metadata={'help': "'assistant' or 'summary'"})
+    dataset_name: str = field(default='Anthropic/hh-rlhf', metadata={'help': 'Dataset: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, nvidia/HelpSteer, nvidia/HelpSteer2'})
+    reward_names: str = field(default='', metadata={'help': 'Comma-separated reward names; auto-selected from dataset_name if empty'})
     num_pref_samples: int = field(default=11, metadata={'help': 'Number of preference points to evaluate'})
     num_eval_samples: int = field(default=0, metadata={'help': 'Limit eval dataset size (0 = all)'})
     save_directory: str = field(default='./results/hoe/', metadata={'help': 'Output directory'})
@@ -98,8 +118,11 @@ gpu_id = process_id
 print(f'Process {process_id} | GPU {gpu_id}')
 
 # ========== reward models ==========
-reward_names = [x.strip() for x in script_args.reward_names.split(',')]
+_rn_str = script_args.reward_names.strip() or _DEFAULT_REWARD_NAMES.get(script_args.dataset_name, 'harmless,helpful')
+reward_names = [x.strip() for x in _rn_str.split(',')]
 num_rewards = len(reward_names)
+if any(n not in REWARD_PATHS for n in reward_names):
+    raise ValueError(f'Unknown reward name(s): {[n for n in reward_names if n not in REWARD_PATHS]}')
 reward_model_paths = [REWARD_PATHS[n] for n in reward_names]
 reward_models = RewardModels(reward_model_paths, reward_model_paths, gpu_id)
 
@@ -131,14 +154,28 @@ model.eval()
 tokenizer = load_main_tokenizer(script_args.sft_model_name)
 tokenizer.padding_side = 'left'
 
-if script_args.exp_type == 'assistant':
+if script_args.dataset_name == 'Anthropic/hh-rlhf':
     valid_dataset = build_dataset_eval_ppo(
-        'Anthropic/hh-rlhf', tokenizer, reward_models.rm_tokenizers, split='test')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
+elif script_args.dataset_name == 'openai/summarize_from_feedback':
+    valid_dataset = build_dataset_summary_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions_summary()
+elif script_args.dataset_name == 'argilla/news-summary':
+    valid_dataset = build_dataset_news_summary_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers[0], split='train')
+    instructions = Instructions_summary()
+elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+    valid_dataset = build_dataset_beaver_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
+elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+    valid_dataset = build_dataset_steer_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 else:
-    valid_dataset = build_dataset_summary_eval_ppo(
-        'openai/summarize_from_feedback', tokenizer, reward_models.rm_tokenizers, split='test')
-    instructions = Instructions_summary()
+    raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 
 if script_args.num_eval_samples > 0:
     valid_dataset = valid_dataset.select(
@@ -167,8 +204,9 @@ for p in preferences:
     pref_str = ', '.join(f'{reward_names[k]}={p[k]:.2f}' for k in range(num_rewards))
     print(f'  [{pref_str}]')
 
+_long_response_datasets = {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'}
 generation_kwargs = {
-    'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48, # , 'nvidia/HelpSteer', 'nvidia/HelpSteer2'
+    'max_new_tokens': 128 if script_args.dataset_name in _long_response_datasets else 48,
     'min_length': -1,
     'do_sample': False,
 }

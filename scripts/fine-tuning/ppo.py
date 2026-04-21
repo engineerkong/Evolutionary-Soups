@@ -89,7 +89,6 @@ _REWARD_PATH_MAP = {
 if reward_name not in _REWARD_PATH_MAP:
     raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
 reward_peft_path = _REWARD_PATH_MAP[reward_name]
-print(f"Using reward model: {reward_name} at {reward_peft_path}")
 rm_tokenizer_path = reward_peft_path
 reward_model = RewardModels([reward_peft_path], [rm_tokenizer_path], gpu_id)
 rm_tokenizer = reward_model.rm_tokenizers[0] 
