@@ -1,8 +1,0 @@
-# config.yaml
-
-epochs: 1000
-batch_size: 64
-num_pref_bins: 11
-num_action_bins: 11
-alpha: 0.1
-epsilon: 0.8

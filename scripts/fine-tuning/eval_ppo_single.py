@@ -18,12 +18,10 @@ sys.path.insert(0, str(project_root))
 from peft import PeftModel
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import load_main_tokenizer, merge_lora_weight, \
-    build_dataset_eval_ppo, build_dataset_summary_eval_ppo, build_dataset_news_summary_ppo, \
-    build_dataset_beaver_eval_ppo, build_dataset_steer_eval_ppo, \
+    build_dataset_eval, build_dataset_summary_eval, build_dataset_news_summary_ppo, \
+    build_dataset_beaver_eval, build_dataset_steer_eval, \
     get_clean_data, Instructions, Instructions_summary
 tqdm.pandas()
-
-SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
 
 # ========== define script arguments ==========
 @dataclass
@@ -109,11 +107,11 @@ tokenizer.padding_side = "left"
 
 # ========== prepare evaluation dataset and dataloader ==========
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
-    valid_dataset = build_dataset_eval_ppo(
+    valid_dataset = build_dataset_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
-    valid_dataset = build_dataset_summary_eval_ppo(
+    valid_dataset = build_dataset_summary_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'argilla/news-summary':
@@ -121,11 +119,11 @@ elif script_args.dataset_name == 'argilla/news-summary':
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
-    valid_dataset = build_dataset_beaver_eval_ppo(
+    valid_dataset = build_dataset_beaver_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-    valid_dataset = build_dataset_steer_eval_ppo(
+    valid_dataset = build_dataset_steer_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 else:

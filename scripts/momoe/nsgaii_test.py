@@ -47,8 +47,8 @@ from scripts.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
     build_dataset_beaver_ppo, build_dataset_steer_ppo,
-    build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
-    build_dataset_beaver_eval_ppo, build_dataset_steer_eval_ppo,
+    build_dataset_eval, build_dataset_summary_eval,
+    build_dataset_beaver_eval, build_dataset_steer_eval,
     get_clean_data, load_main_tokenizer,
 )
 from nsgaii_architecture import GatingNetwork, MoEForCausalLM
@@ -275,12 +275,12 @@ if args.use_train_split:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 else:
     if args.dataset_name == 'Anthropic/hh-rlhf':
-        ds = build_dataset_eval_ppo(
+        ds = build_dataset_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
     elif args.dataset_name == 'openai/summarize_from_feedback':
-        ds = build_dataset_summary_eval_ppo(
+        ds = build_dataset_summary_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
@@ -291,12 +291,12 @@ else:
             reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
     elif args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
-        ds = build_dataset_beaver_eval_ppo(
+        ds = build_dataset_beaver_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
     elif args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-        ds = build_dataset_steer_eval_ppo(
+        ds = build_dataset_steer_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()

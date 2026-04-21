@@ -17,10 +17,10 @@ script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import load_main_tokenizer, check_lora_in_model_path, Instructions, Instructions_summary, \
-                    build_dataset_eval_sft, build_dataset_summary_eval_sft, \
-                    build_dataset_news_summary_ppo, build_dataset_beaver_eval_ppo, \
-                    build_dataset_steer_eval_ppo, get_clean_data
+from scripts.utils.utils import load_main_tokenizer, Instructions, Instructions_summary, \
+                    build_dataset_eval, build_dataset_summary_eval, \
+                    build_dataset_news_summary_ppo, build_dataset_beaver_eval, \
+                    build_dataset_steer_eval, get_clean_data
 tqdm.pandas()
 
 SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
@@ -28,7 +28,8 @@ SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summar
 # ========== define script arguments ==========
 @dataclass
 class ScriptArguments:
-    sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
+    base_model_name: Optional[str] = field(default='meta-llama/Llama-2-7b-hf', metadata={'help': 'local path or HF id of the base model'})
+    sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help': 'path to the SFT LoRA adapter (tokenizer lives here too)'})
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"})
     save_directory: Optional[str] = field(default='./results/sft/', metadata={"help": "directory to save the results"})
@@ -87,15 +88,13 @@ reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu
 # ========== load sft model and tokenizer ==========
 tokenizer = load_main_tokenizer(script_args.sft_model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    script_args.sft_model_name, 
+    script_args.base_model_name,
     torch_dtype=torch.bfloat16,
-    device_map=gpu_id, 
+    device_map=gpu_id,
 )
+model = PeftModel.from_pretrained(model, script_args.sft_model_name)
+model = model.merge_and_unload()
 model.resize_token_embeddings(len(tokenizer))
-if check_lora_in_model_path(model, script_args.sft_model_name):
-    model = PeftModel.from_pretrained(model, script_args.sft_model_name)
-if hasattr(model, 'merge_and_unload'):
-    model = model.merge_and_unload()
 
 # ========== define generation kwargs ==========
 generation_kwargs = {
@@ -109,33 +108,30 @@ tokenizer.padding_side = "left"
 
 # ========== prepare evaluation dataset and dataloader ==========
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
-    valid_dataset = build_dataset_eval_sft(
-        script_args.dataset_name, tokenizer,
-        reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test')
+    valid_dataset = build_dataset_eval(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
-    valid_dataset = build_dataset_summary_eval_sft(
-        script_args.dataset_name, tokenizer,
-        reward_models.rm_tokenizers[0], reward_models.rm_tokenizers[1], split='test')
+    valid_dataset = build_dataset_summary_eval(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'argilla/news-summary':
     valid_dataset = build_dataset_news_summary_ppo(
-        script_args.dataset_name, tokenizer,
-        reward_models.rm_tokenizers[0], split='train')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
-    valid_dataset = build_dataset_beaver_eval_ppo(
+    valid_dataset = build_dataset_beaver_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-    valid_dataset = build_dataset_steer_eval_ppo(
+    valid_dataset = build_dataset_steer_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
     instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 print(f"Size of the validation set: {len(valid_dataset)}")
 
-valid_batch_size = 8
+valid_batch_size = 32
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)

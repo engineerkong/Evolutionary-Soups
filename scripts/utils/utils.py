@@ -286,35 +286,7 @@ def build_dataset_news_summary_ppo(path, tokenizer, rm_tokenizer, split='train',
     return ds
 
 
-def build_dataset_eval_sft(path, tokenizer, rm_tokenizer1, rm_tokenizer2, split='test', size=None):
-    ds = load_dataset(path, split=split)
-    if size is not None:
-        ds = ds.select(range(size))
-    ds = ds.select(range(0, len(ds), 4))
-
-    def tokenize(sample):
-        sample['text'] = sample['chosen'] 
-        split_text = sample['text'].split('\n\nAssistant:')
-        sample['prompt'] = '\n\nAssistant:'.join(split_text[:-1]) + ' ' + '\n\nAssistant:'
-        sample['response'] = split_text[-1].strip()
-        sample["input_ids"] = tokenizer.encode(sample["prompt"])  # only prompt, no eos
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        sample["input_ids_rm1"] = rm_tokenizer1.encode(sample["prompt"]) 
-        sample["input_ids_rm2"] = rm_tokenizer2.encode(sample["prompt"]) 
-        return sample
-
-    ds_chosen = ds.map(tokenize, batched=False, num_proc=20)
-    ds_concat = ds_chosen
-    ds_concat = ds_concat.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8 \
-                                 and len(x["input_ids_rm1"]) <= 512 and len(x["input_ids_rm1"]) >= 8
-                                 and len(x["input_ids_rm2"]) <= 512 and len(x["input_ids_rm2"]) >= 8 )
-    ds_concat = ds_concat.remove_columns(['chosen', 'rejected','input_ids_rm1', 'input_ids_rm2'])
-
-    ds_concat.set_format(type="torch")
-    return ds_concat
-
-
-def build_dataset_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+def build_dataset_eval(path, tokenizer, rm_tokenizers_list, split='test', size=None):
     ds = load_dataset(path, split=split)
     if size is not None:
         ds = ds.select(range(size))
@@ -342,43 +314,7 @@ def build_dataset_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', si
     return ds_concat
 
 
-def build_dataset_summary_eval_sft(path, tokenizer, rm_tokenizer1,rm_tokenizer2, split='test', size=None):
-    if split == 'test':
-        split = 'validation'
-    ds = load_dataset(path, 'comparisons')
-    ds = ds[split]
-    ds = ds.filter(lambda x: x["info"]['post'] is not None and 100 < len(x["info"]['post']) < 1200, batched=False, num_proc=30)
-
-    # need to remove duplicated prompts for evaluation
-    def remove_duplicate(duplicated_dataset):
-        duplicated_dataset = duplicated_dataset.filter(lambda x: x['info']["id"] is not None)
-        initial_list = duplicated_dataset.map(lambda x: {"id": x['info']["id"]})
-        _ , unique_indices = np.unique(initial_list["id"], return_index=True, axis=0)
-        filtered_dataset = duplicated_dataset.select(unique_indices.tolist())
-        return filtered_dataset
-
-    ds = remove_duplicate(ds)
-    if size is not None:
-        ds = ds.select(range(size))
-    ds = ds.select(range(0, min(len(ds),2000))) # select 2000 data 
-
-    def tokenize(sample):
-        info_post = sample["info"]["post"].replace("\n", " ")
-        prompt_summary = Instructions_summary.prompt_input(info_post)
-        sample["prompt"] = prompt_summary
-        sample["input_ids"] = tokenizer.encode(prompt_summary) 
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        return sample
-
-    ds = ds.map(tokenize, batched=False,  num_proc=30) 
-    ds = ds.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8)
-    remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
-    ds = ds.remove_columns(remove_columns)
-    ds.set_format(type="torch")
-    return ds
-
-
-def build_dataset_summary_eval_ppo(path, tokenizer, rm_tokenizers, split='test', size=None):
+def build_dataset_summary_eval(path, tokenizer, rm_tokenizers, split='test', size=None):
     if split == 'test':
         split = 'validation'
     ds = load_dataset(path, 'comparisons')
@@ -600,7 +536,7 @@ def build_dataset_beaver_ppo(path, tokenizer, rm_tokenizer=None, split='train', 
     return ds
 
 
-def build_dataset_beaver_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+def build_dataset_beaver_eval(path, tokenizer, rm_tokenizers_list, split='test', size=None):
     """Eval dataset for PKU-SafeRLHF-10K (subsamples train as test set)."""
     ds = load_dataset(path, split='train')
     ds = ds.select(range(0, len(ds), 12))
@@ -690,7 +626,7 @@ def build_dataset_steer_ppo(path, tokenizer, rm_tokenizer=None, split='train', s
     return ds
 
 
-def build_dataset_steer_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+def build_dataset_steer_eval(path, tokenizer, rm_tokenizers_list, split='test', size=None):
     """Eval dataset for nvidia/HelpSteer or HelpSteer2."""
     from datasets import Dataset as HFDataset
     if split == 'test':
