@@ -15,11 +15,19 @@ from nsgaii_architecture import GatingNetwork
 # Reward model paths
 # ---------------------------------------------------------------------------
 REWARD_PATHS = {
-    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':  'Tristan/gpt2_reward_summarization',
-    'faithful': 'CogComp/bart-faithful-summary-detector',
+    'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':           'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':           'Tristan/gpt2_reward_summarization',
+    'faithful':          'CogComp/bart-faithful-summary-detector',
+    'humor':             'mohameddhiab/humor-no-humor',
+    'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness': 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#0',
+    'steer_correctness': 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#1',
+    'steer_coherence':   'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#2',
+    'steer_complexity':  'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#3',
+    'steer_verbosity':   'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#4',
 }
 
 

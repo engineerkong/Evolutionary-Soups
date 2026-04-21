@@ -46,7 +46,9 @@ from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
+    build_dataset_beaver_ppo, build_dataset_steer_ppo,
     build_dataset_eval_ppo, build_dataset_summary_eval_ppo,
+    build_dataset_beaver_eval_ppo, build_dataset_steer_eval_ppo,
     get_clean_data, load_main_tokenizer,
 )
 from nsgaii_architecture import GatingNetwork, MoEForCausalLM
@@ -234,13 +236,10 @@ reward_names = [x.strip() for x in args.reward_names.split(',')]
 tokenizer              = load_main_tokenizer(args.sft_model_name)
 tokenizer.padding_side = 'left'
 
-reward_models = RewardModels(
-    [REWARD_PATHS[n] for n in reward_names],
-    [REWARD_PATHS[n] for n in reward_names],
-    gpu_id,
-)
+_rm_paths = [REWARD_PATHS[n] for n in reward_names]
+reward_models = RewardModels(_rm_paths, _rm_paths, gpu_id)
 
-_max_new_tokens = 128 if args.dataset_name == 'Anthropic/hh-rlhf' else 48
+_max_new_tokens = 128 if args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48
 generation_kwargs = dict(max_new_tokens=_max_new_tokens, do_sample=args.do_sample)
 if args.do_sample:
     generation_kwargs.update(top_k=0, top_p=0.9, temperature=0.7)
@@ -262,6 +261,16 @@ if args.use_train_split:
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers[0], split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
+    elif args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+        ds = build_dataset_beaver_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
+    elif args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+        ds = build_dataset_steer_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 else:
@@ -281,6 +290,16 @@ else:
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
+    elif args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+        ds = build_dataset_beaver_eval_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
+    elif args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+        ds = build_dataset_steer_eval_ppo(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 

@@ -19,7 +19,8 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import load_main_tokenizer, check_lora_in_model_path, Instructions, Instructions_summary, \
                     build_dataset_eval_sft, build_dataset_summary_eval_sft, \
-                    build_dataset_news_summary_ppo, get_clean_data
+                    build_dataset_news_summary_ppo, build_dataset_beaver_eval_ppo, \
+                    build_dataset_steer_eval_ppo, get_clean_data
 tqdm.pandas()
 
 SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
@@ -29,7 +30,7 @@ SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summar
 class ScriptArguments:
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
-    reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"}) 
+    reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"})
     save_directory: Optional[str] = field(default='./results/sft/', metadata={"help": "directory to save the results"})
     wandb_name: Optional[str] = field(default='assistant_sft_eval', metadata={"help": "name for this experiment"})
 
@@ -47,18 +48,32 @@ gpu_id = process_id
 print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== load reward models ==========
+_DEFAULT_REWARD_NAMES = {
+    'openai/summarize_from_feedback':  'summary,faithful',
+    'argilla/news-summary':            'summary,faithful',
+    'PKU-Alignment/PKU-SafeRLHF-10K': 'beaver_reward,beaver_cost',
+    'nvidia/HelpSteer':                'steer_helpfulness,steer_correctness',
+    'nvidia/HelpSteer2':               'steer_helpfulness,steer_correctness',
+}
 if not script_args.reward_names:
-    script_args.reward_names = ('summary,faithful' if script_args.dataset_name in SUMMARIZATION_DATASETS
-                                else 'harmless,helpful')
+    script_args.reward_names = _DEFAULT_REWARD_NAMES.get(script_args.dataset_name, 'harmless,helpful')
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
+_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
 reward_path_tokenizer_dict = {
-    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':  'Tristan/gpt2_reward_summarization',
-    'faithful': 'CogComp/bart-faithful-summary-detector',
-    'humor':    'mohameddhiab/humor-no-humor',
+    'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':           'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':           'Tristan/gpt2_reward_summarization',
+    'faithful':          'CogComp/bart-faithful-summary-detector',
+    'humor':             'mohameddhiab/humor-no-humor',
+    'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness': f'{_ARMORM}#0',
+    'steer_correctness': f'{_ARMORM}#1',
+    'steer_coherence':   f'{_ARMORM}#2',
+    'steer_complexity':  f'{_ARMORM}#3',
+    'steer_verbosity':   f'{_ARMORM}#4',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []
@@ -84,7 +99,7 @@ if hasattr(model, 'merge_and_unload'):
 
 # ========== define generation kwargs ==========
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
+    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48,
     "min_length": -1,
     "top_k": 0.0,
     "top_p": 0.9,
@@ -108,6 +123,14 @@ elif script_args.dataset_name == 'argilla/news-summary':
         script_args.dataset_name, tokenizer,
         reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+    valid_dataset = build_dataset_beaver_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
+elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+    valid_dataset = build_dataset_steer_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 print(f"Size of the validation set: {len(valid_dataset)}")
@@ -117,6 +140,7 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)
 
+valid_dataset = valid_dataset.with_format("numpy")
 data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 valid_data_loader = DataLoader(valid_dataset, batch_size=valid_batch_size, drop_last=True, collate_fn=data_collator)
 accelerator = Accelerator()

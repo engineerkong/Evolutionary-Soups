@@ -21,7 +21,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, sample_preferences_uniform, \
     Instructions, Instructions_summary, build_dataset_eval_ppo, build_dataset_summary_eval_ppo, \
-    build_dataset_news_summary_ppo
+    build_dataset_news_summary_ppo, build_dataset_beaver_eval_ppo, build_dataset_steer_eval_ppo
 tqdm.pandas()
 
 
@@ -95,13 +95,21 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 # ========== load reward models ==========
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
+_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
 reward_path_tokenizer_dict = {
-    'harmless': 'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':  'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':  'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':  'Tristan/gpt2_reward_summarization',
-    'faithful': 'CogComp/bart-faithful-summary-detector',
-    'humor':    'mohameddhiab/humor-no-humor',
+    'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':           'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':           'Tristan/gpt2_reward_summarization',
+    'faithful':          'CogComp/bart-faithful-summary-detector',
+    'humor':             'mohameddhiab/humor-no-humor',
+    'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness': f'{_ARMORM}#0',
+    'steer_correctness': f'{_ARMORM}#1',
+    'steer_coherence':   f'{_ARMORM}#2',
+    'steer_complexity':  f'{_ARMORM}#3',
+    'steer_verbosity':   f'{_ARMORM}#4',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []
@@ -138,6 +146,14 @@ elif script_args.dataset_name == 'argilla/news-summary':
     valid_dataset = build_dataset_news_summary_ppo(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+    valid_dataset = build_dataset_beaver_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
+elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+    valid_dataset = build_dataset_steer_eval_ppo(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 print(f"Size of the validation set: {len(valid_dataset)}")
@@ -165,7 +181,7 @@ def evaluate_model(temp_save_path, tokenizer, valid_dataset):
 
     # define generation kwargs
     generation_kwargs = {
-        "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
+        "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48,
         "min_length": -1,
         "do_sample": False,
     }

@@ -18,6 +18,7 @@ project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo, \
+    build_dataset_beaver_ppo, build_dataset_steer_ppo, \
     load_main_tokenizer, print_trainable_parameters
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
@@ -25,9 +26,12 @@ tqdm.pandas()
 SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
 
 _PPO_CONFIG_KEY = {
-    'Anthropic/hh-rlhf':              'ppo_assistant',
-    'openai/summarize_from_feedback':  'ppo_summary',
-    'argilla/news-summary':            'ppo_news_summary',
+    'Anthropic/hh-rlhf':                    'ppo_assistant',
+    'openai/summarize_from_feedback':        'ppo_summary',
+    'argilla/news-summary':                  'ppo_news_summary',
+    'PKU-Alignment/PKU-SafeRLHF-10K':        'ppo_beaver',
+    'nvidia/HelpSteer':                      'ppo_steer',
+    'nvidia/HelpSteer2':                     'ppo_steer',
 }
 
 # ========== define script arguments ==========
@@ -36,7 +40,7 @@ class ScriptArguments:
     base_model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "local path to the base model or the huggingface id"})
     sft_model_name: Optional[str] = field(default='./models/sft/', metadata={'help':"the path to the sft model; need to merge if using lora"})
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
-    reward_name: Optional[str] = field(default='harmless', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor'"})
+    reward_name: Optional[str] = field(default='harmless', metadata={"help": "the reward model name: 'summary', 'faithful', 'helpful', 'harmless', 'deberta', 'humor', 'beaver_reward', 'beaver_cost', 'steer_helpfulness', 'steer_correctness', 'steer_coherence', 'steer_complexity', 'steer_verbosity'"})
     load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "loading model in 8 bit or bfloat16"})
     log_with: Optional[str] = field(default='none', metadata={"help": "use 'wandb' to log with wandb"})
     save_directory: Optional[str] = field(default='./models/ppo/', metadata={"help": "directory to save the model"})
@@ -66,20 +70,25 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== load reward model ==========
 reward_name = script_args.reward_name
-if reward_name == 'summary':
-    reward_peft_path = 'Tristan/gpt2_reward_summarization'
-elif reward_name == 'faithful':
-    reward_peft_path = 'CogComp/bart-faithful-summary-detector'
-elif reward_name == 'helpful':
-    reward_peft_path = 'Ray2333/gpt2-large-helpful-reward_model'
-elif reward_name == 'harmless':
-    reward_peft_path = 'Ray2333/gpt2-large-harmless-reward_model'
-elif reward_name == 'deberta':
-    reward_peft_path = 'OpenAssistant/reward-model-deberta-v3-large-v2'
-elif reward_name == 'humor':
-    reward_peft_path = 'mohameddhiab/humor-no-humor'
-else:
-    raise NotImplementedError
+_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
+_REWARD_PATH_MAP = {
+    'summary':             'Tristan/gpt2_reward_summarization',
+    'faithful':            'CogComp/bart-faithful-summary-detector',
+    'helpful':             'Ray2333/gpt2-large-helpful-reward_model',
+    'harmless':            'Ray2333/gpt2-large-harmless-reward_model',
+    'deberta':             'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'humor':               'mohameddhiab/humor-no-humor',
+    'beaver_reward':       'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':         'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness':   f'{_ARMORM}#0',
+    'steer_correctness':   f'{_ARMORM}#1',
+    'steer_coherence':     f'{_ARMORM}#2',
+    'steer_complexity':    f'{_ARMORM}#3',
+    'steer_verbosity':     f'{_ARMORM}#4',
+}
+if reward_name not in _REWARD_PATH_MAP:
+    raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
+reward_peft_path = _REWARD_PATH_MAP[reward_name]
 rm_tokenizer_path = reward_peft_path
 reward_model = RewardModels([reward_peft_path], [rm_tokenizer_path], gpu_id)
 rm_tokenizer = reward_model.rm_tokenizers[0] 
@@ -148,6 +157,12 @@ elif script_args.dataset_name == 'argilla/news-summary':
     # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test for training
     dataset = build_dataset_news_summary_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='test')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
+    dataset = build_dataset_beaver_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
+    instructions = Instructions()
+elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
+    dataset = build_dataset_steer_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
+    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 train_dataset = dataset.shuffle()
@@ -162,7 +177,7 @@ ppo_trainer = PPOTrainer(
 )
 
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.dataset_name == 'Anthropic/hh-rlhf' else 48,
+    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48,
     'min_length': -1, 
     "top_k": 0.0,
     "top_p": 1.0, 
@@ -219,6 +234,7 @@ for epoch in range(epochs):
             temp_resp = response.strip('<s>').strip('</s>')
             temp_resp = temp_resp.split('\n\nHuman:')[0].strip()
             temp_resp = temp_resp.split('\nHuman:')[0].strip()
+            temp_resp = temp_resp.split('\n\nuser:')[0].strip()
             temp_resp = temp_resp.split('\n\nAssistant:')[0].strip()
             temp_resp = temp_resp.split('\nAssistant:')[0].strip()
             temp_resp = temp_resp.split('###')[0].strip()

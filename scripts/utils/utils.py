@@ -427,16 +427,27 @@ def check_lora_in_model_path(model, path):
 
 
 def load_reward_model(reward_peft_path, gpu_id):
-    num_labels = 2 if ('humor' in reward_peft_path or 'faithful' in reward_peft_path) else 1
+    actual_path = reward_peft_path.split('#')[0]  # strip steer dimension suffix (e.g. 'nvidia/HelpSteer#0')
+    if 'beaver' in actual_path:
+        try:
+            from safe_rlhf.models import AutoModelForScore
+        except ImportError:
+            raise ImportError(
+                'safe_rlhf is required for BeaverTails reward models. '
+                'Install from: https://github.com/PKU-Alignment/safe-rlhf')
+        reward_model = AutoModelForScore.from_pretrained(
+            actual_path, torch_dtype=torch.bfloat16, device_map=gpu_id)
+        return reward_model.to(gpu_id)
+    num_labels = 2 if ('humor' in actual_path or 'faithful' in actual_path) else 1
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-                    reward_peft_path,
+                    actual_path,
                     num_labels=num_labels, torch_dtype=torch.bfloat16,
                     device_map=gpu_id,
                     )
-    if check_lora_in_model_path(reward_model, reward_peft_path):
-        reward_model = PeftModel.from_pretrained(reward_model, reward_peft_path)
+    if check_lora_in_model_path(reward_model, actual_path):
+        reward_model = PeftModel.from_pretrained(reward_model, actual_path)
     if hasattr(reward_model, 'merge_and_unload'):
-        reward_model = reward_model.merge_and_unload() # merge lora weights
+        reward_model = reward_model.merge_and_unload()
     return reward_model.to(gpu_id)
 
 # Load main tokenizer without adding special tokens
@@ -451,15 +462,16 @@ def load_main_tokenizer(tokenizer_name):
 
 def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_position=0, round_digits=1):
     rewards = []
-    # print('log: reward model forwarding ...')
     with torch.no_grad():
-        # pbar = tqdm(total=len(texts_for_rewards))
         for inputs in texts_for_rewards:
-            if sub_position != 0: # for multiple output
-                rewards.append(reward_model(**(inputs.to(reward_model.device))).logits[0][sub_position])
+            if sub_position == -100:  # BeaverTails AutoModelForScore
+                rewards.append(reward_model(**(inputs.to(reward_model.device))).end_scores[0])
             else:
-                rewards.append(reward_model(**(inputs.to(reward_model.device))).logits[0])
-            # pbar.update(1)
+                logits = reward_model(**(inputs.to(reward_model.device))).logits[0]
+                if logits.dim() > 0 and logits.numel() > 1:
+                    rewards.append(logits[sub_position])
+                else:
+                    rewards.append(logits)
     
     if reward_mean_std is None:
         rewards = [r.cpu().detach().item() for r in rewards]
@@ -526,6 +538,184 @@ def merge_lora_weight(model, path):
         model = PeftModel.from_pretrained(model, path)
         model = model.merge_and_unload()
     return model
+
+
+# ---------------------------------------------------------------------------
+# BeaverTails (PKU-Alignment/PKU-SafeRLHF-10K) dataset builders
+# BeaverTails uses the same \n\nHuman: / \n\nAssistant: format as hh-rlhf.
+# The dataset only has a 'train' split; split='test' subsamples it.
+# ---------------------------------------------------------------------------
+
+def build_dataset_beaver_sft(path, tokenizer, split='train', size=None):
+    """SFT dataset for PKU-Alignment/PKU-SafeRLHF-10K (uses better_response)."""
+    ds = load_dataset(path, split='train')
+    if split == 'test':
+        ds = ds.select(range(0, len(ds), 12))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        chosen = sample[f"response_{sample['better_response_id']}"]
+        text = '\n\nHuman:' + sample['prompt'] + ' \n\nAssistant:' + chosen
+        sample['text'] = text
+        sample['input_ids'] = tokenizer.encode(text) + [tokenizer.eos_token_id]
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    keep = {'input_ids', 'query', 'text'}
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_beaver_ppo(path, tokenizer, rm_tokenizer=None, split='train', size=None):
+    """PPO/NSGA-II prompt-only dataset for PKU-Alignment/PKU-SafeRLHF-10K."""
+    ds = load_dataset(path, split='train')
+    if split == 'test':
+        ds = ds.select(range(0, len(ds), 12))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        prompt = '\n\nHuman:' + sample['prompt'] + ' \n\nAssistant:'
+        sample['prompt'] = prompt
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        if rm_tokenizer is not None:
+            sample['reward_ids'] = rm_tokenizer.encode(prompt)
+        return sample
+
+    drop = ['response_0', 'response_1', 'is_response_0_safe',
+            'is_response_1_safe', 'better_response_id', 'safer_response_id']
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    if rm_tokenizer is not None:
+        ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 256 and 8 <= len(x['reward_ids']) <= 256)
+        ds = ds.remove_columns(['reward_ids'] + [c for c in drop if c in ds.column_names])
+    else:
+        ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 256)
+        ds = ds.remove_columns([c for c in drop if c in ds.column_names])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_beaver_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+    """Eval dataset for PKU-SafeRLHF-10K (subsamples train as test set)."""
+    ds = load_dataset(path, split='train')
+    ds = ds.select(range(0, len(ds), 12))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        prompt = '\n\nHuman:' + sample['prompt'] + ' \n\nAssistant:'
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    drop = ['prompt', 'response_0', 'response_1', 'is_response_0_safe',
+            'is_response_1_safe', 'better_response_id', 'safer_response_id']
+    ds = ds.map(tokenize, batched=False, num_proc=20)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 256)
+    ds = ds.remove_columns([c for c in drop if c in ds.column_names])
+    ds.set_format(type='torch')
+    return ds
+
+
+# ---------------------------------------------------------------------------
+# HelpSteer / HelpSteer2 (nvidia/HelpSteer, nvidia/HelpSteer2) dataset builders
+# HelpSteer uses \n\nHuman: prefix; HelpSteer2 uses \n\nuser: (lowercase).
+# ---------------------------------------------------------------------------
+
+def _steer_prompt_prefix(path: str) -> str:
+    return '\n\nuser: ' if 'HelpSteer2' in path else '\n\nHuman: '
+
+
+def build_dataset_steer_sft(path, tokenizer, split='train', size=None):
+    """SFT dataset for nvidia/HelpSteer or nvidia/HelpSteer2."""
+    if split == 'test':
+        split = 'validation'
+    ds = load_dataset(path, split=split)
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+    prefix = _steer_prompt_prefix(path)
+
+    def tokenize(sample):
+        text = prefix + sample['prompt'] + ' \n\nAssistant: ' + sample['response']
+        sample['text'] = text
+        sample['input_ids'] = tokenizer.encode(text) + [tokenizer.eos_token_id]
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    keep = {'input_ids', 'query', 'text'}
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_steer_ppo(path, tokenizer, rm_tokenizer=None, split='train', size=None):
+    """PPO/NSGA-II prompt-only dataset for nvidia/HelpSteer or HelpSteer2."""
+    import pandas as pd
+    from datasets import Dataset as HFDataset
+    if split == 'test':
+        split = 'validation'
+    ds = load_dataset(path, split=split)
+    import pandas as pd
+    df = pd.DataFrame(ds)
+    ds = HFDataset.from_pandas(df.drop_duplicates('prompt').reset_index(drop=True))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+    prefix = _steer_prompt_prefix(path)
+
+    def tokenize(sample):
+        prompt = prefix + sample['prompt'] + ' \n\nAssistant: '
+        sample['prompt'] = prompt
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        if rm_tokenizer is not None:
+            sample['reward_ids'] = rm_tokenizer.encode(prompt)
+        return sample
+
+    drop = ['response', 'helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    if rm_tokenizer is not None:
+        ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512 and 8 <= len(x['reward_ids']) <= 512)
+        ds = ds.remove_columns(['reward_ids'] + [c for c in drop if c in ds.column_names])
+    else:
+        ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+        ds = ds.remove_columns([c for c in drop if c in ds.column_names])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_steer_eval_ppo(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+    """Eval dataset for nvidia/HelpSteer or HelpSteer2."""
+    from datasets import Dataset as HFDataset
+    if split == 'test':
+        split = 'validation'
+    ds = load_dataset(path, split=split)
+    import pandas as pd
+    df = pd.DataFrame(ds)
+    ds = HFDataset.from_pandas(df.drop_duplicates('prompt').reset_index(drop=True))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+    ds = ds.select(range(0, min(len(ds), 2000)))
+    prefix = _steer_prompt_prefix(path)
+
+    def tokenize(sample):
+        prompt = prefix + sample['prompt'] + ' \n\nAssistant: '
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    drop = ['prompt', 'response', 'helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
+    ds = ds.map(tokenize, batched=False, num_proc=20)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    ds = ds.remove_columns([c for c in drop if c in ds.column_names])
+    ds.set_format(type='torch')
+    return ds
 
 
 def get_clean_data(full_responses, full_prompts, remove_bad=False):
