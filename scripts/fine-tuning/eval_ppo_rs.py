@@ -164,7 +164,7 @@ for key in ['key', 'text', 'prompt', 'response', 'query']:
 
 # ========== evaluation function ==========
 def evaluate_model(temp_save_path, tokenizer, valid_dataset):
-    mini_batch_size = 8
+    mini_batch_size = 32
     valid_dataset = valid_dataset.with_format("numpy")
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     valid_data_loader = DataLoader(valid_dataset, mini_batch_size, drop_last=False, collate_fn=data_collator)

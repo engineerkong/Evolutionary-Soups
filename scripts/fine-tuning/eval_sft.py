@@ -99,7 +99,7 @@ if hasattr(model, 'merge_and_unload'):
 
 # ========== define generation kwargs ==========
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48,
+    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48,
     "min_length": -1,
     "top_k": 0.0,
     "top_p": 0.9,

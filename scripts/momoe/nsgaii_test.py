@@ -140,9 +140,9 @@ def generate_and_score(model, input_ids, attention_mask, tokenizer,
                  for r in responses_clean]
         if hasattr(instructions, 'get_post'):
             scores = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post)
+                pairs, instructions.get_post, normalize_rewards=False)  # no normalization during eval
         else:
-            scores = reward_models.get_reward_model_scores(pairs)
+            scores = reward_models.get_reward_model_scores(pairs, normalize_rewards=False)
 
         n_prompts, n_rewards = len(prompts_clean), len(scores)
         if accumulated is None:
@@ -239,7 +239,7 @@ tokenizer.padding_side = 'left'
 _rm_paths = [REWARD_PATHS[n] for n in reward_names]
 reward_models = RewardModels(_rm_paths, _rm_paths, gpu_id)
 
-_max_new_tokens = 128 if args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48
+_max_new_tokens = 128 if args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48
 generation_kwargs = dict(max_new_tokens=_max_new_tokens, do_sample=args.do_sample)
 if args.do_sample:
     generation_kwargs.update(top_k=0, top_p=0.9, temperature=0.7)

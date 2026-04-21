@@ -152,7 +152,7 @@ class RewardModels():
                 self.reward_models.append(_model_cache[ap])
                 self.rm_tokenizers.append(_tokenizer_cache[tok_ap])
 
-    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=True, round_digits=None):
+    def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=False, round_digits=None):
         texts_for_rewards = []
         for i in range(self.num_rewards):
             path = self.reward_model_path_list[i]
@@ -208,6 +208,7 @@ class RewardModels():
             if _is_armorm(ap):
                 _, dim = _parse_armorm(path)
                 temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
+                print(f"Raw rewards for {ap} (dim {dim}): {temp_reward[:5]}...")
                 if round_digits is not None:
                     temp_reward = [np.round(r, round_digits) for r in temp_reward]
                 rewards.append(temp_reward)

@@ -213,7 +213,7 @@ ppo_trainer = MyPPOTrainer(
 weight_sampler = WeightSampler(num_rewards, uniform_ratio=float(cfg.get('uniform_ratio', 1.0)))
 
 generation_kwargs = {
-    'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
+    'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48, # , 'nvidia/HelpSteer', 'nvidia/HelpSteer2'
     'min_length': -1,
     'do_sample': False,
     'num_beams': 1,

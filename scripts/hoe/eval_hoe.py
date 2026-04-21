@@ -79,7 +79,7 @@ class ScriptArguments:
     num_eval_samples: int = field(default=0, metadata={'help': 'Limit eval dataset size (0 = all)'})
     save_directory: str = field(default='./results/hoe/', metadata={'help': 'Output directory'})
     wandb_name: str = field(default='hoe_assistant_eval', metadata={'help': 'Experiment name'})
-    batch_size: int = field(default=64, metadata={'help': 'Evaluation batch size'})
+    batch_size: int = field(default=32, metadata={'help': 'Evaluation batch size'})
     n_layers: int = field(default=32, metadata={'help': 'Number of LLaMA transformer layers'})
 
 
@@ -168,7 +168,7 @@ for p in preferences:
     print(f'  [{pref_str}]')
 
 generation_kwargs = {
-    'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48,
+    'max_new_tokens': 128 if script_args.exp_type == 'assistant' else 48, # , 'nvidia/HelpSteer', 'nvidia/HelpSteer2'
     'min_length': -1,
     'do_sample': False,
 }

@@ -89,6 +89,7 @@ _REWARD_PATH_MAP = {
 if reward_name not in _REWARD_PATH_MAP:
     raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
 reward_peft_path = _REWARD_PATH_MAP[reward_name]
+print(f"Using reward model: {reward_name} at {reward_peft_path}")
 rm_tokenizer_path = reward_peft_path
 reward_model = RewardModels([reward_peft_path], [rm_tokenizer_path], gpu_id)
 rm_tokenizer = reward_model.rm_tokenizers[0] 
@@ -177,7 +178,7 @@ ppo_trainer = PPOTrainer(
 )
 
 generation_kwargs = {
-    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48,
+    "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48,
     'min_length': -1, 
     "top_k": 0.0,
     "top_p": 1.0, 
@@ -255,9 +256,9 @@ for epoch in range(epochs):
             for text in texts_merge
         ]
         if hasattr(instructions, 'get_post'):
-            rewards = reward_model.get_reward_model_scores(queries_responses, instructions.get_post)[0]
+            rewards = reward_model.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False)[0]
         else:
-            rewards = reward_model.get_reward_model_scores(queries_responses)[0]
+            rewards = reward_model.get_reward_model_scores(queries_responses, normalize_rewards=False)[0]
         rewards_tensor = [torch.tensor(r).to(gpu_id) for r in rewards]
         print("epoch {}, batch {}, global_step {}: mean score: {:.4f}".format(epoch, i, global_step, torch.mean(torch.tensor(rewards)).item()))
 

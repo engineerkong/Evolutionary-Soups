@@ -138,4 +138,3 @@ if process_id == 0:
     trainer.model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
     
-
