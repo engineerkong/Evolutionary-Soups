@@ -59,7 +59,7 @@ if not script_args.reward_names:
     script_args.reward_names = _DEFAULT_REWARD_NAMES.get(script_args.dataset_name, 'harmless,helpful')
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
-_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
+_URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
 reward_path_tokenizer_dict = {
     'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
     'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
@@ -69,11 +69,11 @@ reward_path_tokenizer_dict = {
     'humor':             'mohameddhiab/humor-no-humor',
     'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
     'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness': f'{_ARMORM}#0',
-    'steer_correctness': f'{_ARMORM}#1',
-    'steer_coherence':   f'{_ARMORM}#2',
-    'steer_complexity':  f'{_ARMORM}#3',
-    'steer_verbosity':   f'{_ARMORM}#4',
+    'steer_helpfulness': f'{_URM}#0',
+    'steer_correctness': f'{_URM}#1',
+    'steer_coherence':   f'{_URM}#2',
+    'steer_complexity':  f'{_URM}#3',
+    'steer_verbosity':   f'{_URM}#4',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []

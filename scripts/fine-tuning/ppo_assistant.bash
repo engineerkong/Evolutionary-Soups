@@ -1,0 +1,5 @@
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_assistant_2701/model/' --dataset_name 'Anthropic/hh-rlhf' --reward_name 'harmless' --wandb_name 'ppo_assistant_harmless_2104' 2>&1 | tee ./logs/ppo/ppo_assistant_harmless_2104.log
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_assistant_2701/model/' --dataset_name 'Anthropic/hh-rlhf' --reward_name 'helpful' --wandb_name 'ppo_assistant_helpful_2104' 2>&1 | tee ./logs/ppo/ppo_assistant_helpful_2104.log
+
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_assistant_2701/model/' --dataset_name 'Anthropic/hh-rlhf' --reward_name 'humor' --wandb_name 'ppo_assistant_humor_2104' 2>&1 | tee ./logs/ppo/ppo_assistant_humor_2104.log

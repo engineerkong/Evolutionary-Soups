@@ -65,7 +65,7 @@ from scripts.utils.utils import (
     load_main_tokenizer,
 )
 
-_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
+_URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
 REWARD_PATHS = {
     'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
     'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
@@ -75,11 +75,11 @@ REWARD_PATHS = {
     'humor':             'mohameddhiab/humor-no-humor',
     'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
     'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness': f'{_ARMORM}#0',
-    'steer_correctness': f'{_ARMORM}#1',
-    'steer_coherence':   f'{_ARMORM}#2',
-    'steer_complexity':  f'{_ARMORM}#3',
-    'steer_verbosity':   f'{_ARMORM}#4',
+    'steer_helpfulness': f'{_URM}#0',
+    'steer_correctness': f'{_URM}#1',
+    'steer_coherence':   f'{_URM}#2',
+    'steer_complexity':  f'{_URM}#3',
+    'steer_verbosity':   f'{_URM}#4',
 }
 
 _DEFAULT_REWARD_NAMES = {

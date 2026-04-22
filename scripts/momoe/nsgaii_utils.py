@@ -23,11 +23,11 @@ REWARD_PATHS = {
     'humor':             'mohameddhiab/humor-no-humor',
     'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
     'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness': 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#0',
-    'steer_correctness': 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#1',
-    'steer_coherence':   'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#2',
-    'steer_complexity':  'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#3',
-    'steer_verbosity':   'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#4',
+    'steer_helpfulness': 'urm://LxzGordon/URM-LLaMa-3.1-8B#0',
+    'steer_correctness': 'urm://LxzGordon/URM-LLaMa-3.1-8B#1',
+    'steer_coherence':   'urm://LxzGordon/URM-LLaMa-3.1-8B#2',
+    'steer_complexity':  'urm://LxzGordon/URM-LLaMa-3.1-8B#3',
+    'steer_verbosity':   'urm://LxzGordon/URM-LLaMa-3.1-8B#4',
 }
 
 

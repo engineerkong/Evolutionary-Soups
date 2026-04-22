@@ -25,6 +25,19 @@ def _parse_armorm(path: str):
     return body, 0
 
 
+def _is_urm(path: str) -> bool:
+    return _actual_path(path).startswith('urm://')
+
+
+def _parse_urm(path: str):
+    """Return (model_path, dim_index) from 'urm://model_id#N'."""
+    body = path[len('urm://'):]
+    if '#' in body:
+        model_path, dim = body.rsplit('#', 1)
+        return model_path, int(dim)
+    return body, 0
+
+
 def _sub_position(path: str) -> int:
     """Return sub_position: -100 for beaver, int(N) for #N suffix, 0 otherwise."""
     if 'beaver' in _actual_path(path):
@@ -106,6 +119,71 @@ class ArmoRMClient:
 
 
 # ---------------------------------------------------------------------------
+# URM local multi-objective reward model
+# LxzGordon/URM-LLaMa-3.1-8B — outputs per-attribute scores on 0-4 scale,
+# matching HelpSteer annotation scale natively (no rescaling needed).
+# Path format: 'urm://LxzGordon/URM-LLaMa-3.1-8B#N'
+#   N in {0,1,2,3,4} → helpfulness, correctness, coherence, complexity, verbosity
+# ---------------------------------------------------------------------------
+
+URM_ATTRIBUTES = ['helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
+
+
+class URMClient:
+    """URM multi-objective reward model (LxzGordon/URM-LLaMa-3.1-8B).
+
+    Outputs per-attribute means on the HelpSteer 0-4 scale.
+    Loaded once per unique model path; shared across heads that differ only in dim.
+    """
+
+    def __init__(self, model_path: str, device):
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        self.device = device
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            device_map=device,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model.eval()
+
+    def score_batch(self, queries_responses: list, dim: int) -> list:
+        """Score (q, r) pairs; return float list for attribute dim on 0-4 scale."""
+        results = []
+        for q, r in queries_responses:
+            messages = [{"role": "user", "content": q},
+                        {"role": "assistant", "content": r}]
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False)
+            inputs = self.tokenizer(
+                text, return_tensors="pt", truncation=True, max_length=4096
+            ).to(self.device)
+
+            with torch.no_grad():
+                transformer_outputs = self.model.model(**inputs, return_dict=True)
+                hidden_states = transformer_outputs[0]
+                raw_logits  = self.model.score(hidden_states)
+                raw_weights = self.model.weights(hidden_states.to(torch.float16))
+
+                input_ids = inputs["input_ids"]
+                pad_id = self.model.config.pad_token_id
+                if pad_id is None:
+                    seq_len = -1
+                else:
+                    eq = torch.eq(input_ids, pad_id).int().argmax(-1) - 1
+                    seq_len = (eq % input_ids.shape[-1]).to(raw_logits.device)
+
+                batch_idx     = torch.arange(1, device=raw_logits.device)
+                pooled_logits = raw_logits[batch_idx, seq_len]  # [1, hidden]
+
+                per_attr   = pooled_logits.view(-1, 5, 2)
+                attr_means = per_attr[:, :, 0].squeeze(0)       # [5]
+
+            results.append(attr_means[dim].float().item())
+        return results
+
+
+# ---------------------------------------------------------------------------
 # Standard (non-ArmoRM) helpers
 # ---------------------------------------------------------------------------
 
@@ -142,7 +220,14 @@ class RewardModels():
                     print(f'Loading ArmoRM from {model_path}')
                     _model_cache[model_path] = ArmoRMClient(model_path, gpu_id_list[i])
                 self.reward_models.append(_model_cache[model_path])
-                self.rm_tokenizers.append(None)  # tokeniser is internal to ArmoRMClient
+                self.rm_tokenizers.append(None)
+            elif _is_urm(ap):
+                model_path = ap[len('urm://'):]
+                if model_path not in _model_cache:
+                    print(f'Loading URM from {model_path}')
+                    _model_cache[model_path] = URMClient(model_path, gpu_id_list[i])
+                self.reward_models.append(_model_cache[model_path])
+                self.rm_tokenizers.append(None)  # tokeniser is internal to URMClient
             else:
                 tok_ap = _actual_path(self.rm_tokenizer_path_list[i])
                 if ap not in _model_cache:
@@ -158,7 +243,7 @@ class RewardModels():
             path = self.reward_model_path_list[i]
             ap = _actual_path(path)
 
-            if _is_armorm(ap):
+            if _is_armorm(ap) or _is_urm(ap):
                 texts_for_rewards.append(queries_responses)  # raw (q, r) pairs
                 continue
 
@@ -207,6 +292,16 @@ class RewardModels():
 
             if _is_armorm(ap):
                 _, dim = _parse_armorm(path)
+                temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
+                if 0 <= dim <= 4:  # HelpSteer dimensions: rescale [0,1] → [-0.5, 4.5]
+                    temp_reward = [r * 5 - 0.5 for r in temp_reward]
+                if round_digits is not None:
+                    temp_reward = [np.round(r, round_digits) for r in temp_reward]
+                rewards.append(temp_reward)
+                continue
+
+            if _is_urm(ap):
+                _, dim = _parse_urm(path)
                 temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
                 if round_digits is not None:
                     temp_reward = [np.round(r, round_digits) for r in temp_reward]

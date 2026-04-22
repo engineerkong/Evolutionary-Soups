@@ -46,32 +46,32 @@ ppo_summary:
   init_kl_coef: 0.05
   adap_kl_ctrl: true
   tracker_project_name: "ppo-summary"
-  
+
 ppo_beaver:
-  epochs: 1
+  epochs: 5
   learning_rate: 1e-5
   mini_batch_size: 8
   batch_size: 64
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   early_stopping: true
-  target: 3
+  target: 6
   max_grad_norm: 0.5
   optimize_cuda_cache: true
-  init_kl_coef: 0.2
-  adap_kl_ctrl: true
+  init_kl_coef: 0.1
+  adap_kl_ctrl: false
   tracker_project_name: "ppo-beaver"
 
 ppo_steer:
-  epochs: 4
-  learning_rate: 5e-6
+  epochs: 5
+  learning_rate: 1e-5
   mini_batch_size: 8
   batch_size: 64
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 4
   early_stopping: true
-  target: 3
+  target: 6
   max_grad_norm: 0.5
   optimize_cuda_cache: true
-  init_kl_coef: 0.05
+  init_kl_coef: 0.1
   adap_kl_ctrl: true
   tracker_project_name: "ppo-steer"
 

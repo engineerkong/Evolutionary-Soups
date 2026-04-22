@@ -70,7 +70,7 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== load reward model ==========
 reward_name = script_args.reward_name
-_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
+_URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
 _REWARD_PATH_MAP = {
     'summary':             'Tristan/gpt2_reward_summarization',
     'faithful':            'CogComp/bart-faithful-summary-detector',
@@ -80,11 +80,11 @@ _REWARD_PATH_MAP = {
     'humor':               'mohameddhiab/humor-no-humor',
     'beaver_reward':       'PKU-Alignment/beaver-7b-v1.0-reward',
     'beaver_cost':         'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness':   f'{_ARMORM}#0',
-    'steer_correctness':   f'{_ARMORM}#1',
-    'steer_coherence':     f'{_ARMORM}#2',
-    'steer_complexity':    f'{_ARMORM}#3',
-    'steer_verbosity':     f'{_ARMORM}#4',
+    'steer_helpfulness':   f'{_URM}#0',
+    'steer_correctness':   f'{_URM}#1',
+    'steer_coherence':     f'{_URM}#2',
+    'steer_complexity':    f'{_URM}#3',
+    'steer_verbosity':     f'{_URM}#4',
 }
 if reward_name not in _REWARD_PATH_MAP:
     raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
@@ -202,6 +202,11 @@ save_data = {
     'text_sample':[],
 }
 
+best_score = float('-inf')
+best_score_label = None
+_ROLLING_WINDOW = 10  # rolling mean window for best-model tracking
+recent_scores = []
+
 global_step = 0
 for epoch in range(epochs):
     pbar = tqdm(total=len(train_dataset) // ppo_trainer.config.batch_size // accelerator.num_processes)
@@ -259,7 +264,11 @@ for epoch in range(epochs):
         else:
             rewards = reward_model.get_reward_model_scores(queries_responses, normalize_rewards=False)[0]
         rewards_tensor = [torch.tensor(r).to(gpu_id) for r in rewards]
-        print("epoch {}, batch {}, global_step {}: mean score: {:.4f}".format(epoch, i, global_step, torch.mean(torch.tensor(rewards)).item()))
+        batch_mean = torch.mean(torch.tensor(rewards)).item()
+        print("epoch {}, batch {}, global_step {}: mean score: {:.4f}".format(epoch, i, global_step, batch_mean))
+        recent_scores.append(batch_mean)
+        if len(recent_scores) > _ROLLING_WINDOW:
+            recent_scores.pop(0)
 
         model.gradient_checkpointing_enable()
         model.pretrained_model.config.use_cache = False
@@ -357,33 +366,48 @@ for epoch in range(epochs):
         # save model checkpoint every 100 steps
         if ppo_trainer.accelerator.is_main_process and global_step % 100 == 0 and global_step != 0:
             save_path = os.path.join(
-                script_args.save_directory, 
-                script_args.wandb_name, 
+                script_args.save_directory,
+                script_args.wandb_name,
                 'step_{}'.format(global_step)
             )
             ppo_trainer.save_pretrained(save_path)
             print("epoch {}, batch {}, global_step {}: checkpoint saved".format(epoch, i, global_step))
+            rolling_mean = sum(recent_scores) / len(recent_scores)
+            if rolling_mean > best_score:
+                best_score = rolling_mean
+                best_score_label = 'step_{}'.format(global_step)
+                best_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'best_model')
+                ppo_trainer.save_pretrained(best_path)
+                print("  → new best model (rolling_mean={:.4f}) saved as best_model".format(best_score))
 
         global_step += 1
 
     # save model at end of each epoch
     if ppo_trainer.accelerator.is_main_process:
         save_path = os.path.join(
-            script_args.save_directory, 
-            script_args.wandb_name, 
+            script_args.save_directory,
+            script_args.wandb_name,
             'epoch_{}_final'.format(epoch)
         )
         ppo_trainer.save_pretrained(save_path)
         print("epoch {} complete, global_step {}: epoch checkpoint saved".format(epoch, global_step))
+        rolling_mean = sum(recent_scores) / len(recent_scores)
+        if rolling_mean > best_score:
+            best_score = rolling_mean
+            best_score_label = 'epoch_{}_final'.format(epoch)
+            best_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'best_model')
+            ppo_trainer.save_pretrained(best_path)
+            print("  → new best model (rolling_mean={:.4f}) saved as best_model".format(best_score))
 
 # save final model
 if ppo_trainer.accelerator.is_main_process:
     save_path = os.path.join(
-        script_args.save_directory, 
-        script_args.wandb_name, 
+        script_args.save_directory,
+        script_args.wandb_name,
         'final'
     )
     ppo_trainer.save_pretrained(save_path)
     print("Training complete! Final model saved at global_step {}".format(global_step))
+    print("Best model: '{}' (rolling_mean={:.4f}) → saved as best_model/".format(best_score_label, best_score))
 
             

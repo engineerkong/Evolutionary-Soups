@@ -1,0 +1,3 @@
+CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29602 ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_beaver_2004/model/' --dataset_name 'PKU-Alignment/PKU-SafeRLHF-10K' --reward_name 'beaver_reward' --wandb_name 'ppo_beaver_reward_2204' 2>&1 | tee ./logs/ppo/ppo_beaver_reward_2204.log
+
+CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29602 ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_beaver_2004/model/' --dataset_name 'PKU-Alignment/PKU-SafeRLHF-10K' --reward_name 'beaver_cost' --wandb_name 'ppo_beaver_cost_2204' 2>&1 | tee ./logs/ppo/ppo_beaver_cost_2204.log
