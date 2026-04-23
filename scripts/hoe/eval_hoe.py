@@ -90,7 +90,6 @@ _DEFAULT_REWARD_NAMES = {
 @dataclass
 class ScriptArguments:
     base_model_name: str = field(default='meta-llama/Llama-2-7b-hf', metadata={'help': 'Local path or HF id of the base LLaMA model'})
-    sft_model_name: str = field(default='', metadata={'help': 'Path to the SFT LoRA adapter (tokenizer lives here too)'})
     expert_model_paths: str = field(default='', metadata={'help': 'Comma-separated paths to per-objective PPO LoRA adapters, one per reward (order must match reward_names)'})
     checkpoint_path: str = field(default='', metadata={'help': 'Path to trained HoE router checkpoint directory'})
     dataset_name: str = field(default='Anthropic/hh-rlhf', metadata={'help': 'Dataset: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, nvidia/HelpSteer, nvidia/HelpSteer2'})
@@ -149,8 +148,7 @@ if script_args.checkpoint_path:
 model.eval()
 
 # ========== dataset and dataloader ==========
-# Tokenizer lives in the SFT adapter directory (same as ppo.py sft_model_name)
-tokenizer = load_main_tokenizer(script_args.sft_model_name)
+tokenizer = load_main_tokenizer(expert_paths[0])
 tokenizer.padding_side = 'left'
 
 if script_args.dataset_name == 'Anthropic/hh-rlhf':

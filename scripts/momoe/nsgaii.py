@@ -10,7 +10,6 @@ Algorithm: NSGA-II (Deb et al., 2002).
 
 TO RUN:
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii.py \
-    --sft_model_name './models/sft/assistant_sft/model/' \
     --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' \
                          './models/ppo/assistant_ppo_helpful_2701/batch_832/' \
     --run_name 'nsgaii_gating_0101' 2>&1 | tee ./logs/nsgaii_0101.log
@@ -58,7 +57,6 @@ from nsgaii_utils import save_gating_network, get_simplex_samples, REWARD_PATHS
 @dataclass
 class ScriptArguments:
     base_model_name:      str       = 'meta-llama/Llama-2-7b-hf'
-    sft_model_name:       str       = './models/sft/model/'
     expert_model_paths:   List[str] = field(default_factory=list)
     reward_names:         str       = 'harmless,helpful'          # auto-selected from dataset_name if empty
     dataset_name:         str       = 'Anthropic/hh-rlhf'         # 'Anthropic/hh-rlhf' | 'openai/summarize_from_feedback' | 'argilla/news-summary'
@@ -840,7 +838,7 @@ n_objectives = len(reward_names)
 reward_model_paths = [REWARD_PATHS[n] for n in reward_names]
 reward_models      = RewardModels(reward_model_paths, reward_model_paths, gpu_id)
 
-sft_tokenizer              = load_main_tokenizer(script_args.sft_model_name)
+sft_tokenizer              = load_main_tokenizer(script_args.expert_model_paths[0])
 sft_tokenizer.padding_side = 'left'
 
 if script_args.dataset_name == 'Anthropic/hh-rlhf':

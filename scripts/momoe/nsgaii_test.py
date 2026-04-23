@@ -14,7 +14,6 @@ gating_paths accepts:
 
 TO RUN:
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii_test.py \
-    --sft_model_name ./models/sft/assistant_sft/model/ \
     --expert_model_paths ./models/ppo/assistant_ppo_harmless_2701/batch_832/ \
                          ./models/ppo/assistant_ppo_helpful_2701/batch_832/ \
     --gating_paths ./models/nsgaii/nsgaii_gating_0101/gen_0020/ \
@@ -62,7 +61,6 @@ from nsgaii_utils import REWARD_PATHS, load_gating_network, get_simplex_samples
 @dataclass
 class Args:
     base_model_name:    str       = 'meta-llama/Llama-2-7b-hf'
-    sft_model_name:     str       = './models/sft/assistant_sft/model/'
     expert_model_paths: List[str] = field(default_factory=list)
     gating_paths:       List[str] = field(default_factory=list)
     reward_names:       str       = ''          # auto-selected from dataset_name if empty
@@ -233,7 +231,7 @@ device      = f'cuda:{gpu_id}'
 
 reward_names = [x.strip() for x in args.reward_names.split(',')]
 
-tokenizer              = load_main_tokenizer(args.sft_model_name)
+tokenizer              = load_main_tokenizer(args.expert_model_paths[0])
 tokenizer.padding_side = 'left'
 
 _rm_paths = [REWARD_PATHS[n] for n in reward_names]

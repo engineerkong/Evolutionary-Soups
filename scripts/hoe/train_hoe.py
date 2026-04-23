@@ -168,8 +168,7 @@ ref_model = ref_model.merge_and_unload()
 ref_model.config.update({'use_cache': True, 'pad_token_id': ref_model.config.eos_token_id})
 
 # ========== dataset ==========
-# Tokenizer lives in the SFT adapter directory (same as ppo.py sft_model_name)
-tokenizer = load_main_tokenizer(script_args.sft_model_name)
+tokenizer = load_main_tokenizer(expert_paths[0])
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions()
