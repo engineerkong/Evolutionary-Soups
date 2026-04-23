@@ -4,7 +4,7 @@ from pathlib import Path
 import os
 import gc
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 from accelerate import Accelerator
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
@@ -41,10 +41,9 @@ def _load_adapter_sd(adapter_dir: str) -> dict:
     raise FileNotFoundError(f'No adapter weights found in {adapter_dir}')
 
 
-def _merge_and_save_rewarded_soup(base_model_name, sft_model_name, ppo_model_list, preference, save_path):
+def _merge_and_save_rewarded_soup(base_model_name, ppo_model_list, preference, save_path):
     base = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=torch.bfloat16, device_map='cpu')
-    base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
 
     expert_sds  = [_load_adapter_sd(p) for p in ppo_model_list]
     peft_config = LoraConfig.from_pretrained(ppo_model_list[0])
@@ -68,10 +67,7 @@ def _merge_and_save_rewarded_soup(base_model_name, sft_model_name, ppo_model_lis
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default='meta-llama/Llama-2-7b-hf', metadata={"help": "base LLaMA model path or HF id"})
-    sft_model_name: Optional[str] = field(default="./models/sft/model/", metadata={"help": "SFT LoRA adapter path (tokenizer lives here)"})
-    ppo_model_name1: Optional[str]=field(default='./ppo/assistant_ppo_harmless/batch_832')
-    ppo_model_name2: Optional[str]=field(default='./ppo/assistant_ppo_helpful/batch_832')
-    ppo_model_name3: Optional[str]=field(default='')
+    expert_model_paths: List[str] = field(default_factory=list, metadata={"help": "PPO adapter paths (space-separated on CLI)"})
     num_pref_samples: int = field(default=10, metadata={"help": "number of preference samples per input"})
     reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"})
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
@@ -80,6 +76,7 @@ class ScriptArguments:
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
+ppo_model_list = script_args.expert_model_paths
 print(script_args)
 
 output_dir = os.path.join(script_args.save_directory, script_args.wandb_name)
@@ -119,21 +116,16 @@ for name in reward_names:
     reward_model_path_list.append(reward_path_tokenizer_dict[name])
     rm_tokenizer_path_list.append(reward_path_tokenizer_dict[name])
 
-save_info = {
-    'tokenizer_name': script_args.sft_model_name,
-    'ppo_model_name1': script_args.ppo_model_name1,
-    'ppo_model_name2': script_args.ppo_model_name2,
-    'ppo_model_name3': script_args.ppo_model_name3,
-    'reward_peft_path1': reward_model_path_list[0],
-    'reward_peft_path2': reward_model_path_list[1],
-}
-for i in range(len(reward_model_path_list)):
-    save_info['reward_peft_path{}'.format(i+1)] = reward_model_path_list[i]
+save_info = {'tokenizer_name': ppo_model_list[0]}
+for i, p in enumerate(ppo_model_list):
+    save_info[f'ppo_model_name{i+1}'] = p
+for i, p in enumerate(reward_model_path_list):
+    save_info[f'reward_peft_path{i+1}'] = p
 save_configs(save_info, output_dir)
 reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu_id) 
 
 # ========== prepare evaluation dataset and dataloader ==========
-tokenizer = load_main_tokenizer(script_args.sft_model_name)
+tokenizer = load_main_tokenizer(ppo_model_list[0])
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     valid_dataset = build_dataset_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
@@ -234,12 +226,8 @@ for k in range(0, len(sampled_preferences)):
     preference = sampled_preferences[k]
     temp_save_path = output_dir + '/temp_merged_model_pref_{}_{}'.format('_'.join([str(p) for p in preference]), k)
     if process_id == 0:
-        if len(preference) == 3:
-            ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2, script_args.ppo_model_name3]
-        else:
-            ppo_model_list = [script_args.ppo_model_name1, script_args.ppo_model_name2]
         _merge_and_save_rewarded_soup(
-            script_args.base_model_name, script_args.sft_model_name,
+            script_args.base_model_name,
             ppo_model_list, preference, temp_save_path)
         print("merged model saved to {}".format(temp_save_path))
 
@@ -261,10 +249,8 @@ for k in range(0, len(sampled_preferences)):
             print('total average obtained score {}: {}'.format(i+1, np.mean(evaluation_result['obtained_score{}'.format(i+1)])))
 
         dataframe = pd.DataFrame(evaluation_result)
-        if len(preference) == 2:
-            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}.csv'.format(preference[0], preference[1])), escapechar='\\')
-        else:
-            dataframe.to_csv(os.path.join(output_dir,'eval_data_pref{}_{}_{}.csv'.format(preference[0], preference[1], preference[2])), escapechar='\\')
+        pref_str = '_'.join([str(p) for p in preference])
+        dataframe.to_csv(os.path.join(output_dir, f'eval_data_pref{pref_str}.csv'), escapechar='\\')
 
 
 

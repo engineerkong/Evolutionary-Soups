@@ -16,8 +16,9 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_mo
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/sft_assistant/model/' --ppo_model_name './models/ppo/ppo_assistant_harmless/batch_832/' --dataset_name 'Anthropic/hh-rlhf' --reward_names 'harmless,helpful,humor' --wandb_name 'ppo_assistant_harmless_eval' 2>&1 | tee ./logs/ppo/ppo_assistant_harmless_eval.log
 
 # PPO REWARDED-SOUPS EVALUATION (--main_process_port 29601)
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_rs.py --sft_model_name './models/sft/assistant_sft/model/' --ppo_model_name1 './models/ppo/assistant_ppo_harmless/batch_832/' --ppo_model_name2 './models/ppo/assistant_ppo_helpful/batch_832/' --exp_type 'assistant' --reward_names 'harmless,helpful' --wandb_name 'assistant_ppo_rs' 2>&1 | tee ./logs/ppo_assistant_rs.log
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_rs.py --sft_model_name './models/sft/summary_sft/model/' --ppo_model_name1 './models/ppo/summary_ppo_summary/batch_307/' --ppo_model_name2 './models/ppo/summary_ppo_faithful/batch_307/' --ppo_model_name3 './models/ppo/summary_ppo_deberta/batch_307/' --exp_type 'summary' --reward_names 'summary,faithful,deberta' --wandb_name 'summary_ppo_rs' 2>&1 | tee ./logs/ppo_summary_rs.log
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_rs.py --sft_model_name './models/sft/sft_summary_3001/model/' --expert_model_paths './models/ppo/ppo_summary_summary_2104/best_model/' './models/ppo/ppo_summary_faithful_2104/best_model/' './models/ppo/ppo_summary_deberta_2104/best_model/' --num_pref_samples 66 --reward_names 'summary,faithful,deberta' --dataset_name 'openai/summarize_from_feedback' --wandb_name 'ppo_summary_rs_2204' 2>&1 | tee ./logs/ppo/ppo_summary_rs_2204.log
+
+
 ```
 
 ### Multi-Objective Mixture-of-Experts (MOMoE) (--main_process_port 29601)

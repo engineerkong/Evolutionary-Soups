@@ -322,7 +322,6 @@ experts = []
 for i, path in enumerate(args.expert_model_paths):
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
-    base = PeftModel.from_pretrained(base, args.sft_model_name).merge_and_unload()
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(tokenizer))
     m.eval()
@@ -446,10 +445,9 @@ def _load_adapter_sd(adapter_dir: str) -> dict:
     raise FileNotFoundError(f'No adapter weights found in {adapter_dir}')
 
 
-def _build_rewarded_soup(base_model_name, sft_model_name, expert_sds, peft_config, coeffs, device):
+def _build_rewarded_soup(base_model_name, expert_sds, peft_config, coeffs, device):
     base = AutoModelForCausalLM.from_pretrained(
         base_model_name, torch_dtype=torch.bfloat16, device_map=device)
-    base = PeftModel.from_pretrained(base, sft_model_name).merge_and_unload()
     blended_sd = {
         k: sum(coeffs[i] * expert_sds[i][k].to(torch.bfloat16) for i in range(len(coeffs)))
         for k in expert_sds[0]
@@ -501,7 +499,7 @@ if args.expert_model_paths:
                 continue
 
             model = _build_rewarded_soup(
-                args.base_model_name, args.sft_model_name,
+                args.base_model_name,
                 expert_sds, peft_cfg_rs, coeffs, device)
             model.resize_token_embeddings(len(tokenizer))
 

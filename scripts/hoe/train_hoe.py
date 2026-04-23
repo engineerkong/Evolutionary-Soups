@@ -143,7 +143,6 @@ top_k = number_experts[:]
 
 hoe_base = build_hoe_model(
     base_model_name=script_args.base_model_name,
-    sft_model_name=script_args.sft_model_name,
     expert_model_paths=expert_paths,
     number_experts=number_experts,
     top_k=top_k,

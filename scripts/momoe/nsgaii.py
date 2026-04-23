@@ -895,7 +895,6 @@ for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
     base = AutoModelForCausalLM.from_pretrained(
         script_args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
-    base = PeftModel.from_pretrained(base, script_args.sft_model_name).merge_and_unload()
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
     m.resize_token_embeddings(len(sft_tokenizer))
     m.eval()

@@ -100,9 +100,7 @@ model.resize_token_embeddings(len(tokenizer))
 generation_kwargs = {
     "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48,
     "min_length": -1,
-    "top_k": 0.0,
-    "top_p": 0.9,
-    "do_sample": True,
+    "do_sample": False,
 }
 tokenizer.padding_side = "left"
 

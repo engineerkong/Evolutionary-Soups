@@ -15,9 +15,9 @@ from torch.utils.data import DataLoader
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from peft import PeftModel
+
 from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import load_main_tokenizer, merge_lora_weight, \
+from scripts.utils.utils import build_dataset_summary_ppo, load_main_tokenizer, merge_lora_weight, \
     build_dataset_eval, build_dataset_summary_eval, build_dataset_news_summary_ppo, \
     build_dataset_beaver_eval, build_dataset_steer_eval, \
     get_clean_data, Instructions, Instructions_summary
@@ -27,7 +27,6 @@ tqdm.pandas()
 @dataclass
 class ScriptArguments:
     base_model_name: Optional[str] = field(default='meta-llama/Llama-2-7b-hf', metadata={'help': 'base LLaMA model path or HF id'})
-    sft_model_name: Optional[str] = field(default='./models/sft/model/', metadata={'help': 'SFT LoRA adapter path'})
     ppo_model_name: Optional[str] = field(default='./models/ppo/', metadata={'help':"the path to the ppo model"})
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     reward_names: Optional[str] = field(default='', metadata={"help": "comma-separated reward names; auto-selected from dataset_name if empty"})
@@ -91,7 +90,6 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     device_map=gpu_id,
 )
-model = PeftModel.from_pretrained(model, script_args.sft_model_name).merge_and_unload()
 model.resize_token_embeddings(len(tokenizer))
 model = merge_lora_weight(model, script_args.ppo_model_name)
 
@@ -99,8 +97,6 @@ model = merge_lora_weight(model, script_args.ppo_model_name)
 generation_kwargs = {
     "max_new_tokens": 128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48,
     "min_length": -1,
-    "top_k": 0.0,
-    "top_p": 0.9,
     "do_sample": False,
 }
 tokenizer.padding_side = "left"

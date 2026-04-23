@@ -65,7 +65,6 @@ def _build_mola_state_dict(expert_model_paths: List[str]) -> dict:
 
 def build_hoe_model(
     base_model_name: str,
-    sft_model_name: str,
     expert_model_paths: List[str],
     number_experts: List[int],
     top_k: List[int],
@@ -86,7 +85,7 @@ def build_hoe_model(
 
     Returns the model with model.dynamic_weights attached.
     """
-    from peft import LoraConfig, PeftModel as _StdPeft
+    from peft import LoraConfig
     from transformers import AutoConfig
     from src.mola_modeling_llama_hacked import LlamaForCausalLM_d
     from src.mola_mapping_hacked import MODEL_TYPE_TO_PEFT_MODEL_MAPPING
@@ -109,9 +108,6 @@ def build_hoe_model(
         torch_dtype=torch.bfloat16,
         device_map=device if device == 'cuda' else {'': device},
     )
-    base = _StdPeft.from_pretrained(base, sft_model_name)
-    base = base.merge_and_unload()
-
     # ---- 2. Create MoLA PeftModel (random-initialised expert weights) ----
     peft_config = LoraConfig.from_pretrained(expert_model_paths[0])
     # update_layer() only activates MoLA routing (creates self.router) when r is a list.

@@ -120,7 +120,7 @@ class Instructions_summary():
     def get_response(self, response):
         return response.split(self.response_split)[-1].strip()
 
-
+# Anthropic HH-RLHF dataset builders
 def build_dataset_sft(path, tokenizer, split='train', size=None):
     ds = load_dataset(path, split=split)
     if size is not None:
@@ -169,7 +169,35 @@ def build_dataset_ppo(path, tokenizer, rm_tokenizer=None, split='train', size=No
     ds_concat.set_format(type="torch")
     return ds_concat
 
+def build_dataset_eval(path, tokenizer, rm_tokenizers_list, split='test', size=None):
+    ds = load_dataset(path, split=split)
+    if size is not None:
+        ds = ds.select(range(size))
+    ds = ds.select(range(0, len(ds), 4))
 
+    rm_tokenizer1, rm_tokenizer2 = rm_tokenizers_list[:2]
+    def tokenize(sample):
+        sample['text'] = sample['chosen'] 
+        split_text = sample['text'].split('\n\nAssistant:')
+        sample['prompt'] = '\n\nAssistant:'.join(split_text[:-1]) + ' ' + '\n\nAssistant:'
+        sample['response'] = split_text[-1].strip()
+        sample["input_ids"] = tokenizer.encode(sample["prompt"])
+        sample["query"] = tokenizer.decode(sample["input_ids"])
+        sample["input_ids_rm1"] = rm_tokenizer1.encode(sample["prompt"])
+        sample["input_ids_rm2"] = rm_tokenizer2.encode(sample["prompt"])
+        return sample
+
+    ds_chosen = ds.map(tokenize, batched=False, num_proc=20)
+    ds_concat = ds_chosen
+    ds_concat = ds_concat.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8 \
+                                 and len(x["input_ids_rm1"]) <= 512 and len(x["input_ids_rm1"]) >= 8
+                                 and len(x["input_ids_rm2"]) <= 512 and len(x["input_ids_rm2"]) >= 8 )
+    ds_concat = ds_concat.remove_columns(['chosen', 'rejected','input_ids_rm1', 'input_ids_rm2', 'text', 'prompt', 'response', 'query'])
+    ds_concat.set_format(type="torch")
+    return ds_concat
+
+
+# openai summarize_from_feedback dataset builders
 def build_dataset_summary_sft(path, tokenizer, split='train', size=None):
     ds = load_dataset(path, 'comparisons')
     ds = ds[split]
@@ -196,6 +224,66 @@ def build_dataset_summary_sft(path, tokenizer, split='train', size=None):
     return ds
 
 
+def build_dataset_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
+    ds = load_dataset(path, 'comparisons')
+    ds = ds[split]
+    ds = ds.filter(lambda x: x["info"]['post'] is not None and 100 < len(x["info"]['post']) < 1200, batched=False, num_proc=30)
+
+    if size is not None:
+        ds = ds.select(range(size))
+
+    def tokenize(sample):
+        info_post = sample["info"]["post"].replace("\n", " ")
+        prompt_summary = Instructions_summary.prompt_input(info_post)
+        sample["prompt"] = prompt_summary
+        sample["input_ids"] = tokenizer.encode(sample["prompt"])
+        sample["query"] = tokenizer.decode(sample["input_ids"])
+        return sample
+
+    ds = ds.map(tokenize, batched=False,  num_proc=30) 
+    ds = ds.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8)
+    remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
+    ds = ds.remove_columns(remove_columns)
+    ds.set_format(type="torch")
+    return ds
+
+
+def build_dataset_summary_eval(path, tokenizer, rm_tokenizers, split='test', size=None):
+    if split == 'test':
+        split = 'validation'
+    ds = load_dataset(path, 'comparisons')
+    ds = ds[split]
+    ds = ds.filter(lambda x: x["info"]['post'] is not None and 100 < len(x["info"]['post']) < 1200, batched=False, num_proc=30)
+
+    # need to remove duplicated prompts for evaluation
+    def remove_duplicate(duplicated_dataset):
+        duplicated_dataset = duplicated_dataset.filter(lambda x: x['info']["id"] is not None)
+        initial_list = duplicated_dataset.map(lambda x: {"id": x['info']["id"]})
+        _ , unique_indices = np.unique(initial_list["id"], return_index=True, axis=0)
+        filtered_dataset = duplicated_dataset.select(unique_indices.tolist())
+        return filtered_dataset
+
+    ds = remove_duplicate(ds)
+    if size is not None:
+        ds = ds.select(range(size))
+
+    def tokenize(sample):
+        info_post = sample["info"]["post"].replace("\n", " ")
+        prompt_summary = Instructions_summary.prompt_input(info_post)
+        sample["prompt"] = prompt_summary
+        sample["input_ids"] = tokenizer.encode(prompt_summary)
+        sample["query"] = tokenizer.decode(sample["input_ids"])
+        return sample
+
+    ds = ds.map(tokenize, batched=False,  num_proc=30) 
+    ds = ds.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8)
+    remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
+    ds = ds.remove_columns(remove_columns)
+    ds.set_format(type="torch")
+    return ds
+
+
+# argilla news-summary dataset builders
 def build_dataset_news_summary_sft(path, tokenizer, split='train', size=None):
     """SFT dataset builder for argilla/news-summary (full prompt+summary pairs)."""
     ds = load_dataset(path, split=split)
@@ -236,30 +324,6 @@ def build_dataset_news_summary_sft(path, tokenizer, split='train', size=None):
     return ds
 
 
-def build_dataset_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
-    ds = load_dataset(path, 'comparisons')
-    ds = ds[split]
-    ds = ds.filter(lambda x: x["info"]['post'] is not None and 100 < len(x["info"]['post']) < 1200, batched=False, num_proc=30)
-
-    if size is not None:
-        ds = ds.select(range(size))
-
-    def tokenize(sample):
-        info_post = sample["info"]["post"].replace("\n", " ")
-        prompt_summary = Instructions_summary.prompt_input(info_post)
-        sample["prompt"] = prompt_summary
-        sample["input_ids"] = tokenizer.encode(sample["prompt"])
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        return sample
-
-    ds = ds.map(tokenize, batched=False,  num_proc=30) 
-    ds = ds.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8)
-    remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
-    ds = ds.remove_columns(remove_columns)
-    ds.set_format(type="torch")
-    return ds
-
-
 def build_dataset_news_summary_ppo(path, tokenizer, rm_tokenizer, split='train', size=None):
     """Dataset builder for argilla/news-summary (PPO / NSGA-II prompt-only format)."""
     ds = load_dataset(path, split=split)
@@ -283,69 +347,6 @@ def build_dataset_news_summary_ppo(path, tokenizer, rm_tokenizer, split='train',
     remove = [c for c in ds.column_names if c not in keep]
     ds = ds.remove_columns(remove)
     ds.set_format(type='torch')
-    return ds
-
-
-def build_dataset_eval(path, tokenizer, rm_tokenizers_list, split='test', size=None):
-    ds = load_dataset(path, split=split)
-    if size is not None:
-        ds = ds.select(range(size))
-    ds = ds.select(range(0, len(ds), 4))
-
-    rm_tokenizer1, rm_tokenizer2 = rm_tokenizers_list[:2]
-    def tokenize(sample):
-        sample['text'] = sample['chosen'] 
-        split_text = sample['text'].split('\n\nAssistant:')
-        sample['prompt'] = '\n\nAssistant:'.join(split_text[:-1]) + ' ' + '\n\nAssistant:'
-        sample['response'] = split_text[-1].strip()
-        sample["input_ids"] = tokenizer.encode(sample["prompt"])
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        sample["input_ids_rm1"] = rm_tokenizer1.encode(sample["prompt"])
-        sample["input_ids_rm2"] = rm_tokenizer2.encode(sample["prompt"])
-        return sample
-
-    ds_chosen = ds.map(tokenize, batched=False, num_proc=20)
-    ds_concat = ds_chosen
-    ds_concat = ds_concat.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8 \
-                                 and len(x["input_ids_rm1"]) <= 512 and len(x["input_ids_rm1"]) >= 8
-                                 and len(x["input_ids_rm2"]) <= 512 and len(x["input_ids_rm2"]) >= 8 )
-    ds_concat = ds_concat.remove_columns(['chosen', 'rejected','input_ids_rm1', 'input_ids_rm2', 'text', 'prompt', 'response', 'query'])
-    ds_concat.set_format(type="torch")
-    return ds_concat
-
-
-def build_dataset_summary_eval(path, tokenizer, rm_tokenizers, split='test', size=None):
-    if split == 'test':
-        split = 'validation'
-    ds = load_dataset(path, 'comparisons')
-    ds = ds[split]
-    ds = ds.filter(lambda x: x["info"]['post'] is not None and 100 < len(x["info"]['post']) < 1200, batched=False, num_proc=30)
-
-    # need to remove duplicated prompts for evaluation
-    def remove_duplicate(duplicated_dataset):
-        duplicated_dataset = duplicated_dataset.filter(lambda x: x['info']["id"] is not None)
-        initial_list = duplicated_dataset.map(lambda x: {"id": x['info']["id"]})
-        _ , unique_indices = np.unique(initial_list["id"], return_index=True, axis=0)
-        filtered_dataset = duplicated_dataset.select(unique_indices.tolist())
-        return filtered_dataset
-
-    ds = remove_duplicate(ds)
-    if size is not None:
-        ds = ds.select(range(size))
-
-    def tokenize(sample):
-        info_post = sample["info"]["post"].replace("\n", " ")
-        prompt_summary = Instructions_summary.prompt_input(info_post)
-        sample["prompt"] = prompt_summary
-        sample["input_ids"] = tokenizer.encode(prompt_summary)
-        sample["query"] = tokenizer.decode(sample["input_ids"])
-        return sample
-
-    ds = ds.map(tokenize, batched=False,  num_proc=30) 
-    ds = ds.filter(lambda x: len(x["input_ids"]) <= 512 and len(x["input_ids"]) >= 8)
-    remove_columns = ['info', 'summaries', 'choice', 'worker', 'batch', 'split', 'extra']
-    ds = ds.remove_columns(remove_columns)
-    ds.set_format(type="torch")
     return ds
 
 

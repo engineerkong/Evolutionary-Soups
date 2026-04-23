@@ -135,7 +135,6 @@ top_k = number_experts[:]
 
 model = build_hoe_model(
     base_model_name=script_args.base_model_name,
-    sft_model_name=script_args.sft_model_name,
     expert_model_paths=expert_paths,
     number_experts=number_experts,
     top_k=top_k,
@@ -320,7 +319,6 @@ for pref in preferences:
     rs_base = AutoModelForCausalLM.from_pretrained(
         script_args.base_model_name, torch_dtype=torch.bfloat16,
         device_map=f'cuda:{gpu_id}')
-    rs_base = PeftModel.from_pretrained(rs_base, script_args.sft_model_name).merge_and_unload()
     rs_model = get_peft_model(rs_base, peft_cfg_rs)
     set_peft_model_state_dict(rs_model, blended_sd)
     rs_model = rs_model.merge_and_unload()
