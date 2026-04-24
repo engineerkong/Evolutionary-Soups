@@ -1,6 +1,8 @@
 from transformers import AutoTokenizer
 import numpy as np
 import torch
+import os
+import time
 from .utils import load_reward_model, get_rewards
 
 
@@ -36,6 +38,19 @@ def _parse_urm(path: str):
         model_path, dim = body.rsplit('#', 1)
         return model_path, int(dim)
     return body, 0
+
+
+def _is_nemotron(path: str) -> bool:
+    return _actual_path(path).startswith('nemotron://')
+
+
+def _parse_nemotron(path: str):
+    """Return (model_path, dim_index) from 'nemotron://model_id#N'."""
+    body = path[len('nemotron://'):]
+    if '#' in body:
+        model_path, dim = body.rsplit('#', 1)
+        return model_path, int(dim)
+    return body, -1  # default: average all attributes
 
 
 def _sub_position(path: str) -> int:
@@ -149,7 +164,7 @@ class URMClient:
         self.model.eval()
 
     def score_batch(self, queries_responses: list, dim: int) -> list:
-        """Score (q, r) pairs; return float list for attribute dim on 0-4 scale."""
+        """Score (q, r) pairs; return float list for attribute dim."""
         results = []
         for q, r in queries_responses:
             messages = [{"role": "user", "content": q},
@@ -160,27 +175,123 @@ class URMClient:
             ).to(self.device)
 
             with torch.no_grad():
-                transformer_outputs = self.model.model(**inputs, return_dict=True)
-                hidden_states = transformer_outputs[0]
-                raw_logits  = self.model.score(hidden_states)
-                raw_weights = self.model.weights(hidden_states.to(torch.float16))
+                hidden_states = self.model.model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    return_dict=True,
+                )[0]  # [1, seq_len, 4096]
 
-                input_ids = inputs["input_ids"]
+                raw_logits = self.model.score(hidden_states)   # [1, seq_len, 10]
+
                 pad_id = self.model.config.pad_token_id
                 if pad_id is None:
                     seq_len = -1
                 else:
-                    eq = torch.eq(input_ids, pad_id).int().argmax(-1) - 1
-                    seq_len = (eq % input_ids.shape[-1]).to(raw_logits.device)
+                    seq_len = (
+                        torch.eq(inputs["input_ids"], pad_id).int().argmax(-1) - 1
+                    ) % inputs["input_ids"].shape[-1]
+                    seq_len = seq_len.to(raw_logits.device)
 
                 batch_idx     = torch.arange(1, device=raw_logits.device)
-                pooled_logits = raw_logits[batch_idx, seq_len]  # [1, hidden]
+                pooled_logits = raw_logits[batch_idx, seq_len]   # [1, 10]
 
-                per_attr   = pooled_logits.view(-1, 5, 2)
-                attr_means = per_attr[:, :, 0].squeeze(0)       # [5]
+                per_attr   = pooled_logits.view(-1, 5, 2)        # [1, 5, 2]
+                attr_means = per_attr[0, :, 0].float()           # [5]  mean per attribute
 
-            results.append(attr_means[dim].float().item())
+            results.append(attr_means[dim].item())
         return results
+
+
+# ---------------------------------------------------------------------------
+# Nemotron-70B-Reward via NVIDIA NIM API
+# nvidia/Llama-3.1-Nemotron-70B-Reward — too large for local GPU; called via API.
+# Outputs HelpSteer-aligned scores on 0-5 scale (helpfulness/correctness/
+# coherence/complexity/verbosity), same dimensions as URM.
+# Path format: 'nemotron://nvidia/Llama-3.1-Nemotron-70B-Reward#N'
+#   N in {0,1,2,3,4} → select specific attribute
+#   N < 0            → return average across all 5 attributes
+# Requires env var NVIDIA_API_KEY (or pass api_key to constructor).
+# ---------------------------------------------------------------------------
+
+NEMOTRON_ATTRIBUTES = ['helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
+
+_NEMOTRON_BASE_URL = 'https://integrate.api.nvidia.com/v1'
+_NEMOTRON_MAX_RETRIES = 5
+_NEMOTRON_RETRY_DELAY = 2.0  # seconds; doubles on each retry
+
+
+class NemotronAPIClient:
+    """Nemotron-70B-Reward reward model accessed via NVIDIA NIM API.
+
+    No local GPU memory required. API key read from NVIDIA_API_KEY env var.
+    """
+
+    def __init__(self, model_path: str, api_key: str = None, base_url: str = None):
+        self.model = model_path
+        self.api_key = api_key or os.environ.get('NVIDIA_API_KEY', '')
+        self.base_url = base_url or os.environ.get('NVIDIA_BASE_URL', _NEMOTRON_BASE_URL)
+        if not self.api_key:
+            raise ValueError(
+                'NVIDIA_API_KEY environment variable is not set. '
+                'Get a key at https://build.nvidia.com and export NVIDIA_API_KEY=<key>'
+            )
+        try:
+            from openai import OpenAI
+            self._client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        except ImportError:
+            self._client = None  # will use requests fallback
+
+    def score_batch(self, queries_responses: list, dim: int) -> list:
+        """Score (q, r) pairs; return float list for attribute dim (or mean if dim < 0)."""
+        return [self._score_one(q, r, dim) for q, r in queries_responses]
+
+    def _score_one(self, q: str, r: str, dim: int) -> float:
+        messages = [{'role': 'user', 'content': q}, {'role': 'assistant', 'content': r}]
+        delay = _NEMOTRON_RETRY_DELAY
+        for attempt in range(_NEMOTRON_MAX_RETRIES):
+            try:
+                content = self._call_api(messages)
+                return self._parse_reward(content, dim)
+            except Exception as e:
+                if attempt == _NEMOTRON_MAX_RETRIES - 1:
+                    raise
+                print(f'[NemotronAPIClient] attempt {attempt+1} failed: {e}; retrying in {delay}s')
+                time.sleep(delay)
+                delay *= 2
+
+    def _call_api(self, messages: list) -> str:
+        if self._client is not None:
+            resp = self._client.chat.completions.create(model=self.model, messages=messages)
+            return resp.choices[0].message.content
+        # requests fallback (no openai package)
+        import requests
+        resp = requests.post(
+            f'{self.base_url}/chat/completions',
+            headers={'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'},
+            json={'model': self.model, 'messages': messages},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json()['choices'][0]['message']['content']
+
+    def _parse_reward(self, content: str, dim: int) -> float:
+        """Parse 'helpfulness:4.5\\ncorrectness:3.0\\n...' response into a scalar."""
+        scores = {}
+        for line in content.strip().split('\n'):
+            if ':' in line:
+                key, _, val = line.partition(':')
+                try:
+                    scores[key.strip().lower()] = float(val.strip())
+                except ValueError:
+                    pass
+        if not scores:
+            raise ValueError(f'Could not parse Nemotron reward response: {content!r}')
+        if dim < 0:
+            return sum(scores.values()) / len(scores)
+        attr = NEMOTRON_ATTRIBUTES[dim]
+        if attr not in scores:
+            raise ValueError(f'Attribute "{attr}" not found in response: {scores}')
+        return scores[attr]
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +338,14 @@ class RewardModels():
                     print(f'Loading URM from {model_path}')
                     _model_cache[model_path] = URMClient(model_path, gpu_id_list[i])
                 self.reward_models.append(_model_cache[model_path])
-                self.rm_tokenizers.append(None)  # tokeniser is internal to URMClient
+                self.rm_tokenizers.append(None)
+            elif _is_nemotron(ap):
+                model_path, _ = _parse_nemotron(ap)
+                if model_path not in _model_cache:
+                    print(f'Using Nemotron API for {model_path}')
+                    _model_cache[model_path] = NemotronAPIClient(model_path)
+                self.reward_models.append(_model_cache[model_path])
+                self.rm_tokenizers.append(None)
             else:
                 tok_ap = _actual_path(self.rm_tokenizer_path_list[i])
                 if ap not in _model_cache:
@@ -237,13 +355,29 @@ class RewardModels():
                 self.reward_models.append(_model_cache[ap])
                 self.rm_tokenizers.append(_tokenizer_cache[tok_ap])
 
+    def to_device(self, device):
+        """Move all reward models to device. Safe for shared-model objectives (deduplicates)."""
+        seen_ids = set()
+        for model in self.reward_models:
+            obj_id = id(model)
+            if obj_id in seen_ids:
+                continue
+            seen_ids.add(obj_id)
+            if isinstance(model, (ArmoRMClient, URMClient)):
+                model.model = model.model.to(device)
+                model.device = device
+            elif isinstance(model, NemotronAPIClient):
+                pass  # API-based, no local model to move
+            elif model is not None:
+                model.to(device)
+
     def get_reward_model_scores(self, queries_responses, summary_fun=None, normalize_rewards=False, round_digits=None):
         texts_for_rewards = []
         for i in range(self.num_rewards):
             path = self.reward_model_path_list[i]
             ap = _actual_path(path)
 
-            if _is_armorm(ap) or _is_urm(ap):
+            if _is_armorm(ap) or _is_urm(ap) or _is_nemotron(ap):
                 texts_for_rewards.append(queries_responses)  # raw (q, r) pairs
                 continue
 
@@ -302,6 +436,14 @@ class RewardModels():
 
             if _is_urm(ap):
                 _, dim = _parse_urm(path)
+                temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
+                if round_digits is not None:
+                    temp_reward = [np.round(r, round_digits) for r in temp_reward]
+                rewards.append(temp_reward)
+                continue
+
+            if _is_nemotron(ap):
+                _, dim = _parse_nemotron(path)
                 temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
                 if round_digits is not None:
                     temp_reward = [np.round(r, round_digits) for r in temp_reward]

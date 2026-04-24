@@ -2,8 +2,8 @@
 
 # ---- PPO training ----
 learning_rate: 5.0e-6
-mini_batch_size: 2
-batch_size: 64
+mini_batch_size: 1
+batch_size: 16
 gradient_accumulation_steps: 8
 epochs: 1
 ppo_epochs: 3

@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 script_dir = Path(__file__).resolve().parent  # project/scripts/fine-tuning
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
+from scripts.utils.utils import load_config, Instructions, Instructions_steer, Instructions_summary, \
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo, \
     build_dataset_beaver_ppo, build_dataset_steer_ppo, \
     load_main_tokenizer, print_trainable_parameters
@@ -162,7 +162,7 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     instructions = Instructions()
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     dataset = build_dataset_steer_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
-    instructions = Instructions()
+    instructions = Instructions_steer(script_args.dataset_name)
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 train_dataset = dataset.shuffle()
@@ -259,6 +259,14 @@ for epoch in range(epochs):
             (instructions.get_input(text), instructions.get_response(text))
             for text in texts_merge
         ]
+        if global_step == 0 and accelerator.is_main_process:
+            q0, r0 = queries_responses[0]
+            print("\n" + "=" * 70)
+            print("Reward model input sample (global_step 0):")
+            print(f"  [QUERY]    {repr(q0)}")
+            print(f"  [RESPONSE] {repr(r0)}")
+            print("=" * 70 + "\n")
+
         if hasattr(instructions, 'get_post'):
             rewards = reward_model.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False)[0]
         else:

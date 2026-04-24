@@ -95,6 +95,29 @@ class Instructions:
         return response.split(Instructions.response_split)[-1].strip()
 
 
+class Instructions_steer:
+    """Instructions for nvidia/HelpSteer and HelpSteer2 with URM reward models.
+
+    URM applies its own chat template, so get_input() returns only the raw
+    question text — no '\n\nuser:'/ '\n\nHuman:' prefix, no '\n\nAssistant:' suffix.
+    """
+    response_split = "\n\nAssistant:"
+
+    def __init__(self, dataset_path: str = ''):
+        self.prefix = '\n\nuser: ' if 'HelpSteer2' in dataset_path else '\n\nHuman: '
+
+    def get_input(self, query):
+        before_response = self.response_split.join(query.split(self.response_split)[:-1])
+        # Use split rather than startswith so that any leading BOS/special tokens
+        # the tokenizer prepended (e.g. LLaMA-2's <s>) are automatically skipped.
+        if self.prefix in before_response:
+            before_response = before_response.split(self.prefix, 1)[1]
+        return before_response.strip()
+
+    def get_response(self, response):
+        return response.split(self.response_split)[-1].strip()
+
+
 class Instructions_summary():
     instruction_summary = "Generate a one-sentence summary of this post."
     response_split = "### Response:"

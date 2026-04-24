@@ -12,14 +12,15 @@ set -e
 export BNB_CUDA_VERSION=128   # force bitsandbytes to use CUDA 12.8 binary on CUDA 12.9 system
 
 base_model_name='meta-llama/Llama-2-7b-hf'
-sft_model_name='./models/sft/assistant_sft/model/'
-expert_model_paths='./models/ppo/assistant_ppo_harmless_2701/batch_832,./models/ppo/assistant_ppo_helpful_2701/batch_832'
-reward_names='harmless,helpful'
-exp_type='assistant'
-train_name='hoe_assistant_train'
-eval_name='hoe_assistant_eval'
+sft_model_name='./models/sft/sft_assistant_2701/model/'
+expert_model_paths='./models/ppo/ppo_assistant_harmless_2104/best_model,./models/ppo/ppo_assistant_helpful_2104/best_model,./models/ppo/ppo_assistant_humor_2104/best_model'
+dataset_name='Anthropic/hh-rlhf'
+reward_names='harmless,helpful,humor'
+num_pref_samples=21
+train_name='hoe_assistant_train_2304'
+eval_name='hoe_assistant_eval_2304'
 save_dir='./results/hoe/'
-checkpoint_path="${save_dir}${train_name}/epoch_0_final"
+checkpoint_path="${save_dir}${train_name}/model"
 
 mkdir -p ./logs
 
@@ -32,8 +33,8 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --base_model_name "${base_model_name}" \
     --sft_model_name "${sft_model_name}" \
     --expert_model_paths "${expert_model_paths}" \
+    --dataset_name "${dataset_name}" \
     --reward_names "${reward_names}" \
-    --exp_type "${exp_type}" \
     --save_directory "${save_dir}" \
     --wandb_name "${train_name}" \
     2>&1 | tee ./logs/${train_name}.log
@@ -44,11 +45,10 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --main_process_port 29702 \
     ./scripts/hoe/eval_hoe.py \
     --base_model_name "${base_model_name}" \
-    --sft_model_name "${sft_model_name}" \
     --expert_model_paths "${expert_model_paths}" \
     --checkpoint_path "${checkpoint_path}" \
+    --dataset_name "${dataset_name}" \
     --reward_names "${reward_names}" \
-    --exp_type "${exp_type}" \
     --save_directory "${save_dir}" \
     --wandb_name "${eval_name}" \
     2>&1 | tee ./logs/${eval_name}.log

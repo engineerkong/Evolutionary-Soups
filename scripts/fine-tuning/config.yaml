@@ -68,10 +68,10 @@ ppo_steer:
   batch_size: 64
   gradient_accumulation_steps: 4
   early_stopping: true
-  target: 6
+  target: 3
   max_grad_norm: 0.5
   optimize_cuda_cache: true
-  init_kl_coef: 0.1
+  init_kl_coef: 0.05
   adap_kl_ctrl: true
   tracker_project_name: "ppo-steer"
 

@@ -130,7 +130,7 @@ num_rewards = len(reward_names)
 if any(n not in REWARD_PATHS for n in reward_names):
     raise ValueError(f'Unknown reward name(s): {[n for n in reward_names if n not in REWARD_PATHS]}')
 reward_model_paths = [REWARD_PATHS[n] for n in reward_names]
-reward_models = RewardModels(reward_model_paths, reward_model_paths, gpu_id)
+reward_models = RewardModels(reward_model_paths, reward_model_paths, 'cpu')
 _first_non_armorm = next((p for p in reward_model_paths if not p.startswith('armorm://')), reward_model_paths[0])
 rm_tokenizer = AutoTokenizer.from_pretrained(_first_non_armorm)
 
@@ -189,6 +189,15 @@ else:
 print(f'Dataset size: {len(dataset)}')
 # numpy format avoids the pyarrow DLPack readonly-buffer error with torch>=2.8
 dataset = dataset.with_format("numpy")
+
+
+def _update_model_symlink(output_dir: str, ckpt: str):
+    """Keep output_dir/model pointing at the latest checkpoint (relative symlink)."""
+    symlink = os.path.join(output_dir, 'model')
+    target = os.path.basename(ckpt)
+    if os.path.islink(symlink):
+        os.remove(symlink)
+    os.symlink(target, symlink)
 
 
 def collator(data):
@@ -297,10 +306,12 @@ for epoch in range(epochs):
         queries_responses = [
             (instructions.get_input(t), instructions.get_response(t)) for t in texts_merge
         ]
-        if hasattr(instructions, 'get_post'):
-            rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False) # no normalization during training as well to keep reward scales consistent
-        else:
-            rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=False)
+        reward_models.to_device(f'cuda:{gpu_id}')
+        rewards_list = reward_models.get_reward_model_scores(
+            queries_responses, getattr(instructions, 'get_post', None), normalize_rewards=False
+        )
+        reward_models.to_device('cpu')
+        torch.cuda.empty_cache()
 
         # blend: blend_ratio * preference-weighted + (1-blend_ratio) * uniform
         rewards = []
@@ -351,9 +362,10 @@ for epoch in range(epochs):
         accelerator.wait_for_everyone()
         pbar.update(1)
 
-        if ppo_trainer.accelerator.is_main_process and i % 5 == 0 and i > 0:
+        if ppo_trainer.accelerator.is_main_process and i % 100 == 0 and i > 0:
             ckpt = os.path.join(output_dir, f'epoch_{epoch}_batch_{i}')
             ppo_trainer.save_pretrained(ckpt)
+            _update_model_symlink(output_dir, ckpt)
             print(f'Checkpoint saved to {ckpt}')
 
     pbar.close()
@@ -361,4 +373,5 @@ for epoch in range(epochs):
     if ppo_trainer.accelerator.is_main_process:
         ckpt = os.path.join(output_dir, f'epoch_{epoch}_final')
         ppo_trainer.save_pretrained(ckpt)
+        _update_model_symlink(output_dir, ckpt)
         print(f'Epoch {epoch} complete. Final checkpoint saved to {ckpt}')

@@ -123,7 +123,7 @@ num_rewards = len(reward_names)
 if any(n not in REWARD_PATHS for n in reward_names):
     raise ValueError(f'Unknown reward name(s): {[n for n in reward_names if n not in REWARD_PATHS]}')
 reward_model_paths = [REWARD_PATHS[n] for n in reward_names]
-reward_models = RewardModels(reward_model_paths, reward_model_paths, gpu_id)
+reward_models = RewardModels(reward_model_paths, reward_model_paths, 'cpu')
 
 # ========== build and load HoE model ==========
 expert_paths = _parse_paths(script_args.expert_model_paths)
@@ -239,10 +239,12 @@ for pref in preferences:
         (instructions.get_input(r), instructions.get_response(r)) for r in full_responses
     ]
 
-    if hasattr(instructions, 'get_post'):
-        rewards_list = reward_models.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False) # no normalization during eval
-    else:
-        rewards_list = reward_models.get_reward_model_scores(queries_responses, normalize_rewards=False)
+    reward_models.to_device(f'cuda:{gpu_id}')
+    rewards_list = reward_models.get_reward_model_scores(
+        queries_responses, getattr(instructions, 'get_post', None), normalize_rewards=False
+    )
+    reward_models.to_device('cpu')
+    torch.cuda.empty_cache()
 
     all_rewards = [accelerator.gather_for_metrics(rewards_list[i]) for i in range(num_rewards)]
     all_prompts = accelerator.gather_for_metrics(full_prompts)
@@ -322,7 +324,6 @@ for pref in preferences:
     rs_model = rs_model.merge_and_unload()
     rs_model.resize_token_embeddings(len(tokenizer))
     rs_model.eval()
-    rs_model = accelerator.prepare(rs_model)
 
     accelerator.wait_for_everyone()
     gc.collect()
@@ -331,18 +332,20 @@ for pref in preferences:
     rs_responses, rs_prompts = [], []
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
         for batch in tqdm(eval_dataloader, desc=f'RS pref={[round(p, 2) for p in pref]}'):
-            input_ids = batch['input_ids'].to(accelerator.device)
-            attention_mask = batch['attention_mask'].to(accelerator.device)
+            input_ids = batch['input_ids'].to(f'cuda:{gpu_id}')
+            attention_mask = batch['attention_mask'].to(f'cuda:{gpu_id}')
             rs_responses.extend(tokenizer.batch_decode(
-                accelerator.unwrap_model(rs_model).generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs)))
+                rs_model.generate(input_ids=input_ids, attention_mask=attention_mask, **generation_kwargs)))
             rs_prompts.extend(tokenizer.batch_decode(input_ids))
 
     rs_prompts, rs_responses = get_clean_data(rs_responses, rs_prompts)
     qr_rs = [(instructions.get_input(r), instructions.get_response(r)) for r in rs_responses]
-    if hasattr(instructions, 'get_post'):
-        rewards_rs = reward_models.get_reward_model_scores(qr_rs, instructions.get_post, normalize_rewards=False) # no normalization during eval
-    else:
-        rewards_rs = reward_models.get_reward_model_scores(qr_rs, normalize_rewards=False)
+    reward_models.to_device(f'cuda:{gpu_id}')
+    rewards_rs = reward_models.get_reward_model_scores(
+        qr_rs, getattr(instructions, 'get_post', None), normalize_rewards=False
+    )
+    reward_models.to_device('cpu')
+    torch.cuda.empty_cache()
 
     all_rewards_rs  = [accelerator.gather_for_metrics(rewards_rs[i]) for i in range(num_rewards)]
     all_rs_prompts  = accelerator.gather_for_metrics(rs_prompts)

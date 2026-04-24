@@ -38,7 +38,7 @@ class CustomLinearv0(nn.Linear):
         nn.init.constant_(self.weight, 0.0)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input.to(torch.float32))
+        return super().forward(input.to(self.weight.dtype))
 
 
 class CustomLinearv1(nn.Linear):
@@ -69,7 +69,7 @@ class CustomLinearv1(nn.Linear):
         seq_ratio = input.shape[0] // weights.shape[0]
         extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
         new_input = torch.cat([input, extra], dim=-1)
-        return super().forward(new_input.to(torch.float32))
+        return super().forward(new_input.to(self.weight.dtype))
 
 
 class CustomLinearv2(nn.Linear):
@@ -93,7 +93,7 @@ class CustomLinearv2(nn.Linear):
         seq_ratio = input.shape[0] // weights.shape[0]
         extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
         new_input = torch.cat([input, extra], dim=-1)
-        output = super().forward(new_input.to(torch.float32))
+        output = super().forward(new_input.to(self.weight.dtype))
         return torch.einsum('ln,ln->ln', output, extra)
 
 
@@ -131,7 +131,7 @@ class CustomLinearv3(nn.Module):
         assert input.shape[0] % weights.shape[0] == 0
         seq_ratio = input.shape[0] // weights.shape[0]
         extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
-        new_input = torch.cat([input, extra], dim=-1).to(torch.float32)
+        new_input = torch.cat([input, extra], dim=-1).to(self.linear1.weight.dtype)
 
         x0 = torch.relu(self.linear1(new_input))
         x0 = self.linear2(x0)
@@ -198,7 +198,7 @@ class ConditionedMOEModel:
                     new_layer = RouterClass(in_f, out_f, dynamic_weights, hidden_dim=hidden_dim)
                 else:
                     new_layer = RouterClass(in_f, out_f, dynamic_weights)
-                setattr(model, name, new_layer.to(module.weight.device))
+                setattr(model, name, new_layer.to(module.weight.device).to(module.weight.dtype))
             else:
                 cls._replace_routers(module, dynamic_weights, RouterClass, hidden_dim)
 
@@ -251,9 +251,6 @@ class ConditionedMOEModelWithValueHead(nn.Module):
         # preference-weighted value: V(s) = sum_k w_k * V_k(s)
         value = torch.einsum('bn,nbq->bq', weights.to(torch.float32), torch.stack(value_per_head))
 
-        if lm_logits.dtype != torch.float32:
-            lm_logits = lm_logits.float()
-
         return {'lm_logits': lm_logits, 'value': value}
 
     def generate(self, weights: torch.Tensor, *args, **kwargs):
@@ -305,31 +302,27 @@ class WeightSampler:
     """
 
     def __init__(self, reward_dim: int = 2, uniform_ratio: float = 0.0):
-        if reward_dim != 2:
-            raise NotImplementedError('WeightSampler only supports reward_dim=2')
         self.reward_dim = reward_dim
         self.uniform_ratio = uniform_ratio
         self.step = 0
 
-    def _bimodal_sample(self, n: int, beg: float = 0.0, end: float = 1.0,
-                        temperature: float = 0.001) -> np.ndarray:
-        # Gaussian vars computed for API parity with original but not used in sampling;
-        # the final sample is a sharp 0/1 bimodal mixed with uniform, matching the
-        # commented-out line in the original: samples = np.where(mix_prob < 0.5, 0.0, 1.0)
-        np.random.normal(0, np.sqrt(temperature), n)   # gaussian_0 (unused)
-        np.random.normal(1, np.sqrt(temperature), n)   # gaussian_1 (unused)
-        uniform = np.random.uniform(beg, end, n)
-        mix_prob = np.random.rand(n)
-        mix_prob2 = np.random.rand(n)
-        base = np.where(mix_prob < 0.5, 0.0, 1.0)
-        return np.where(mix_prob2 < self.uniform_ratio, uniform, base)
+    def _sample_corner(self, n: int) -> np.ndarray:
+        """Sample from vertices of the probability simplex (one-hot vectors)."""
+        indices = np.random.randint(0, self.reward_dim, size=n)
+        corners = np.zeros((n, self.reward_dim))
+        corners[np.arange(n), indices] = 1.0
+        return corners
+
+    def _sample_uniform_simplex(self, n: int) -> np.ndarray:
+        """Sample uniformly from the probability simplex via Dirichlet(1,...,1)."""
+        return np.random.dirichlet(np.ones(self.reward_dim), size=n)
 
     def generate_weights(self, n_samples: int):
-        weights = np.zeros((n_samples, self.reward_dim))
-        lam = np.round(self._bimodal_sample(n_samples, beg=0.0, end=1.0), 2)
-        weights[:, 0] = lam
-        weights[:, 1] = 1.0 - weights[:, 0]
-        weights = torch.tensor(weights)
+        is_uniform = np.random.rand(n_samples) < self.uniform_ratio
+        uniform_samples = self._sample_uniform_simplex(n_samples)
+        corner_samples = self._sample_corner(n_samples)
+        weights = np.where(is_uniform[:, None], uniform_samples, corner_samples)
+        weights = torch.tensor(weights, dtype=torch.float32)
         return [w for w in weights]
 
     def update(self):
