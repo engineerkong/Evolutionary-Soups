@@ -15,7 +15,8 @@ project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
     build_dataset_sft, build_dataset_summary_sft, build_dataset_news_summary_sft, \
-    build_dataset_beaver_sft, build_dataset_steer_sft, load_main_tokenizer
+    build_dataset_beaver_sft, build_dataset_steer_sft, build_dataset_ultrafeedback_sft, \
+    load_main_tokenizer
 tqdm.pandas()
 
 SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
@@ -98,6 +99,10 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     dataset = build_dataset_steer_sft(script_args.dataset_name, tokenizer, split='train')
+    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+elif script_args.dataset_name == 'openbmb/UltraFeedback':
+    dataset = build_dataset_ultrafeedback_sft(script_args.dataset_name, tokenizer, split='train')
     response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
     collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
 else:

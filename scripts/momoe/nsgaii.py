@@ -43,7 +43,7 @@ from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
-    build_dataset_beaver_ppo, build_dataset_steer_ppo,
+    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
     get_clean_data, load_main_tokenizer,
 )
 from nsgaii_architecture import GatingNetwork, MoEForCausalLM
@@ -867,11 +867,16 @@ elif script_args.dataset_name == 'argilla/news-summary':
         script_args.dataset_name, sft_tokenizer,
         reward_models.rm_tokenizers[0], split='test')
     instructions = Instructions_summary()
+elif script_args.dataset_name == 'openbmb/UltraFeedback':
+    dataset = build_dataset_ultrafeedback_ppo(
+        script_args.dataset_name, sft_tokenizer,
+        rm_tokenizer=reward_models.rm_tokenizers[0], split='train')
+    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
                      f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, '
                      f'argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, '
-                     f'nvidia/HelpSteer, nvidia/HelpSteer2')
+                     f'nvidia/HelpSteer, nvidia/HelpSteer2, openbmb/UltraFeedback')
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:     dataset     = dataset.remove_columns(key)

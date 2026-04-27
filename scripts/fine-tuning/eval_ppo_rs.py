@@ -21,7 +21,8 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, sample_preferences_uniform, \
     Instructions, Instructions_summary, build_dataset_eval, build_dataset_summary_eval, \
-    build_dataset_news_summary_ppo, build_dataset_beaver_eval, build_dataset_steer_eval
+    build_dataset_news_summary_ppo, build_dataset_beaver_eval, build_dataset_steer_eval, \
+    build_dataset_ultrafeedback_eval
 tqdm.pandas()
 
 
@@ -92,21 +93,26 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 # ========== load reward models ==========
 reward_names = [x.strip() for x in script_args.reward_names.split(',')]
 print('reward names:', reward_names)
+_ARMORM = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
 _URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
 reward_path_tokenizer_dict = {
-    'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
-    'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
-    'deberta':           'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'summary':           'Tristan/gpt2_reward_summarization',
-    'faithful':          'CogComp/bart-faithful-summary-detector',
-    'humor':             'mohameddhiab/humor-no-humor',
-    'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
-    'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness': f'{_URM}#0',
-    'steer_correctness': f'{_URM}#1',
-    'steer_coherence':   f'{_URM}#2',
-    'steer_complexity':  f'{_URM}#3',
-    'steer_verbosity':   f'{_URM}#4',
+    'harmless':                 'Ray2333/gpt2-large-harmless-reward_model',
+    'helpful':                  'Ray2333/gpt2-large-helpful-reward_model',
+    'deberta':                  'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'summary':                  'Tristan/gpt2_reward_summarization',
+    'faithful':                 'CogComp/bart-faithful-summary-detector',
+    'humor':                    'mohameddhiab/humor-no-humor',
+    'beaver_reward':            'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':              'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness':        f'{_URM}#0',
+    'steer_correctness':        f'{_URM}#1',
+    'steer_coherence':          f'{_URM}#2',
+    'steer_complexity':         f'{_URM}#3',
+    'steer_verbosity':          f'{_URM}#4',
+    'uf_instruction_following': f'{_ARMORM}#6',
+    'uf_truthfulness':          f'{_ARMORM}#7',
+    'uf_honesty':               f'{_ARMORM}#8',
+    'uf_helpfulness':           f'{_ARMORM}#9',
 }
 reward_model_path_list = []
 rm_tokenizer_path_list = []
@@ -145,6 +151,10 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     valid_dataset = build_dataset_steer_eval(
         script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+    instructions = Instructions()
+elif script_args.dataset_name == 'openbmb/UltraFeedback':
+    valid_dataset = build_dataset_ultrafeedback_eval(
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers)
     instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')

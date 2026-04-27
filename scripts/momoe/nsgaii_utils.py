@@ -23,11 +23,15 @@ REWARD_PATHS = {
     'humor':             'mohameddhiab/humor-no-humor',
     'beaver_reward':     'PKU-Alignment/beaver-7b-v1.0-reward',
     'beaver_cost':       'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness': 'urm://LxzGordon/URM-LLaMa-3.1-8B#0',
-    'steer_correctness': 'urm://LxzGordon/URM-LLaMa-3.1-8B#1',
-    'steer_coherence':   'urm://LxzGordon/URM-LLaMa-3.1-8B#2',
-    'steer_complexity':  'urm://LxzGordon/URM-LLaMa-3.1-8B#3',
-    'steer_verbosity':   'urm://LxzGordon/URM-LLaMa-3.1-8B#4',
+    'steer_helpfulness':        'urm://LxzGordon/URM-LLaMa-3.1-8B#0',
+    'steer_correctness':        'urm://LxzGordon/URM-LLaMa-3.1-8B#1',
+    'steer_coherence':          'urm://LxzGordon/URM-LLaMa-3.1-8B#2',
+    'steer_complexity':         'urm://LxzGordon/URM-LLaMa-3.1-8B#3',
+    'steer_verbosity':          'urm://LxzGordon/URM-LLaMa-3.1-8B#4',
+    'uf_instruction_following': 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#6',
+    'uf_truthfulness':          'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#7',
+    'uf_honesty':               'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#8',
+    'uf_helpfulness':           'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1#9',
 }
 
 

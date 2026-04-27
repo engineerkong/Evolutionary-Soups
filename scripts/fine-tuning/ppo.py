@@ -18,7 +18,7 @@ project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, Instructions, Instructions_steer, Instructions_summary, \
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo, \
-    build_dataset_beaver_ppo, build_dataset_steer_ppo, \
+    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo, \
     load_main_tokenizer, print_trainable_parameters
 from scripts.utils.multi_reward_models import RewardModels
 tqdm.pandas()
@@ -32,6 +32,7 @@ _PPO_CONFIG_KEY = {
     'PKU-Alignment/PKU-SafeRLHF-10K':        'ppo_beaver',
     'nvidia/HelpSteer':                      'ppo_steer',
     'nvidia/HelpSteer2':                     'ppo_steer2',
+    'openbmb/UltraFeedback':                 'ppo_ultrafeedback',
 }
 
 # ========== define script arguments ==========
@@ -70,9 +71,10 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 
 # ========== load reward model ==========
 reward_name = script_args.reward_name
-_URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
+_ARMORM   = 'armorm://RLHFlow/ArmoRM-Llama3-8B-v0.1'
+_URM      = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
 _NEMOTRON = 'nemotron://nvidia/llama-3.1-nemotron-70b-reward'
-_STEERLM = 'steerlm://nvidia/Llama2-13B-SteerLM-RM'
+_STEERLM  = 'steerlm://nvidia/Llama2-13B-SteerLM-RM'
 _REWARD_PATH_MAP = {
     'summary':                  'Tristan/gpt2_reward_summarization',
     'faithful':                 'CogComp/bart-faithful-summary-detector',
@@ -92,7 +94,11 @@ _REWARD_PATH_MAP = {
     'steerlm_correctness':      f'{_STEERLM}#5',
     'steerlm_coherence':        f'{_STEERLM}#6',
     'steerlm_complexity':       f'{_STEERLM}#7',
-    'steerlm_verbosity':        f'{_STEERLM}#8',
+    'steerlm_verbosity':          f'{_STEERLM}#8',
+    'uf_instruction_following':   f'{_ARMORM}#6',
+    'uf_truthfulness':            f'{_ARMORM}#7',
+    'uf_honesty':                 f'{_ARMORM}#8',
+    'uf_helpfulness':             f'{_ARMORM}#9',
 }
 if reward_name not in _REWARD_PATH_MAP:
     raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
@@ -181,6 +187,9 @@ elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
         # HelpSteer2 prompts use "\n\nuser:" — flag for substitution at reward time.
         instructions = Instructions()
         _normalise_query_for_rm = True
+elif script_args.dataset_name == 'openbmb/UltraFeedback':
+    dataset = build_dataset_ultrafeedback_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
+    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 train_dataset = dataset.shuffle()

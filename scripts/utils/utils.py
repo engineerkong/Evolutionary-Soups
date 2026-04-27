@@ -678,6 +678,103 @@ def build_dataset_steer_eval(path, tokenizer, rm_tokenizers_list, split='test', 
     return ds
 
 
+# ---------------------------------------------------------------------------
+# UltraFeedback (openbmb/UltraFeedback) dataset builders
+# Prompt format: \n\nHuman: {instruction} \n\nAssistant:
+# SFT picks the highest-rated completion; PPO uses instructions as prompts.
+# ---------------------------------------------------------------------------
+
+def _uf_best_response(sample) -> str:
+    """Return the completion with the highest sum of annotation ratings."""
+    best_resp, best_score = '', -999
+    for comp in sample.get('completions', []):
+        resp = (comp.get('response') or '').strip()
+        if not resp:
+            continue
+        ann = comp.get('annotations') or {}
+        score = 0
+        for dim in ('instruction_following', 'truthfulness', 'honesty', 'helpfulness'):
+            val = ann.get(dim)
+            if isinstance(val, dict):
+                r = val.get('Rating') or val.get('rating')
+                try:
+                    score += float(r)
+                except (TypeError, ValueError):
+                    pass
+        if not best_resp or score > best_score:
+            best_score, best_resp = score, resp
+    return best_resp
+
+
+def build_dataset_ultrafeedback_sft(path, tokenizer, split='train', size=None):
+    """SFT dataset for openbmb/UltraFeedback (uses highest-rated completion)."""
+    ds = load_dataset(path, split='train')
+    if split == 'test':
+        step = max(1, len(ds) // 2000)
+        ds = ds.select(range(0, len(ds), step))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        resp = _uf_best_response(sample)
+        text = '\n\nHuman: ' + sample['instruction'].strip() + ' \n\nAssistant: ' + resp
+        sample['text'] = text
+        sample['input_ids'] = tokenizer.encode(text) + [tokenizer.eos_token_id]
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    keep = {'input_ids', 'query', 'text'}
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_ultrafeedback_ppo(path, tokenizer, rm_tokenizer=None, split='train', size=None):
+    """PPO/NSGA-II prompt-only dataset for openbmb/UltraFeedback."""
+    ds = load_dataset(path, split='train')
+    if split == 'test':
+        step = max(1, len(ds) // 2000)
+        ds = ds.select(range(0, len(ds), step))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        prompt = '\n\nHuman: ' + sample['instruction'].strip() + ' \n\nAssistant: '
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    ds = ds.map(tokenize, batched=False, num_proc=30)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    keep = {'input_ids', 'query'}
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+    ds.set_format(type='torch')
+    return ds
+
+
+def build_dataset_ultrafeedback_eval(path, tokenizer, rm_tokenizers_list=None, split='test', size=None):
+    """Eval dataset for openbmb/UltraFeedback (caps at 2000 prompts from train)."""
+    ds = load_dataset(path, split='train')
+    ds = ds.select(range(min(2000, len(ds))))
+    if size is not None:
+        ds = ds.select(range(min(size, len(ds))))
+
+    def tokenize(sample):
+        prompt = '\n\nHuman: ' + sample['instruction'].strip() + ' \n\nAssistant: '
+        sample['input_ids'] = tokenizer.encode(prompt)
+        sample['query'] = tokenizer.decode(sample['input_ids'])
+        return sample
+
+    ds = ds.map(tokenize, batched=False, num_proc=20)
+    ds = ds.filter(lambda x: 8 <= len(x['input_ids']) <= 512)
+    keep = {'input_ids', 'query'}
+    ds = ds.remove_columns([c for c in ds.column_names if c not in keep])
+    ds.set_format(type='torch')
+    return ds
+
+
 def get_clean_data(full_responses, full_prompts, remove_bad=False):
     full_prompts_clean = []
     full_responses_clean = []

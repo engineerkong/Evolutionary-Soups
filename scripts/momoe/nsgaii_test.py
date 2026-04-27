@@ -45,9 +45,9 @@ from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
-    build_dataset_beaver_ppo, build_dataset_steer_ppo,
+    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
     build_dataset_eval, build_dataset_summary_eval,
-    build_dataset_beaver_eval, build_dataset_steer_eval,
+    build_dataset_beaver_eval, build_dataset_steer_eval, build_dataset_ultrafeedback_eval,
     get_clean_data, load_main_tokenizer,
 )
 from nsgaii_architecture import GatingNetwork, MoEForCausalLM
@@ -269,6 +269,11 @@ if args.use_train_split:
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
+    elif args.dataset_name == 'openbmb/UltraFeedback':
+        ds = build_dataset_ultrafeedback_ppo(
+            args.dataset_name, tokenizer,
+            rm_tokenizer=reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
 else:
@@ -297,6 +302,11 @@ else:
         ds = build_dataset_steer_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
+        instructions = Instructions()
+    elif args.dataset_name == 'openbmb/UltraFeedback':
+        ds = build_dataset_ultrafeedback_eval(
+            args.dataset_name, tokenizer,
+            reward_models.rm_tokenizers, size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')

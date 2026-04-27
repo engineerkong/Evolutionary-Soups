@@ -61,6 +61,20 @@ ppo_beaver:
   adap_kl_ctrl: false
   tracker_project_name: "ppo-beaver"
 
+ppo_ultrafeedback:
+  epochs: 4
+  learning_rate: 5e-6
+  mini_batch_size: 8
+  batch_size: 64
+  gradient_accumulation_steps: 8
+  early_stopping: false
+  target: 3
+  max_grad_norm: 0.5
+  optimize_cuda_cache: true
+  init_kl_coef: 0.05
+  adap_kl_ctrl: true
+  tracker_project_name: "ppo-ultrafeedback"
+
 ppo_steer:
   epochs: 5
   learning_rate: 2e-5
