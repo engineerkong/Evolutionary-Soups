@@ -63,29 +63,44 @@ ppo_beaver:
 
 ppo_steer:
   epochs: 5
-  learning_rate: 1e-5
+  learning_rate: 2e-5
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 4
   early_stopping: true
-  target: 3
+  target: 9
   max_grad_norm: 0.5
   optimize_cuda_cache: true
   init_kl_coef: 0.05
   adap_kl_ctrl: true
   tracker_project_name: "ppo-steer"
 
-# unused configs
-ppo_news_summary:
+ppo_steer2:
   epochs: 5
-  learning_rate: 1e-6
+  learning_rate: 2e-5
   mini_batch_size: 8
   batch_size: 64
   gradient_accumulation_steps: 8
   early_stopping: true
-  target: 3
-  max_grad_norm: 0.1
+  target: 6
+  max_grad_norm: 0.5
   optimize_cuda_cache: true
-  init_kl_coef: 0.2
+  init_kl_coef: 0.1
   adap_kl_ctrl: true
-  tracker_project_name: "ppo-news-summary"
+  tracker_project_name: "ppo-steer2"
+
+# unused configs
+
+# ppo_news_summary:
+#   epochs: 5
+#   learning_rate: 1e-6
+#   mini_batch_size: 8
+#   batch_size: 64
+#   gradient_accumulation_steps: 8
+#   early_stopping: true
+#   target: 3
+#   max_grad_norm: 0.1
+#   optimize_cuda_cache: true
+#   init_kl_coef: 0.2
+#   adap_kl_ctrl: true
+#   tracker_project_name: "ppo-news-summary"

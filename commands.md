@@ -13,7 +13,9 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_sft.py --s
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_assistant/model/' --dataset_name 'Anthropic/hh-rlhf' --reward_name 'harmless' --wandb_name 'ppo_assistant_harmless' 2>&1 | tee ./logs/ppo/ppo_assistant_harmless.log
 
 # PPO OBJECTIVE-SPECIFIC EVALUATION (--main_process_port 29601)
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --sft_model_name './models/sft/sft_assistant/model/' --ppo_model_name './models/ppo/ppo_assistant_harmless/batch_832/' --dataset_name 'Anthropic/hh-rlhf' --reward_names 'harmless,helpful,humor' --wandb_name 'ppo_assistant_harmless_eval' 2>&1 | tee ./logs/ppo/ppo_assistant_harmless_eval.log
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_single.py --ppo_model_name './models/ppo/ppo_assistant_harmless/batch_832/' --dataset_name 'Anthropic/hh-rlhf' --reward_names 'harmless,helpful,humor' --wandb_name 'ppo_assistant_harmless_eval' 2>&1 | tee ./logs/ppo/ppo_assistant_harmless_eval.log
+CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29607 ./scripts/fine-tuning/eval_ppo_single.py --ppo_model_name './models/ppo/ppo_steer2_helpfulness_2504/best_model' --dataset_name 'nvidia/HelpSteer2' --reward_names 'steer_helpfulness,steer_correctness,steer_coherence,steer_complexity,steer_verbosity' --wandb_name 'ppo_steer2_helpfulness_eval_2504' 2>&1 | t
+ee ./logs/ppo/ppo_steer2_helpfulness_eval_2504.log
 
 # PPO REWARDED-SOUPS EVALUATION (--main_process_port 29601)
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch ./scripts/fine-tuning/eval_ppo_rs.py --sft_model_name './models/sft/sft_summary_3001/model/' --expert_model_paths './models/ppo/ppo_summary_summary_2104/best_model/' './models/ppo/ppo_summary_faithful_2104/best_model/' './models/ppo/ppo_summary_deberta_2104/best_model/' --num_pref_samples 66 --reward_names 'summary,faithful,deberta' --dataset_name 'openai/summarize_from_feedback' --wandb_name 'ppo_summary_rs_2204' 2>&1 | tee ./logs/ppo/ppo_summary_rs_2204.log

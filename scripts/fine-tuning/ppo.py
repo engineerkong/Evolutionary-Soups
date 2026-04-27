@@ -31,7 +31,7 @@ _PPO_CONFIG_KEY = {
     'argilla/news-summary':                  'ppo_news_summary',
     'PKU-Alignment/PKU-SafeRLHF-10K':        'ppo_beaver',
     'nvidia/HelpSteer':                      'ppo_steer',
-    'nvidia/HelpSteer2':                     'ppo_steer',
+    'nvidia/HelpSteer2':                     'ppo_steer2',
 }
 
 # ========== define script arguments ==========
@@ -71,20 +71,28 @@ print('process: {}, model gpu id: {}'.format(process_id, gpu_id))
 # ========== load reward model ==========
 reward_name = script_args.reward_name
 _URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
+_NEMOTRON = 'nemotron://nvidia/llama-3.1-nemotron-70b-reward'
+_STEERLM = 'steerlm://nvidia/Llama2-13B-SteerLM-RM'
 _REWARD_PATH_MAP = {
-    'summary':             'Tristan/gpt2_reward_summarization',
-    'faithful':            'CogComp/bart-faithful-summary-detector',
-    'helpful':             'Ray2333/gpt2-large-helpful-reward_model',
-    'harmless':            'Ray2333/gpt2-large-harmless-reward_model',
-    'deberta':             'OpenAssistant/reward-model-deberta-v3-large-v2',
-    'humor':               'mohameddhiab/humor-no-humor',
-    'beaver_reward':       'PKU-Alignment/beaver-7b-v1.0-reward',
-    'beaver_cost':         'PKU-Alignment/beaver-7b-v1.0-cost',
-    'steer_helpfulness':   f'{_URM}#0',
-    'steer_correctness':   f'{_URM}#1',
-    'steer_coherence':     f'{_URM}#2',
-    'steer_complexity':    f'{_URM}#3',
-    'steer_verbosity':     f'{_URM}#4',
+    'summary':                  'Tristan/gpt2_reward_summarization',
+    'faithful':                 'CogComp/bart-faithful-summary-detector',
+    'helpful':                  'Ray2333/gpt2-large-helpful-reward_model',
+    'harmless':                 'Ray2333/gpt2-large-harmless-reward_model',
+    'deberta':                  'OpenAssistant/reward-model-deberta-v3-large-v2',
+    'humor':                    'mohameddhiab/humor-no-humor',
+    'beaver_reward':            'PKU-Alignment/beaver-7b-v1.0-reward',
+    'beaver_cost':              'PKU-Alignment/beaver-7b-v1.0-cost',
+    'steer_helpfulness':        f'{_URM}#0',
+    'steer_correctness':        f'{_URM}#1',
+    'steer_coherence':          f'{_URM}#2',
+    'steer_complexity':         f'{_URM}#3',
+    'steer_verbosity':          f'{_URM}#4',
+    'nemotron':                 _NEMOTRON,
+    'steerlm_helpfulness':      f'{_STEERLM}#4',
+    'steerlm_correctness':      f'{_STEERLM}#5',
+    'steerlm_coherence':        f'{_STEERLM}#6',
+    'steerlm_complexity':       f'{_STEERLM}#7',
+    'steerlm_verbosity':        f'{_STEERLM}#8',
 }
 if reward_name not in _REWARD_PATH_MAP:
     raise NotImplementedError(f'Unknown reward name: {reward_name!r}')
@@ -147,6 +155,7 @@ print_trainable_parameters(model)
 model.pretrained_model.resize_token_embeddings(len(tokenizer))
 
 # ========== prepare dataset and dataloader ==========
+_normalise_query_for_rm = False  # overridden below for HelpSteer2 + gpt2 rewards
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
     instructions = Instructions()
@@ -162,7 +171,16 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     instructions = Instructions()
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     dataset = build_dataset_steer_ppo(script_args.dataset_name, tokenizer, rm_tokenizer, split='train')
-    instructions = Instructions_steer(script_args.dataset_name)
+    _steer_reward = reward_name.startswith('steer') or reward_name.startswith('steerlm')
+    if _steer_reward:
+        # URM/SteerLM apply their own chat template and expect raw (q, r).
+        instructions = Instructions_steer(script_args.dataset_name)
+        _normalise_query_for_rm = False
+    else:
+        # gpt2-based rewards were trained on "\n\nHuman:…\n\nAssistant:" format.
+        # HelpSteer2 prompts use "\n\nuser:" — flag for substitution at reward time.
+        instructions = Instructions()
+        _normalise_query_for_rm = True
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
 train_dataset = dataset.shuffle()
@@ -206,6 +224,7 @@ best_score = float('-inf')
 best_score_label = None
 _ROLLING_WINDOW = 10  # rolling mean window for best-model tracking
 recent_scores = []
+
 
 global_step = 0
 for epoch in range(epochs):
@@ -255,9 +274,11 @@ for epoch in range(epochs):
 
         # compute rewards
         texts_merge = [q + r for q, r in zip(batch['query'], batch['response'])]
+        _rm_texts = [t.replace('\n\nuser: ', '\n\nHuman: ') for t in texts_merge] \
+                    if _normalise_query_for_rm else texts_merge
         queries_responses = [
             (instructions.get_input(text), instructions.get_response(text))
-            for text in texts_merge
+            for text in _rm_texts
         ]
         if global_step == 0 and accelerator.is_main_process:
             q0, r0 = queries_responses[0]
@@ -271,8 +292,9 @@ for epoch in range(epochs):
             rewards = reward_model.get_reward_model_scores(queries_responses, instructions.get_post, normalize_rewards=False)[0]
         else:
             rewards = reward_model.get_reward_model_scores(queries_responses, normalize_rewards=False)[0]
+        batch_mean = float(np.mean(rewards))
+        batch_std  = float(np.std(rewards))
         rewards_tensor = [torch.tensor(r).to(gpu_id) for r in rewards]
-        batch_mean = torch.mean(torch.tensor(rewards)).item()
         print("epoch {}, batch {}, global_step {}: mean score: {:.4f}".format(epoch, i, global_step, batch_mean))
         recent_scores.append(batch_mean)
         if len(recent_scores) > _ROLLING_WINDOW:
@@ -299,7 +321,7 @@ for epoch in range(epochs):
         stats = ppo_trainer.step(query_tensors, response_tensors, rewards_tensor)
 
         # print stats after PPO step
-        print(f"  Raw reward: mean={np.mean(rewards):.3f}, std={np.std(rewards):.3f}")
+        print(f"  Raw reward: mean={batch_mean:.3f}, std={batch_std:.3f}")
         print(f"  KL: {stats['objective/kl']:.4f}")
         print(f"  Policy loss: {stats.get('ppo/loss/policy', 'N/A')}")
         print(f"  Value loss: {stats.get('ppo/loss/value', 'N/A')}")
@@ -335,8 +357,8 @@ for epoch in range(epochs):
         all_policy_kl = accelerator.gather_for_metrics(policy_kl)
 
         if ppo_trainer.accelerator.is_main_process:
-            mean_scores.append(torch.mean(torch.tensor(rewards)).item())
-            std_scores.append(torch.std(torch.tensor(rewards)).item())
+            mean_scores.append(batch_mean)
+            std_scores.append(batch_std)
 
             # save plot
             save_path = os.path.join(script_args.save_directory, script_args.wandb_name, 'scores.png')

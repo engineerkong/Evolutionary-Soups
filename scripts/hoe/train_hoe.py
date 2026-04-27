@@ -66,6 +66,7 @@ from scripts.utils.utils import (
 )
 
 _URM = 'urm://LxzGordon/URM-LLaMa-3.1-8B'
+_NEMOTRON = 'nemotron://nvidia/llama-3.1-nemotron-70b-reward'
 REWARD_PATHS = {
     'harmless':          'Ray2333/gpt2-large-harmless-reward_model',
     'helpful':           'Ray2333/gpt2-large-helpful-reward_model',
@@ -80,6 +81,7 @@ REWARD_PATHS = {
     'steer_coherence':   f'{_URM}#2',
     'steer_complexity':  f'{_URM}#3',
     'steer_verbosity':   f'{_URM}#4',
+    'nemotron':          _NEMOTRON,
 }
 
 _DEFAULT_REWARD_NAMES = {

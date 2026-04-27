@@ -49,6 +49,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --checkpoint_path "${checkpoint_path}" \
     --dataset_name "${dataset_name}" \
     --reward_names "${reward_names}" \
+    --num_pref_samples "${num_pref_samples}" \
     --save_directory "${save_dir}" \
     --wandb_name "${eval_name}" \
     2>&1 | tee ./logs/${eval_name}.log

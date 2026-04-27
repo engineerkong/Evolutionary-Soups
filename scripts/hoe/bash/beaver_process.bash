@@ -16,7 +16,7 @@ sft_model_name='./models/sft/sft_beaver_2004/model/'
 expert_model_paths='./models/ppo/ppo_beaver_reward_2204/best_model,./models/ppo/ppo_beaver_cost_2204/best_model'
 dataset_name='PKU-Alignment/PKU-SafeRLHF-10K'
 reward_names='beaver_reward,beaver_cost'
-num_pref_samples=21
+num_pref_samples=11
 train_name='hoe_beaver_train_2304'
 eval_name='hoe_beaver_eval_2304'
 save_dir='./results/hoe/'
@@ -49,6 +49,7 @@ CUDA_VISIBLE_DEVICES=4,5 accelerate launch \
     --checkpoint_path "${checkpoint_path}" \
     --dataset_name "${dataset_name}" \
     --reward_names "${reward_names}" \
+    --num_pref_samples "${num_pref_samples}" \
     --save_directory "${save_dir}" \
     --wandb_name "${eval_name}" \
     2>&1 | tee ./logs/${eval_name}.log

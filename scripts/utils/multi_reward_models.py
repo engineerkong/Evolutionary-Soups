@@ -53,6 +53,19 @@ def _parse_nemotron(path: str):
     return body, -1  # default: average all attributes
 
 
+def _is_steerlm(path: str) -> bool:
+    return _actual_path(path).startswith('steerlm://')
+
+
+def _parse_steerlm(path: str):
+    """Return (model_path, dim_index) from 'steerlm://model_id#N'."""
+    body = path[len('steerlm://'):]
+    if '#' in body:
+        model_path, dim = body.rsplit('#', 1)
+        return model_path, int(dim)
+    return body, 4  # default: helpfulness (index 4)
+
+
 def _sub_position(path: str) -> int:
     """Return sub_position: -100 for beaver, int(N) for #N suffix, 0 otherwise."""
     if 'beaver' in _actual_path(path):
@@ -183,23 +196,71 @@ class URMClient:
 
                 raw_logits = self.model.score(hidden_states)   # [1, seq_len, 10]
 
-                pad_id = self.model.config.pad_token_id
-                if pad_id is None:
-                    seq_len = -1
-                else:
-                    seq_len = (
-                        torch.eq(inputs["input_ids"], pad_id).int().argmax(-1) - 1
-                    ) % inputs["input_ids"].shape[-1]
-                    seq_len = seq_len.to(raw_logits.device)
-
-                batch_idx     = torch.arange(1, device=raw_logits.device)
-                pooled_logits = raw_logits[batch_idx, seq_len]   # [1, 10]
+                # Always pool from the last token. Llama 3.1 chat template inserts
+                # <|eot_id|> after BOTH user and assistant turns, so using argmax on
+                # pad_token_id (which equals <|eot_id|>) would find the end of the
+                # USER turn, making the score blind to the assistant response.
+                pooled_logits = raw_logits[:, -1, :]             # [1, 10]
 
                 per_attr   = pooled_logits.view(-1, 5, 2)        # [1, 5, 2]
                 attr_means = per_attr[0, :, 0].float()           # [5]  mean per attribute
 
             results.append(attr_means[dim].item())
         return results
+
+
+# ---------------------------------------------------------------------------
+# SteerLM-RM local multi-attribute reward model
+# nvidia/Llama2-13B-SteerLM-RM — linear regression head on the last token's
+# hidden state, outputting 9 scalar scores on a 0-4 scale.
+# Path format: 'steerlm://nvidia/Llama2-13B-SteerLM-RM#N'
+#   N → attribute index (see STEERLM_ATTRIBUTES)
+#   HelpSteer2 dims: 4=helpfulness, 5=correctness, 6=coherence, 7=complexity, 8=verbosity
+# ---------------------------------------------------------------------------
+
+STEERLM_ATTRIBUTES = [
+    'quality', 'toxicity', 'humor', 'creativity',
+    'helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity',
+]
+
+
+class SteerLMRMClient:
+    """nvidia/Llama2-13B-SteerLM-RM multi-attribute reward model.
+
+    Loaded once per unique model path; shared across heads that differ only in dim.
+    Input: (question, answer) pairs. Output: float score for attribute dim on 0-4 scale.
+    """
+
+    def __init__(self, model_path: str, device):
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+        self.device = device
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            device_map=device,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+        self.model.eval()
+
+    def score_batch(self, queries_responses: list, dim: int) -> list:
+        """Score (q, r) pairs; return float list for attribute dim (0-4 scale)."""
+        results = []
+        for q, r in queries_responses:
+            text = self._format(q, r)
+            inputs = self.tokenizer(
+                text, return_tensors='pt', truncation=True, max_length=4096,
+            ).to(self.device)
+            with torch.no_grad():
+                logits = self.model(**inputs).logits  # [1, 9]
+            results.append(logits[0, dim].item())
+        return results
+
+    def _format(self, q: str, r: str) -> str:
+        if self.tokenizer.chat_template:
+            messages = [{'role': 'user', 'content': q}, {'role': 'assistant', 'content': r}]
+            return self.tokenizer.apply_chat_template(messages, tokenize=False)
+        return f'User: {q}\n\nAssistant: {r}'
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +273,6 @@ class URMClient:
 #   N < 0            → return average across all 5 attributes
 # Requires env var NVIDIA_API_KEY (or pass api_key to constructor).
 # ---------------------------------------------------------------------------
-
-NEMOTRON_ATTRIBUTES = ['helpfulness', 'correctness', 'coherence', 'complexity', 'verbosity']
 
 _NEMOTRON_BASE_URL = 'https://integrate.api.nvidia.com/v1'
 _NEMOTRON_MAX_RETRIES = 5
@@ -275,23 +334,11 @@ class NemotronAPIClient:
         return resp.json()['choices'][0]['message']['content']
 
     def _parse_reward(self, content: str, dim: int) -> float:
-        """Parse 'helpfulness:4.5\\ncorrectness:3.0\\n...' response into a scalar."""
-        scores = {}
-        for line in content.strip().split('\n'):
-            if ':' in line:
-                key, _, val = line.partition(':')
-                try:
-                    scores[key.strip().lower()] = float(val.strip())
-                except ValueError:
-                    pass
-        if not scores:
-            raise ValueError(f'Could not parse Nemotron reward response: {content!r}')
-        if dim < 0:
-            return sum(scores.values()) / len(scores)
-        attr = NEMOTRON_ATTRIBUTES[dim]
-        if attr not in scores:
-            raise ValueError(f'Attribute "{attr}" not found in response: {scores}')
-        return scores[attr]
+        """Parse Nemotron API response — a single float string e.g. '-3.28125'."""
+        try:
+            return float(content.strip())
+        except ValueError:
+            raise ValueError(f'Could not parse Nemotron reward response as float: {content!r}')
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +393,13 @@ class RewardModels():
                     _model_cache[model_path] = NemotronAPIClient(model_path)
                 self.reward_models.append(_model_cache[model_path])
                 self.rm_tokenizers.append(None)
+            elif _is_steerlm(ap):
+                model_path, _ = _parse_steerlm(ap)
+                if model_path not in _model_cache:
+                    print(f'Loading SteerLM-RM from {model_path}')
+                    _model_cache[model_path] = SteerLMRMClient(model_path, gpu_id_list[i])
+                self.reward_models.append(_model_cache[model_path])
+                self.rm_tokenizers.append(None)
             else:
                 tok_ap = _actual_path(self.rm_tokenizer_path_list[i])
                 if ap not in _model_cache:
@@ -363,7 +417,7 @@ class RewardModels():
             if obj_id in seen_ids:
                 continue
             seen_ids.add(obj_id)
-            if isinstance(model, (ArmoRMClient, URMClient)):
+            if isinstance(model, (ArmoRMClient, URMClient, SteerLMRMClient)):
                 model.model = model.model.to(device)
                 model.device = device
             elif isinstance(model, NemotronAPIClient):
@@ -377,7 +431,7 @@ class RewardModels():
             path = self.reward_model_path_list[i]
             ap = _actual_path(path)
 
-            if _is_armorm(ap) or _is_urm(ap) or _is_nemotron(ap):
+            if _is_armorm(ap) or _is_urm(ap) or _is_nemotron(ap) or _is_steerlm(ap):
                 texts_for_rewards.append(queries_responses)  # raw (q, r) pairs
                 continue
 
@@ -444,6 +498,14 @@ class RewardModels():
 
             if _is_nemotron(ap):
                 _, dim = _parse_nemotron(path)
+                temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
+                if round_digits is not None:
+                    temp_reward = [np.round(r, round_digits) for r in temp_reward]
+                rewards.append(temp_reward)
+                continue
+
+            if _is_steerlm(ap):
+                _, dim = _parse_steerlm(path)
                 temp_reward = self.reward_models[i].score_batch(texts_for_rewards[i], dim)
                 if round_digits is not None:
                     temp_reward = [np.round(r, round_digits) for r in temp_reward]
