@@ -84,7 +84,7 @@ class Args:
 class FixedGating(torch.nn.Module):
     def __init__(self, coeffs: List[float]):
         super().__init__()
-        self.register_buffer('_c', torch.tensor(coeffs, dtype=torch.float32))
+        self.register_buffer('_c', torch.tensor(coeffs, dtype=torch.bfloat16))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self._c.unsqueeze(0).expand(hidden_states.shape[0], -1)

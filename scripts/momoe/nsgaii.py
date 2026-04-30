@@ -74,16 +74,21 @@ class ScriptArguments:
     # Evolutionary hyper-parameters
     population_size:      int       = 20
     num_generations:      int       = 100
+    convergence_window:   int       = 10
     mutation_sigma:       float     = 0.05
     mutation_rate:        float     = 0.3
-    sigma_decay:          float     = 0.999
-    use_reward_map:       bool      = False
-    use_guided_crossover: bool      = False  # True → p1 from F1, p2 front-decay weighted
-                                             # False → both parents uniform-random (recommended)
-    crossover_front_decay: float    = 0.5   # only used when use_guided_crossover=True
+    sigma_decay:          float     = 0.97
+    sigma_min:            float     = 0.01 # sigma floor; sigma_decay=0.97→σ_min@gen50, 0.95→@gen30
+# ---------------------------------------------------------------------------
     fitness_ema_alpha:    float     = 1.0   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
-                                            # <1.0 triggers Phase A (parent re-eval every gen)
-                                            # 1.0 = no EMA, no Phase A (pure single-phase)
+                                            # 1.0 = no EMA (pure single-phase)
+    ema_alpha_start:      float     = 1.0   # annealing start α; if > fitness_ema_alpha, α decays
+                                            # each gen: α(g) = max(fitness_ema_alpha, start·decay^g)
+    ema_alpha_decay:      float     = 1.0  # per-gen α multiplier (~gen 22: 0.9→0.5)
+    archive_size:         int       = 10    # elitist Pareto archive capacity (0 = disabled)
+    child_penalty:        float     = 1.0  # safety coefficient: child apparent fitness *= (1 - (1-p)*|f|/|f|)
+                                            # i.e. child_ema = raw - (1-p)*|raw|; 1.0 = no penalty
+# ---------------------------------------------------------------------------
 
     gpu_id:               int       = -1
     save_directory:       str       = './models/nsgaii/'
@@ -99,8 +104,8 @@ class ScriptArguments:
 
 def net_to_params(net: GatingNetwork) -> np.ndarray:
     return np.concatenate(
-        [p.detach().cpu().numpy().ravel() for p in net.parameters()]
-    ).astype(np.float64)
+        [p.detach().cpu().float().numpy().ravel() for p in net.parameters()]
+    )
 
 
 def params_to_net(params: np.ndarray, template: GatingNetwork,
@@ -243,7 +248,7 @@ def _generate_reference_points(n_objectives: int, n_divisions: int) -> np.ndarra
                 _gen(n_obj - 1, n_div - i, cur + [i], result)
     pts: list = []
     _gen(n_objectives, n_divisions, [], pts)
-    return np.array(pts, dtype=float) / n_divisions
+    return np.array(pts, dtype=np.float32) / n_divisions
 
 
 def _nsga3_select(rewards: np.ndarray, pop_size: int,
@@ -350,55 +355,20 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
     return selected + chosen_from_last
 
 
-# ---------------------------------------------------------------------------
-# Reward map — per-chunk Pareto archive
-# ---------------------------------------------------------------------------
-
-class RewardMap:
-    """Per-chunk Pareto archive: maps chunk_idx → Pareto-optimal (params, fitness) pairs.
-
-    When the evolutionary loop revisits a chunk (every _num_chunks generations),
-    stored candidates are injected into the parent pool so that historical best
-    solutions can participate in crossover and NSGA selection — without re-evaluation,
-    because same chunk_idx means the same set of prompts.
-    """
-
-    def __init__(self) -> None:
-        self._chunks: dict = {}   # int → List[Tuple[np.ndarray, np.ndarray]]
-
-    def update(self, chunk_idx: int, params: np.ndarray, fitness: np.ndarray) -> bool:
-        """Add (params, fitness) to the Pareto front for chunk_idx.
-
-        Prunes dominated entries; returns True if the point was accepted.
-        """
-        front = self._chunks.get(chunk_idx, [])
-        for _, ef in front:
-            if _dominates(ef, fitness):
-                return False
-        front = [(p, f) for p, f in front if not _dominates(fitness, f)]
-        front.append((params.copy(), fitness.copy()))
-        self._chunks[chunk_idx] = front
-        return True
-
-    def get_candidates(self, chunk_idx: int,
-                       exclude: Optional[List[np.ndarray]] = None
-                       ) -> List[tuple]:
-        """Return stored (params, fitness) pairs for chunk_idx.
-
-        Entries whose params exactly match any array in `exclude` are filtered out,
-        preventing injection of individuals already present in the current population.
-        """
-        stored = self._chunks.get(chunk_idx, [])
-        if not stored or not exclude:
-            return list(stored)
-        return [(p, f) for p, f in stored
-                if not any(np.array_equal(p, ep) for ep in exclude)]
-
-    def chunk_size(self, chunk_idx: int) -> int:
-        return len(self._chunks.get(chunk_idx, []))
-
-    def __len__(self) -> int:
-        return sum(len(v) for v in self._chunks.values())
+def _pareto_prune(archive: list, max_size: int) -> list:
+    """Retain non-dominated (params, fitness) pairs, capped at max_size by crowding distance."""
+    non_dom = []
+    for p, f in archive:
+        if any(_dominates(ef, f) for _, ef in non_dom):
+            continue
+        non_dom = [(pp, ff) for pp, ff in non_dom if not _dominates(f, ff)]
+        non_dom.append((p.copy(), f.copy()))
+    if len(non_dom) > max_size:
+        fits  = np.array([f for _, f in non_dom])
+        dist  = _crowding_distance(fits, list(range(len(non_dom))))
+        order = np.argsort(-dist)[:max_size]
+        non_dom = [non_dom[i] for i in order]
+    return non_dom
 
 
 # ---------------------------------------------------------------------------
@@ -440,9 +410,10 @@ class NSGAII:
         self.fitness     = [np.full(self.M, -np.inf) for _ in range(self.P)]
         self.ema_fitness = [np.full(self.M, -np.inf) for _ in range(self.P)]
 
-        self.z_star          = np.full(self.M, -np.inf, dtype=np.float64)
+        self.z_star          = np.full(self.M, -np.inf, dtype=np.float32)
         self.fitness_history = []
         self.front_history   = []
+        self.elite_archive:  list = []  # List[(params, ema_fitness)] non-dominated elitist store
 
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
@@ -454,14 +425,14 @@ class NSGAII:
             print(f'[{datetime.datetime.now():%H:%M:%S}] rank{rank} {msg}', flush=True)
 
     @staticmethod
-    def _crossover(p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+    def _crossover(p1: np.ndarray, p2: np.ndarray) -> tuple:
         alpha = np.random.uniform(0.3, 0.7, size=p1.shape)
-        return alpha * p1 + (1.0 - alpha) * p2
+        return alpha * p1 + (1.0 - alpha) * p2, float(alpha.mean())
 
     @staticmethod
     def _mutate(x: np.ndarray, sigma: float, rate: float) -> np.ndarray:
         mask = np.random.random(x.shape) < rate
-        return x + mask.astype(np.float64) * np.random.normal(0.0, sigma, x.shape)
+        return x + mask.astype(x.dtype) * np.random.normal(0.0, sigma, x.shape).astype(x.dtype)
 
     def _save_checkpoint(self, output_dir: str, gen: int):
         ckpt_dir = os.path.join(output_dir, f'gen_{gen:04d}')
@@ -503,19 +474,20 @@ class NSGAII:
         poll_interval:     float = 2.0,
         verbose:           bool  = False,
         seed:              int   = 42,
-        use_reward_map:    bool  = False,
-        use_guided_crossover: bool = False,
-        crossover_front_decay: float = 0.5,
-        fitness_ema_alpha:    float = 1.0,
-        algorithm:         str   = 'nsgaii',
-        n_reference_divisions: int = 12,
+        fitness_ema_alpha:     float = 1.0,
+        ema_alpha_start:       float = 1.0,
+        ema_alpha_decay:       float = 0.97,
+        sigma_min:             float = 0.005,
+        archive_size:          int   = 10,
+        convergence_window:    int   = 10,
+        child_penalty:         float = 0.95,
+        algorithm:             str   = 'nsgaii',
+        n_reference_divisions: int   = 12,
     ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
         rank    = torch.distributed.get_rank() if dist_on else 0
         is_main = rank == 0
-
-        reward_map = RewardMap()  # accumulates Pareto-optimal (params, fitness) across all gens
 
         # ── Algorithm-specific setup ──────────────────────────────────────────
         assert algorithm in ('nsgaii', 'nsgaiii'), \
@@ -542,8 +514,9 @@ class NSGAII:
         def _task_path(g, i):   return os.path.join(_gen_dir(g), f'task_{i:03d}.json')
         def _claim_path(g, i):  return os.path.join(_gen_dir(g), f'claimed_{i:03d}')
         def _result_path(g, i): return os.path.join(_gen_dir(g), f'result_{i:03d}.json')
-        def _done_path(g):       return os.path.join(_gen_dir(g), 'done')
-        def _phaseA_done_path(g): return os.path.join(_gen_dir(g), 'phaseA_done')
+        def _done_path(g):        return os.path.join(_gen_dir(g), 'done')
+        def _tasks_ready_path(g): return os.path.join(_gen_dir(g), 'tasks_ready')
+        _converged_path = os.path.join(queue_root, 'converged')
 
         def _try_claim(g, i):
             try:
@@ -639,10 +612,6 @@ class NSGAII:
             for i in range(self.P):
                 self.fitness[i]     = _collect_fitness(gen, i)
                 self.ema_fitness[i] = self.fitness[i].copy()   # gen-0: ema = raw
-            if use_reward_map:
-                for i in range(self.P):
-                    reward_map.update(0, self.population[i], self.fitness[i])
-                log(f'gen 0 reward_map[chunk=0]: {reward_map.chunk_size(0)} Pareto entries')
             open(_done_path(gen), 'w').close()
             log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
             print(f'Gen {gen:4d}/{num_generations}')
@@ -652,136 +621,104 @@ class NSGAII:
                 time.sleep(poll_interval)
 
         # ── Generational loop ─────────────────────────────────────────────────
-        # Phase A (parent re-eval) is triggered independently by two flags:
-        #   fitness_ema_alpha < 1.0  → re-eval to accumulate EMA across gens
-        #   use_guided_crossover     → re-eval to get fresh parent fitness for
-        #                              front-weighted crossover strategy
-        # Phase A task IDs: 0 .. P-1   (parent re-evals)
-        # Phase B task IDs: P .. 2P-1  (children)  — only when Phase A is active
-        # Single-phase task IDs: 0 .. P-1 (children) — when Phase A is skipped
-        #
-        # Crossover strategy (Phase B or single-phase):
-        #   use_guided_crossover=True  → p1 from F1, p2 weighted by front decay
-        #   use_guided_crossover=False → both parents uniform-random from aug pool
+        # Single worker loop per generation evaluates 2P individuals on the same chunk:
+        #   tasks 0..P-1  : parent re-evals (same chunk as children → fair comparison)
+        #   tasks P..2P-1 : children
+        # pre_ema is snapshotted before the current-chunk parent eval so that child EMA
+        # inheritance uses only historical performance, avoiding double-counting.
 
-        sigma = mutation_sigma
+        sigma             = mutation_sigma
+        parents_kept_hist: list = []
+        diversity_hist:    list = []
+        z_star_hist:       list = []
         for gen in range(1, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
 
-            do_phase_a = use_guided_crossover or (fitness_ema_alpha < 1.0)
-
+            # evolution and evaluation
             if is_main:
                 os.makedirs(_gen_dir(gen), exist_ok=True)
                 chunk_idx = gen % _num_chunks
                 diversity = np.std(np.array(self.population), axis=0).mean()
 
-            if do_phase_a:
-                # ── Phase A: re-evaluate current parents ──────────────────────
-                if is_main:
-                    for i in range(self.P):
-                        _write_task(gen, i, {'task_id': i,
-                                             'chunk_idx': chunk_idx,
-                                             'child_params': self.population[i].tolist()})
-                    log(f'gen {gen} phase-A: {self.P} parent re-eval tasks (chunk={chunk_idx})')
+                # Snapshot EMA before current-chunk update (for parent EMA update below)
+                pre_ema = [f.copy() for f in self.ema_fitness]
 
-                _worker_loop(gen, 0, self.P, _phaseA_done_path(gen))
+                parent_params = list(self.population)
 
-                if is_main:
-                    for i in range(self.P):
-                        raw = _collect_fitness(gen, i)
-                        self.fitness[i] = raw
-                        if fitness_ema_alpha >= 1.0 or np.all(self.ema_fitness[i] == -np.inf):
-                            self.ema_fitness[i] = raw.copy()
-                        else:
-                            self.ema_fitness[i] = (fitness_ema_alpha * raw
-                                                   + (1.0 - fitness_ema_alpha) * self.ema_fitness[i])
+                # Archive extends the crossover donor pool (params only; no EMA inheritance)
+                xover_params = parent_params + [p for p, _ in self.elite_archive]
+                xover_size   = len(xover_params)
 
-                    if use_reward_map:
-                        for i in range(self.P):
-                            reward_map.update(chunk_idx, self.population[i], self.fitness[i])
+                # Current EMA alpha: annealing from ema_alpha_start → fitness_ema_alpha
+                cur_alpha = (max(fitness_ema_alpha, ema_alpha_start * (ema_alpha_decay ** gen))
+                             if ema_alpha_start > fitness_ema_alpha else fitness_ema_alpha)
 
-            # ── Build augmented parent pool (shared by both crossover strategies) ─
-            if is_main:
-                stored = (reward_map.get_candidates(chunk_idx, exclude=list(self.population))
-                          if use_reward_map else [])
-                if stored:
-                    log(f'gen {gen} injecting {len(stored)} reward_map candidates '
-                        f'(chunk={chunk_idx}, total={len(reward_map)})')
+                # Write parent re-eval tasks (0..P-1)
+                for i in range(self.P):
+                    _write_task(gen, i, {'task_id': i, 'chunk_idx': chunk_idx,
+                                         'child_params': self.population[i].tolist()})
 
-                aug_params  = list(self.population) + [p for p, _ in stored]
-                aug_fitness = np.array(list(self.fitness) + [f for _, f in stored])
-                aug_size    = len(aug_params)
-
-                # ── Crossover ──────────────────────────────────────────────────
-                task_offset = self.P if do_phase_a else 0
+                # Crossover → write child tasks (P..2P-1)
                 child_params_list = []
+                for i in range(self.P):
+                    pi1 = np.random.randint(xover_size)
+                    pi2 = np.random.randint(xover_size)
+                    child, _ = self._crossover(xover_params[pi1], xover_params[pi2])
+                    child = self._mutate(child, sigma, mutation_rate)
+                    child_params_list.append(child)
+                    _write_task(gen, self.P + i, {'task_id': self.P + i, 'chunk_idx': chunk_idx,
+                                                   'child_params': child.tolist()})
+                log(f'gen {gen} crossover: parents={self.P}, xover={xover_size} '
+                    f'(+{len(self.elite_archive)} arch), α={cur_alpha:.3f}, penalty={child_penalty:.2f}, chunk={chunk_idx}')
 
-                if use_guided_crossover:
-                    fronts   = _non_dominated_sort(aug_fitness)
-                    front0   = fronts[0]
-                    n_fronts = len(fronts)
-                    raw_w    = np.array([crossover_front_decay ** k for k in range(n_fronts)])
-                    front_w  = raw_w / raw_w.sum()
-                    for i in range(self.P):
-                        pi1      = front0[np.random.randint(len(front0))]
-                        fi_level = int(np.random.choice(n_fronts, p=front_w))
-                        pi2      = fronts[fi_level][np.random.randint(len(fronts[fi_level]))]
-                        child = self._mutate(self._crossover(aug_params[pi1], aug_params[pi2]),
-                                             sigma, mutation_rate)
-                        child_params_list.append(child)
-                        _write_task(gen, task_offset + i,
-                                    {'task_id': task_offset + i, 'chunk_idx': chunk_idx,
-                                     'child_params': child.tolist()})
-                    log(f'gen {gen} guided crossover: front0={len(front0)}, fronts={n_fronts}')
-                else:
-                    for i in range(self.P):
-                        pi1 = np.random.randint(aug_size)
-                        pi2 = np.random.randint(aug_size)
-                        child = self._mutate(self._crossover(aug_params[pi1], aug_params[pi2]),
-                                             sigma, mutation_rate)
-                        child_params_list.append(child)
-                        _write_task(gen, task_offset + i,
-                                    {'task_id': task_offset + i, 'chunk_idx': chunk_idx,
-                                     'child_params': child.tolist()})
-                    log(f'gen {gen} uniform crossover: aug={aug_size}, chunk={chunk_idx}')
-
-                # Signal non-main ranks that child tasks are written
-                open(_phaseA_done_path(gen), 'w').close()
+                open(_tasks_ready_path(gen), 'w').close()
             else:
-                while not os.path.exists(_phaseA_done_path(gen)):
+                while not os.path.exists(_tasks_ready_path(gen)):
+                    if os.path.exists(_converged_path):
+                        break
                     time.sleep(poll_interval)
+                if os.path.exists(_converged_path):
+                    break
 
-            # task_offset is known to all ranks from do_phase_a (no is_main guard needed)
-            task_offset = self.P if do_phase_a else 0
-            _worker_loop(gen, task_offset, task_offset + self.P, _done_path(gen))
+            _worker_loop(gen, 0, 2 * self.P, _done_path(gen))
 
+            # extract fitness for parents and children
             if is_main:
-                child_fitness = [_collect_fitness(gen, task_offset + i) for i in range(self.P)]
+                # Collect parent results → update fitness and EMA with current chunk
+                for i in range(self.P):
+                    raw = _collect_fitness(gen, i)
+                    self.fitness[i] = raw
+                    if cur_alpha >= 1.0 or np.all(pre_ema[i] == -np.inf):
+                        self.ema_fitness[i] = raw.copy()
+                    else:
+                        self.ema_fitness[i] = (cur_alpha * raw
+                                               + (1.0 - cur_alpha) * pre_ema[i])
+                # Collect child results
+                child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
 
-                if use_reward_map:
-                    for i in range(self.P):
-                        reward_map.update(chunk_idx, child_params_list[i], child_fitness[i])
-                    log(f'gen {gen} reward_map[chunk={chunk_idx}]: '
-                        f'{reward_map.chunk_size(chunk_idx)} entries, total={len(reward_map)}')
+                merged_params  = parent_params + child_params_list
+                merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
-                merged_params  = aug_params + child_params_list
-                merged_fitness = np.vstack([aug_fitness, np.array(child_fitness)])
-
-                # EMA for selection: parents accumulated via Phase A (if active),
-                # stored candidates use stored fitness, children start with raw.
-                aug_ema        = list(self.ema_fitness) + [f.copy() for _, f in stored]
-                child_ema_list = [f.copy() for f in child_fitness]
-                merged_ema     = np.vstack([np.array(aug_ema), np.array(child_ema_list)])
+                # Child apparent fitness: pure raw with safety penalty.
+                # No EMA inheritance — child competes purely on current-chunk performance,
+                # deflated by child_penalty to require a genuine advantage over parents.
+                # raw - (1 - penalty) * |raw| moves each objective toward worse regardless of sign.
+                child_ema_list = [raw - (1.0 - child_penalty) * np.abs(raw)
+                                  for raw in child_fitness]
+                merged_ema = np.vstack([np.array(self.ema_fitness), np.array(child_ema_list)])
 
                 selected         = _select(merged_ema, self.P)
-                n_parents_kept   = sum(1 for k in selected if k < aug_size)
+                # label each survivor: "{new_pos}-parent{old_pos}" if parent, "{new_pos}-child" if new
+                ind_labels       = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
+                                    for j, k in enumerate(selected)]
+                n_parents_kept   = sum(1 for k in selected if k < self.P)
                 self.population  = [merged_params[k]  for k in selected]
                 self.fitness     = [merged_fitness[k]  for k in selected]
                 self.ema_fitness = [merged_ema[k]      for k in selected]
 
-            # ── Shared post-selection bookkeeping ─────────────────────────────
+            # ── Post-selection bookkeeping and logging ────────────────────────
             if is_main:
-                sigma *= sigma_decay
+                sigma = max(sigma_min, sigma * sigma_decay)
 
                 fit_arr  = np.array(self.fitness)      # raw (for z*, history)
                 ema_arr  = np.array(self.ema_fitness)  # smoothed (drives selection/display)
@@ -790,6 +727,30 @@ class NSGAII:
                 self.fitness_history.append(fit_arr.tolist())
                 self.front_history.append(n_front0)
 
+                # ── Elitist archive update ────────────────────────────────────
+                # Use the full 2P merged pool: filtered-out individuals are exactly
+                # what the archive is meant to protect against chunk-noise displacement.
+                if archive_size > 0:
+                    for k in range(len(merged_params)):
+                        f = merged_ema[k]
+                        if not any(_dominates(ef, f) for _, ef in self.elite_archive):
+                            self.elite_archive.append((merged_params[k].copy(), f.copy()))
+                    self.elite_archive = _pareto_prune(self.elite_archive, archive_size)
+
+                # Append per-individual record to population log
+                log_path = os.path.join(output_dir, 'population_log.json')
+                try:
+                    with open(log_path) as f:
+                        pop_log = json.load(f)
+                except FileNotFoundError:
+                    pop_log = {}
+                pop_log[f'gen_{gen:04d}'] = {
+                    label: {'raw': fit_arr[j].tolist(), 'ema': ema_arr[j].tolist()}
+                    for j, label in enumerate(ind_labels)
+                }
+                with open(log_path, 'w') as f:
+                    json.dump(pop_log, f, indent=2)
+
                 print(
                     f'Gen {gen:4d}/{num_generations} | '
                     f'front0={n_front0}/{self.P} | '
@@ -797,17 +758,43 @@ class NSGAII:
                     f'mean_fit={np.round(ema_arr.mean(axis=0), 3)} | '
                     f'best_fit={np.round(ema_arr.max(axis=0), 3)} | '
                     f'z*={np.round(self.z_star, 3)} | '
-                    f'σ={sigma:.5f} | div={diversity:.5f}',
+                    f'σ={sigma:.5f} | α={cur_alpha:.3f} | div={diversity:.5f} | '
+                    f'arch={len(self.elite_archive)}',
                     flush=True,
                 )
 
                 if gen % save_every == 0:
                     self._save_checkpoint(output_dir, gen)
 
+                # ── Convergence check ─────────────────────────────────────────
+                converged = False
+                if convergence_window > 0:
+                    parents_kept_hist.append(n_parents_kept)
+                    diversity_hist.append(diversity)
+                    z_star_hist.append(self.z_star.copy())
+                    if len(parents_kept_hist) >= convergence_window:
+                        avg_kept  = np.mean(parents_kept_hist[-convergence_window:])
+                        delta_div = abs(diversity_hist[-1] - diversity_hist[-convergence_window])
+                        z_stable  = all(
+                            np.array_equal(z_star_hist[-convergence_window], z)
+                            for z in z_star_hist[-convergence_window:])
+                        if avg_kept >= 16.5 and delta_div < 0.002 and z_stable:
+                            print(f'  *** Convergence at gen {gen}: '
+                                  f'avg_kept={avg_kept:.1f}/{self.P}, '
+                                  f'Δdiv={delta_div:.4f} ***', flush=True)
+                            converged = True
+
                 open(_done_path(gen), 'w').close()
+                if converged:
+                    if gen % save_every != 0:
+                        self._save_checkpoint(output_dir, gen)
+                    open(_converged_path, 'w').close()
+                    break
             else:
                 while not os.path.exists(_done_path(gen)):
                     time.sleep(poll_interval)
+                if os.path.exists(_converged_path):
+                    break
 
         return self.population
 
@@ -918,7 +905,7 @@ if script_args.warm_start_path:
     loaded = _load(script_args.warm_start_path, lm_hidden_size=lm_hidden_size,
                    num_experts=len(expert_models), device='cpu')
     if loaded is not None:
-        template_net = loaded.cpu()
+        template_net = loaded.cpu().bfloat16()
         print(f'Warm-start from {script_args.warm_start_path}')
 
 moe_model = MoEForCausalLM(expert_models, template_net).to(device)
@@ -945,10 +932,13 @@ final_population = nsgaii.run(
     sigma_decay=script_args.sigma_decay, num_continuations=script_args.num_continuations,
     save_every=script_args.save_every, output_dir=output_dir,
     verbose=script_args.verbose, seed=script_args.seed,
-    use_reward_map=script_args.use_reward_map,
-    use_guided_crossover=script_args.use_guided_crossover,
-    crossover_front_decay=script_args.crossover_front_decay,
     fitness_ema_alpha=script_args.fitness_ema_alpha,
+    ema_alpha_start=script_args.ema_alpha_start,
+    ema_alpha_decay=script_args.ema_alpha_decay,
+    sigma_min=script_args.sigma_min,
+    archive_size=script_args.archive_size,
+    convergence_window=script_args.convergence_window,
+    child_penalty=script_args.child_penalty,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
 )

@@ -84,7 +84,7 @@ def load_gating_network(save_path: str, lm_hidden_size: int = 4096,
     net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
                         hidden_size=hidden_size)
     net.load_state_dict(torch.load(ckpt_file, map_location=device))
-    return net.to(device)
+    return net.to(device).bfloat16()
 
 
 def _resolve_checkpoint(checkpoint_path: str, filename: str) -> str:

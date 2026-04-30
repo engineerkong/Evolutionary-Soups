@@ -41,12 +41,12 @@ class GatingNetwork(nn.Module):
             nn.Linear(lm_hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, num_experts),
-        )
+        ).to(torch.bfloat16)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.mean(dim=1)
-        return F.softmax(self.net(hidden_states.float()), dim=-1)
+        return F.softmax(self.net(hidden_states.to(self.net[0].weight.dtype)), dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +139,7 @@ class MoEForCausalLM(nn.Module):
 
             # ── Gate on post-attn hidden states (before FFN) ─────────────────
             if is_prefill:
-                coeff = self.gating_net(hidden_states.float())
+                coeff = self.gating_net(hidden_states)
                 seq_coefficients.append(coeff)
             else:
                 coeff = seq_coefficients[l]
