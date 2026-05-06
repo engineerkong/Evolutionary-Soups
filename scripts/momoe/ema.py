@@ -1,19 +1,12 @@
-"""nsgaii.py — Evolve GatingNetwork parameters using Chunk-Based Incremental NSGA-II.
+"""nsgaii.py — Evolve GatingNetwork parameters using standard NSGA-II.
 
-Algorithm: Chunk-Based Incremental NSGA-II.
-  - One pool per generation: pools[g] holds only generation g's P children.
-  - Each generation g, ALL active pools are (re-)evaluated on chunk g%N.
-  - Cross-gen selection: triggered for EVERY active pool (oldest→newest). Each pool P_k
-    is compared against all older active pools AND the meta pool, using P_k's full evaluated
-    chunk set as the mutual reference; both sides use mean_fitness restricted to that chunk
-    set. Dominated members of P_k are eliminated; older pools and meta pool are never eliminated.
-  - Intra-gen selection: triggered for EVERY active pool every generation. Keeps only
-    non-dominated members (Pareto front 1) by that pool's full mean fitness.
-  - A pool graduates to Meta after N consecutive chunk evaluations (all N chunks done).
-  - Meta pool: Pareto-filtered graduates; used as crossover donors alongside all active pool members.
-
-Pool lifetime: pool born at gen g is active for gens g … g+N-1, then graduates.
-At steady state there are exactly N active pools and N×P tasks per generation.
+Algorithm: NSGA-II (Deb et al., 2002).
+  - Population of P individuals (flat GatingNetwork parameter vectors).
+  - No preference vector during training — purely Pareto-based selection.
+  - Each individual is evaluated ONCE to produce an M-dimensional reward vector.
+  - Selection: non-dominated sort + crowding distance on raw reward vectors.
+  - Parallel evaluation via file-based work queue (same as moead.py).
+  - At inference: given preference λ, select best individual by argmax dot(λ, r_i).
 
 TO RUN:
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii.py \
@@ -31,7 +24,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -81,12 +74,24 @@ class ScriptArguments:
     # Evolutionary hyper-parameters
     population_size:      int       = 20
     num_generations:      int       = 100
+    convergence_window:   int       = 10
     mutation_sigma:       float     = 0.05
-    mutation_rate:        float     = 0.3
-    sigma_decay:          float     = 0.97
-    sigma_min:            float     = 0.01
-    meta_pool_size:       int       = 0   # max meta pool capacity (0 = unbounded)
-    crowding_threshold:   float     = 0.05 # cross-gen: remove P_k members with crowding distance < threshold (0 = disabled)
+    mutation_rate:        float     = 0.5
+    sigma_decay:          float     = 0.99
+    sigma_min:            float     = 0.03 # sigma floor; sigma_decay=0.97→σ_min@gen50, 0.95→@gen30
+# ---------------------------------------------------------------------------
+    fitness_ema_alpha:    float     = 1.0   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
+                                            # 1.0 = no EMA (pure single-phase)
+    ema_alpha_start:      float     = 1.0   # annealing start α; if > fitness_ema_alpha, α decays
+                                            # each gen: α(g) = max(fitness_ema_alpha, start·decay^g)
+    ema_alpha_decay:      float     = 1.0  # per-gen α multiplier (~gen 22: 0.9→0.5)
+    archive_size:         int       = 10    # elitist Pareto archive capacity (0 = disabled)
+    child_penalty:        float     = 1.0  # safety coefficient: child apparent fitness *= (1 - (1-p)*|f|/|f|)
+                                            # i.e. child_ema = raw - (1-p)*|raw|; 1.0 = no penalty
+# ---------------------------------------------------------------------------
+
+    # α-entmax: per-layer sparsity of gating weights (1.0=softmax, 2.0=sparsemax)
+    alpha_init:           float     = 1.0   # initial α for all layers; evolved jointly with gate weights
 
     gpu_id:               int       = -1
     save_directory:       str       = './models/nsgaii/'
@@ -165,54 +170,6 @@ def generate_and_score(
 
 
 # ---------------------------------------------------------------------------
-# Individual
-# ---------------------------------------------------------------------------
-
-class Individual:
-    """Single genome tracked across chunk evaluations."""
-
-    def __init__(self, params: np.ndarray, entry_gen: int):
-        self.params        = params.copy()
-        self.chunk_fitness: dict = {}   # {chunk_id (int): np.ndarray (M,)}
-        self.entry_gen     = entry_gen
-
-    def mean_fitness(self, chunks=None) -> Optional[np.ndarray]:
-        keys = (list(self.chunk_fitness) if chunks is None
-                else [c for c in chunks if c in self.chunk_fitness])
-        if not keys:
-            return None
-        return np.mean([self.chunk_fitness[c] for c in keys], axis=0)
-
-    @property
-    def n_chunks_done(self) -> int:
-        return len(self.chunk_fitness)
-
-    def is_complete(self, n_chunks: int) -> bool:
-        return len(self.chunk_fitness) >= n_chunks
-
-
-def _pareto_prune_individuals(individuals: list, max_size: int) -> list:
-    """Retain non-dominated Individuals by mean_fitness, capped at max_size by crowding distance."""
-    non_dom = []
-    for ind in individuals:
-        f = ind.mean_fitness()
-        if f is None:
-            continue
-        if any(_dominates(o.mean_fitness(), f) for o in non_dom
-               if o.mean_fitness() is not None):
-            continue
-        non_dom = [o for o in non_dom
-                   if o.mean_fitness() is None or not _dominates(f, o.mean_fitness())]
-        non_dom.append(ind)
-    if len(non_dom) > max_size:
-        fits  = np.array([ind.mean_fitness() for ind in non_dom])
-        dist  = _crowding_distance(fits, list(range(len(non_dom))))
-        order = np.argsort(-dist)[:max_size]
-        non_dom = [non_dom[i] for i in order]
-    return non_dom
-
-
-# ---------------------------------------------------------------------------
 # NSGA-II selection
 # ---------------------------------------------------------------------------
 
@@ -281,7 +238,11 @@ def _nsga2_select(rewards: np.ndarray, pop_size: int) -> List[int]:
 # ---------------------------------------------------------------------------
 
 def _generate_reference_points(n_objectives: int, n_divisions: int) -> np.ndarray:
-    """Das-Dennis structured reference points on the unit hyperplane (sum=1, ≥0)."""
+    """Das-Dennis structured reference points on the unit hyperplane (sum=1, ≥0).
+
+    Returns array of shape (C(n_objectives+n_divisions-1, n_divisions), n_objectives).
+    Typical n_divisions: 12 for M=2 (13 pts), 12 for M=3 (91 pts), 7 for M=4 (120 pts).
+    """
     def _gen(n_obj: int, n_div: int, cur: list, result: list) -> None:
         if n_obj == 1:
             result.append(cur + [n_div])
@@ -295,7 +256,18 @@ def _generate_reference_points(n_objectives: int, n_divisions: int) -> np.ndarra
 
 def _nsga3_select(rewards: np.ndarray, pop_size: int,
                   reference_points: np.ndarray) -> List[int]:
-    """NSGA-III selection: non-dominated sorting + niche-preservation on the last front."""
+    """NSGA-III selection: non-dominated sorting + niche-preservation on the last front.
+
+    Core idea (Deb & Jain, 2014):
+      1. Fill selection with complete fronts until the last (critical) front.
+      2. Normalize the combined fitness onto a unit hyperplane using the ideal
+         point and per-objective intercepts.
+      3. Associate every individual to its nearest reference *line* (through the
+         origin) by minimum perpendicular distance.
+      4. Pick n_needed individuals from the last front by iteratively selecting
+         the reference point with the smallest niche count, then choosing the
+         individual closest to that line (first use) or randomly (subsequent uses).
+    """
     fronts   = _non_dominated_sort(rewards)
     selected: List[int] = []
     last_front: List[int] = []
@@ -311,56 +283,74 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
     if n_needed == 0 or not last_front:
         return selected[:pop_size]
 
+    # ── Normalize fitness onto unit hyperplane ────────────────────────────────
     all_idx    = selected + last_front
-    fit_all    = rewards[all_idx]
-    ideal      = fit_all.min(axis=0)
+    fit_all    = rewards[all_idx]                          # (N_all, M)
+    ideal      = fit_all.min(axis=0)                       # (M,)
     translated = fit_all - ideal
 
+    # Nadir: per-objective max among already-accepted (non-last-front) individuals;
+    # fall back to max of all if no individuals were accepted yet.
     if selected:
         nadir = (rewards[selected] - ideal).max(axis=0)
     else:
         nadir = translated.max(axis=0)
     nadir      = np.where(nadir < 1e-10, 1.0, nadir)
-    normalized = translated / nadir
+    normalized = translated / nadir                        # (N_all, M)
 
-    R       = reference_points
-    r_norms = np.linalg.norm(R, axis=1, keepdims=True)
+    # ── Associate each individual to its nearest reference line ───────────────
+    # Perpendicular distance from point p to line through origin with direction r:
+    #   d_perp² = ||p||² - (p·r̂)²
+    # We compute this for all (individual, ref_point) pairs vectorised.
+    R       = reference_points                             # (R, M)
+    r_norms = np.linalg.norm(R, axis=1, keepdims=True)    # (R, 1)
     r_norms = np.where(r_norms < 1e-10, 1.0, r_norms)
-    R_hat   = R / r_norms
+    R_hat   = R / r_norms                                  # (R, M) unit reference directions
 
-    dot      = normalized @ R_hat.T
-    proj     = dot[:, :, None] * R_hat[None, :, :]
-    diff     = normalized[:, None, :] - proj
-    perp_dist = np.sqrt(np.maximum((diff ** 2).sum(axis=2), 0.0))
+    dot      = normalized @ R_hat.T                        # (N_all, R)  scalar projections
+    proj     = dot[:, :, None] * R_hat[None, :, :]        # (N_all, R, M) projected vectors
+    diff     = normalized[:, None, :] - proj               # (N_all, R, M) perpendicular components
+    perp_dist = np.sqrt(np.maximum((diff ** 2).sum(axis=2), 0.0))  # (N_all, R)
 
-    assoc_ref  = perp_dist.argmin(axis=1)
-    assoc_dist = perp_dist.min(axis=1)
+    assoc_ref  = perp_dist.argmin(axis=1)                  # (N_all,) closest ref index
+    assoc_dist = perp_dist.min(axis=1)                     # (N_all,) perp distance
 
+    # ── Niche counts from already-accepted individuals (before last front) ─────
     n_sel       = len(selected)
     niche_count = np.zeros(len(R), dtype=int)
     for j in range(n_sel):
         niche_count[assoc_ref[j]] += 1
 
-    lf_assoc = assoc_ref[n_sel:]
+    # Associations for individuals in last_front (offset n_sel in all_idx)
+    lf_assoc = assoc_ref[n_sel:]                           # (|last_front|,)
     lf_dist  = assoc_dist[n_sel:]
 
+    # ── Niche-based selection from last_front ─────────────────────────────────
     remaining        = list(range(len(last_front)))
     chosen_from_last: List[int] = []
 
     for _ in range(n_needed):
+        # Map each active reference point to candidate local indices
         ref_to_cands: dict = {}
         for loc in remaining:
             ref_to_cands.setdefault(lf_assoc[loc], []).append(loc)
+
         if not ref_to_cands:
             break
+
+        # Reference point with minimum niche count (ties broken randomly)
         min_nc    = min(niche_count[r] for r in ref_to_cands)
         min_refs  = [r for r in ref_to_cands if niche_count[r] == min_nc]
         chosen_r  = min_refs[np.random.randint(len(min_refs))]
+
         cands = ref_to_cands[chosen_r]
         if niche_count[chosen_r] == 0:
+            # First occupant of this niche: pick the closest individual to the line
             loc = cands[int(np.argmin(lf_dist[cands]))]
         else:
+            # Niche already occupied: pick randomly among candidates
             loc = cands[np.random.randint(len(cands))]
+
         chosen_from_last.append(last_front[loc])
         niche_count[chosen_r] += 1
         remaining.remove(loc)
@@ -368,28 +358,35 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
     return selected + chosen_from_last
 
 
+def _pareto_prune(archive: list, max_size: int) -> list:
+    """Retain non-dominated (params, fitness) pairs, capped at max_size by crowding distance."""
+    non_dom = []
+    for p, f in archive:
+        if any(_dominates(ef, f) for _, ef in non_dom):
+            continue
+        non_dom = [(pp, ff) for pp, ff in non_dom if not _dominates(f, ff)]
+        non_dom.append((p.copy(), f.copy()))
+    if len(non_dom) > max_size:
+        fits  = np.array([f for _, f in non_dom])
+        dist  = _crowding_distance(fits, list(range(len(non_dom))))
+        order = np.argsort(-dist)[:max_size]
+        non_dom = [non_dom[i] for i in order]
+    return non_dom
+
+
 # ---------------------------------------------------------------------------
-# Chunk-Based Incremental NSGA-II
+# NSGA-II
 # ---------------------------------------------------------------------------
 
 class NSGAII:
-    """Chunk-Based Incremental NSGA-II for GatingNetwork evolution.
+    """Standard NSGA-II for GatingNetwork evolution.
 
-    Pool layout
-    -----------
-    pools[g]: List[Individual]  — generation g's children (born at gen g only)
-    meta_pool: List[Individual] — graduated individuals, Pareto-filtered
+    Population: P flat param vectors (no λ association).
+    Each individual evaluated ONCE → M-dim reward vector as fitness.
 
-    Per-generation protocol (gen g, chunk = g % N):
-      1. Create P new children → pools[g]
-      2. Re-evaluate ALL active pools on chunk g%N, update chunk_fitness
-      3. For each active pool P_k (oldest→newest):
-           Cross-gen: compare P_k against all older active pools + meta pool on mutual
-                      chunks (= P_k's full evaluated chunk set); dominated P_k members removed.
-           Intra-gen: keep only non-dominated members (front 1) by P_k's full mean fitness.
-      4. Graduate pools[g-N+1] → meta pool (Pareto-filtered); remove from active pools.
-
-    At steady state: N active pools, max(N×P) evaluations per generation.
+    Task layout per generation (total 2·P tasks):
+      task IDs  0 .. P-1    : child   evals
+      task IDs  P .. 2P-1   : parent re-evals
     """
 
     def __init__(
@@ -399,19 +396,27 @@ class NSGAII:
         population_size: int = 20,
         device:          str = 'cpu',
     ):
-        self.template    = template_net.eval()
-        self.M           = num_objectives
-        self.P           = population_size
-        self.device      = device
-        self.base_params = net_to_params(template_net)
-        self.param_dim   = len(self.base_params)
+        self.template   = template_net.eval()
+        self.M          = num_objectives
+        self.P          = population_size
+        self.device     = device
 
-        self.N           = None   # set in run() once _num_chunks is known
-        self.pools: Dict[int, List[Individual]] = {}   # {generation_id: members}
-        self.meta_pool:  List[Individual] = []
+        base_params     = net_to_params(template_net)
+        self.param_dim  = len(base_params)
+        self.population = [
+            base_params + np.random.randn(self.param_dim) * 0.05
+            for _ in range(self.P)
+        ]
+
+        # fitness[i]:     raw reward vector from the latest evaluation
+        # ema_fitness[i]: EMA-smoothed fitness used for dominance / selection
+        self.fitness     = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        self.ema_fitness = [np.full(self.M, -np.inf) for _ in range(self.P)]
 
         self.z_star          = np.full(self.M, -np.inf, dtype=np.float32)
         self.fitness_history = []
+        self.front_history   = []
+        self.elite_archive:  list = []  # List[(params, ema_fitness)] non-dominated elitist store
 
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
@@ -435,42 +440,19 @@ class NSGAII:
     def _save_checkpoint(self, output_dir: str, gen: int):
         ckpt_dir = os.path.join(output_dir, f'gen_{gen:04d}')
         os.makedirs(ckpt_dir, exist_ok=True)
-
-        for i, ind in enumerate(self.meta_pool):
-            subdir = os.path.join(ckpt_dir, 'meta', f'ind_{i:03d}')
-            os.makedirs(subdir, exist_ok=True)
-            net = params_to_net(ind.params, self.template, 'cpu')
+        for i in range(self.P):
+            subdir = os.path.join(ckpt_dir, f'ind_{i:03d}')
+            net    = params_to_net(self.population[i], self.template, 'cpu')
             save_gating_network(net, subdir)
-            mf = ind.mean_fitness()
             with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
-                json.dump({
-                    'mean_fitness':  mf.tolist() if mf is not None else None,
-                    'chunk_fitness': {str(k): v.tolist() for k, v in ind.chunk_fitness.items()},
-                    'entry_gen':     ind.entry_gen,
-                }, f, indent=2)
-
-        for pg in sorted(self.pools):
-            for i, ind in enumerate(self.pools[pg]):
-                subdir = os.path.join(ckpt_dir, f'pool_g{pg:04d}', f'ind_{i:03d}')
-                os.makedirs(subdir, exist_ok=True)
-                net = params_to_net(ind.params, self.template, 'cpu')
-                save_gating_network(net, subdir)
-                mf = ind.mean_fitness()
-                with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
-                    json.dump({
-                        'mean_fitness':  mf.tolist() if mf is not None else None,
-                        'chunk_fitness': {str(k): v.tolist() for k, v in ind.chunk_fitness.items()},
-                        'entry_gen':     ind.entry_gen,
-                    }, f, indent=2)
-
-        state = {
-            'generation':  gen,
-            'z_star':      self.z_star.tolist(),
-            'meta_size':   len(self.meta_pool),
-            'active_pools': {str(pg): len(self.pools[pg]) for pg in sorted(self.pools)},
+                json.dump({'fitness': self.fitness[i].tolist()}, f, indent=2)
+        meta = {
+            'generation': gen,
+            'z_star':     self.z_star.tolist(),
+            'fitness':    [f.tolist() for f in self.fitness],
         }
         with open(os.path.join(ckpt_dir, 'nsgaii_state.json'), 'w') as f:
-            json.dump(state, f, indent=2)
+            json.dump(meta, f, indent=2)
         print(f'  Checkpoint saved → {ckpt_dir}', flush=True)
 
     def run(
@@ -488,24 +470,29 @@ class NSGAII:
         num_generations:   int   = 100,
         mutation_sigma:    float = 0.05,
         mutation_rate:     float = 0.3,
-        sigma_decay:       float = 0.97,
-        sigma_min:         float = 0.01,
+        sigma_decay:       float = 0.999,
         num_continuations: int   = 1,
         save_every:        int   = 10,
         output_dir:        str   = '.',
         poll_interval:     float = 2.0,
         verbose:           bool  = False,
         seed:              int   = 42,
-        meta_pool_size:    int   = 0,
-        crowding_threshold: float = 0.0,
-        algorithm:         str   = 'nsgaii',
-        n_reference_divisions: int = 12,
-    ) -> List[Individual]:
+        fitness_ema_alpha:     float = 1.0,
+        ema_alpha_start:       float = 1.0,
+        ema_alpha_decay:       float = 0.97,
+        sigma_min:             float = 0.005,
+        archive_size:          int   = 10,
+        convergence_window:    int   = 10,
+        child_penalty:         float = 0.95,
+        algorithm:             str   = 'nsgaii',
+        n_reference_divisions: int   = 12,
+    ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
         rank    = torch.distributed.get_rank() if dist_on else 0
         is_main = rank == 0
 
+        # ── Algorithm-specific setup ──────────────────────────────────────────
         assert algorithm in ('nsgaii', 'nsgaiii'), \
             f"algorithm must be 'nsgaii' or 'nsgaiii', got {algorithm!r}"
         if algorithm == 'nsgaiii':
@@ -532,7 +519,7 @@ class NSGAII:
         def _result_path(g, i): return os.path.join(_gen_dir(g), f'result_{i:03d}.json')
         def _done_path(g):        return os.path.join(_gen_dir(g), 'done')
         def _tasks_ready_path(g): return os.path.join(_gen_dir(g), 'tasks_ready')
-        def _count_path(g):       return os.path.join(_gen_dir(g), 'task_count.json')
+        _converged_path = os.path.join(queue_root, 'converged')
 
         def _try_claim(g, i):
             try:
@@ -562,16 +549,12 @@ class NSGAII:
                        batch_size=eval_batch_size, collate_fn=data_collator, drop_last=False)
             for c in range(_num_chunks)
         ]
-        print(f'Dataset chunks: {_num_chunks} × {_chunk_size} prompts '
-              f'(N = {_num_chunks}, pool lifetime = {_num_chunks} gens)', flush=True)
-
-        self.N    = _num_chunks
-        self.pools = {}
+        print(f'Dataset chunks: {_num_chunks} × {_chunk_size} prompts', flush=True)
 
         # ── Eval helper ───────────────────────────────────────────────────────
         def _eval_individual(params, chunk_idx, label=''):
-            log(f'eval [{label}] chunk={chunk_idx}')
-            loader = chunk_loaders[chunk_idx]
+            log(f'eval [{label}] chunk={chunk_idx % _num_chunks}')
+            loader = chunk_loaders[chunk_idx % _num_chunks]
             net    = params_to_net(params, self.template, self.device)
             net.eval()
             moe_model.gating_net = net
@@ -585,19 +568,19 @@ class NSGAII:
             return np.mean(reward_vecs, axis=0)
 
         # ── Worker loop ───────────────────────────────────────────────────────
-        def _worker_loop(gen, n_tasks, exit_signal):
+        def _worker_loop(gen, task_start, task_end, exit_signal):
             while True:
                 if is_main:
-                    if all(os.path.exists(_result_path(gen, i)) for i in range(n_tasks)):
+                    if all(os.path.exists(_result_path(gen, i)) for i in range(task_start, task_end)):
                         break
                 else:
                     if os.path.exists(exit_signal):
                         break
                 claimed = False
-                for i in range(n_tasks):
-                    if not os.path.exists(_task_path(gen, i)):  continue
-                    if os.path.exists(_result_path(gen, i)):    continue
-                    if not _try_claim(gen, i):                  continue
+                for i in range(task_start, task_end):
+                    if not os.path.exists(_task_path(gen, i)): continue
+                    if os.path.exists(_result_path(gen, i)):   continue
+                    if not _try_claim(gen, i):                 continue
                     claimed = True
                     with open(_task_path(gen, i)) as f: task = json.load(f)
                     r = _eval_individual(np.array(task['child_params']),
@@ -607,204 +590,232 @@ class NSGAII:
                 if not claimed:
                     time.sleep(poll_interval)
 
+        # ── Collect fitness from one task result ──────────────────────────────
         def _collect_fitness(gen, task_id) -> np.ndarray:
             with open(_result_path(gen, task_id)) as f:
                 r = np.array(json.load(f)['reward_vec'])
             self._update_z_star(r)
             return r
 
+        # ── Phase 0: initial population ───────────────────────────────────────
+        gen = 0
+        if is_main:
+            print(f'NSGA-II — initialising population ({self.P} individuals, '
+                  f'1 eval each = {self.P} tasks) …')
+            os.makedirs(_gen_dir(gen), exist_ok=True)
+            for i in range(self.P):
+                _write_task(gen, i, {'task_id': i,
+                                     'chunk_idx': 0,
+                                     'child_params': self.population[i].tolist()})
+            log(f'gen 0 all {self.P} init tasks written (chunk 0)')
+
+        _worker_loop(gen, 0, self.P, _done_path(gen))
+
+        if is_main:
+            for i in range(self.P):
+                self.fitness[i]     = _collect_fitness(gen, i)
+                self.ema_fitness[i] = self.fitness[i].copy()   # gen-0: ema = raw
+            open(_done_path(gen), 'w').close()
+            log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
+            print(f'Gen {gen:4d}/{num_generations}')
+
+        else:
+            while not os.path.exists(_done_path(gen)):
+                time.sleep(poll_interval)
+
         # ── Generational loop ─────────────────────────────────────────────────
-        sigma        = mutation_sigma
+        # Single worker loop per generation evaluates 2P individuals on the same chunk:
+        #   tasks 0..P-1  : parent re-evals (same chunk as children → fair comparison)
+        #   tasks P..2P-1 : children
+        # pre_ema is snapshotted before the current-chunk parent eval so that child EMA
+        # inheritance uses only historical performance, avoiding double-counting.
 
-        for gen in range(num_generations + 1):
+        sigma             = mutation_sigma
+        parents_kept_hist: list = []
+        diversity_hist:    list = []
+        z_star_hist:       list = []
+        for gen in range(1, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
-            chunk_idx = gen % self.N   # current chunk for all pools this generation
 
+            # evolution and evaluation
             if is_main:
                 os.makedirs(_gen_dir(gen), exist_ok=True)
+                chunk_idx = gen % _num_chunks
+                diversity = np.std(np.array(self.population), axis=0).mean()
 
-                # ── 1. Create P new children → pools[gen] ────────────────────
-                all_inds     = [ind for pool in self.pools.values() for ind in pool] + self.meta_pool
-                donor_params = [ind.params for ind in all_inds] if all_inds else [self.base_params]
-                donor_size   = len(donor_params)
+                # Snapshot EMA before current-chunk update (for parent EMA update below)
+                pre_ema = [f.copy() for f in self.ema_fitness]
 
-                new_children: List[Individual] = []
-                for _ in range(self.P):
-                    pi1 = np.random.randint(donor_size)
-                    pi2 = np.random.randint(donor_size)
-                    child_p, _ = self._crossover(donor_params[pi1], donor_params[pi2])
-                    child_p    = self._mutate(child_p, sigma, mutation_rate)
-                    new_children.append(Individual(child_p, entry_gen=gen))
-                self.pools[gen] = new_children
+                parent_params = list(self.population)
 
-                # ── 2. Build flat task list: ALL active pools on chunk_idx ───
-                # Ordered oldest → newest so task IDs are stable across re-runs.
-                ordered_pool_gens = sorted(self.pools.keys())
-                to_eval: List[Individual] = []
-                for pg in ordered_pool_gens:
-                    to_eval.extend(self.pools[pg])
-                n_tasks = len(to_eval)
-                n_hist  = n_tasks - self.P   # individuals from older pools
+                # Archive extends the crossover donor pool (params only; no EMA inheritance)
+                xover_params = parent_params + [p for p, _ in self.elite_archive]
+                xover_size   = len(xover_params)
 
-                log(f'gen {gen}: chunk={chunk_idx} tasks={n_tasks} '
-                    f'({self.P} new + {n_hist} hist from {len(ordered_pool_gens)-1} older pools)')
+                # Current EMA alpha: annealing from ema_alpha_start → fitness_ema_alpha
+                cur_alpha = (max(fitness_ema_alpha, ema_alpha_start * (ema_alpha_decay ** gen))
+                             if ema_alpha_start > fitness_ema_alpha else fitness_ema_alpha)
 
-                for i, ind in enumerate(to_eval):
+                # Write parent re-eval tasks (0..P-1)
+                for i in range(self.P):
                     _write_task(gen, i, {'task_id': i, 'chunk_idx': chunk_idx,
-                                          'child_params': ind.params.tolist()})
-                with open(_count_path(gen), 'w') as f:
-                    json.dump({'n_tasks': n_tasks}, f)
-                open(_tasks_ready_path(gen), 'w').close()
+                                         'child_params': self.population[i].tolist()})
 
+                # Crossover → write child tasks (P..2P-1)
+                child_params_list = []
+                for i in range(self.P):
+                    pi1 = np.random.randint(xover_size)
+                    pi2 = np.random.randint(xover_size)
+                    child, _ = self._crossover(xover_params[pi1], xover_params[pi2])
+                    child = self._mutate(child, sigma, mutation_rate)
+                    child_params_list.append(child)
+                    _write_task(gen, self.P + i, {'task_id': self.P + i, 'chunk_idx': chunk_idx,
+                                                   'child_params': child.tolist()})
+                log(f'gen {gen} crossover: parents={self.P}, xover={xover_size} '
+                    f'(+{len(self.elite_archive)} arch), α={cur_alpha:.3f}, penalty={child_penalty:.2f}, chunk={chunk_idx}')
+
+                open(_tasks_ready_path(gen), 'w').close()
             else:
                 while not os.path.exists(_tasks_ready_path(gen)):
+                    if os.path.exists(_converged_path):
+                        break
                     time.sleep(poll_interval)
-                with open(_count_path(gen)) as f:
-                    n_tasks = json.load(f)['n_tasks']
+                if os.path.exists(_converged_path):
+                    break
 
-            _worker_loop(gen, n_tasks, _done_path(gen))
+            _worker_loop(gen, 0, 2 * self.P, _done_path(gen))
 
+            # extract fitness for parents and children
             if is_main:
-                # ── 3. Collect results → update chunk_fitness ─────────────────
-                for i, ind in enumerate(to_eval):
+                # Collect parent results → update fitness and EMA with current chunk
+                for i in range(self.P):
                     raw = _collect_fitness(gen, i)
-                    ind.chunk_fitness[chunk_idx] = raw   # record for this individual's gen
+                    self.fitness[i] = raw
+                    if cur_alpha >= 1.0 or np.all(pre_ema[i] == -np.inf):
+                        self.ema_fitness[i] = raw.copy()
+                    else:
+                        self.ema_fitness[i] = (cur_alpha * raw
+                                               + (1.0 - cur_alpha) * pre_ema[i])
+                # Collect child results
+                child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
 
-                # ── 4. Cross-gen + Intra-gen selection ───────────────────────
-                # Both triggered for EVERY active pool at the current chunk.
-                #
-                # Cross-gen (for each pool P_k, oldest→newest):
-                #   Mutual chunks = P_k's full evaluated chunk set.  Older pools have
-                #   been active longer and include all of P_k's chunks, so P_k's chunk
-                #   set is exactly the intersection.  Both sides use mean_fitness over
-                #   these mutual chunks.  Dominated members of P_k are eliminated;
-                #   older pools are never touched.
-                #
-                # Intra-gen (for each pool P_k):
-                #   NSGA-II select by that pool's full mean fitness.
-                #   For the graduating pool this serves as the final quality filter
-                #   using all N chunks before members enter meta.
-                ordered_pool_gens = sorted(self.pools.keys())  # oldest → newest
-                for k_idx, pg in enumerate(ordered_pool_gens):
-                    pool_k = self.pools[pg]
-                    if not pool_k:
-                        continue
+                merged_params  = parent_params + child_params_list
+                merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
-                    # Cross-gen: compare pool_k against all older active pools + meta pool
-                    # Meta pool members have all N chunks so always cover mutual_chunks.
-                    older_inds = ([ind for opg in ordered_pool_gens[:k_idx]
-                                   for ind in self.pools[opg]]
-                                  + self.meta_pool)
-                    if older_inds:
-                        # mutual_chunks = pool_k's own evaluated chunk set;
-                        # all members of pool_k were born at the same gen and have
-                        # identical chunk_fitness keys, so we read from pool_k[0].
-                        mutual_chunks = list(pool_k[0].chunk_fitness.keys())
-                        self.pools[pg] = [
-                            c for c in pool_k
-                            if (c.mean_fitness(chunks=mutual_chunks) is not None and
-                                not any(
-                                    _dominates(o.mean_fitness(chunks=mutual_chunks),
-                                               c.mean_fitness(chunks=mutual_chunks))
-                                    for o in older_inds
-                                    if o.mean_fitness(chunks=mutual_chunks) is not None))
-                        ]
-                        pool_k = self.pools[pg]
-                        # Crowding threshold: remove P_k members too close to older/meta set
-                        if crowding_threshold > 0 and pool_k:
-                            ref_fits = [o.mean_fitness(chunks=mutual_chunks) for o in older_inds
-                                        if o.mean_fitness(chunks=mutual_chunks) is not None]
-                            if ref_fits:
-                                pk_fits  = [c.mean_fitness(chunks=mutual_chunks) for c in pool_k]
-                                combined = np.array(ref_fits + pk_fits)
-                                n_ref    = len(ref_fits)
-                                dist     = _crowding_distance(combined, list(range(len(combined))))
-                                self.pools[pg] = [c for c, d in zip(pool_k, dist[n_ref:])
-                                                  if d >= crowding_threshold]
-                                pool_k = self.pools[pg]
+                # Child apparent fitness: pure raw with safety penalty.
+                # No EMA inheritance — child competes purely on current-chunk performance,
+                # deflated by child_penalty to require a genuine advantage over parents.
+                # raw - (1 - penalty) * |raw| moves each objective toward worse regardless of sign.
+                child_ema_list = [raw - (1.0 - child_penalty) * np.abs(raw)
+                                  for raw in child_fitness]
+                merged_ema = np.vstack([np.array(self.ema_fitness), np.array(child_ema_list)])
 
-                    # Intra-gen: keep only non-dominated members by full mean fitness
-                    if len(pool_k) > 1:
-                        self.pools[pg] = [
-                            ind for ind in pool_k
-                            if (ind.mean_fitness() is not None and
-                                not any(_dominates(o.mean_fitness(), ind.mean_fitness())
-                                        for o in pool_k
-                                        if o is not ind and o.mean_fitness() is not None))
-                        ]
+                selected         = _select(merged_ema, self.P)
+                # label each survivor: "{new_pos}-parent{old_pos}" if parent, "{new_pos}-child" if new
+                ind_labels       = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
+                                    for j, k in enumerate(selected)]
+                n_parents_kept   = sum(1 for k in selected if k < self.P)
+                self.population  = [merged_params[k]  for k in selected]
+                self.fitness     = [merged_fitness[k]  for k in selected]
+                self.ema_fitness = [merged_ema[k]      for k in selected]
 
-                n_survived_new = len(self.pools.get(gen, []))
-
-                # ── 5. Graduate oldest pool → meta ────────────────────────────
-                # Intra-gen above already applied full N-chunk mean selection
-                # to the graduating pool before it enters meta.
-                graduate_gen = gen - self.N + 1   # pool born this many gens ago
-                graduates: List[Individual] = []
-                if graduate_gen in self.pools:
-                    graduates = list(self.pools.pop(graduate_gen))
-                    for ind in graduates:
-                        self.meta_pool.append(ind)
-                    if graduates and meta_pool_size > 0:
-                        self.meta_pool = _pareto_prune_individuals(self.meta_pool, meta_pool_size)
-
-                # ── 6. Bookkeeping ────────────────────────────────────────────
+            # ── Post-selection bookkeeping and logging ────────────────────────
+            if is_main:
                 sigma = max(sigma_min, sigma * sigma_decay)
 
-                self.fitness_history.append(
-                    [ind.mean_fitness().tolist() for ind in self.meta_pool]
-                    if self.meta_pool else []
-                )
+                fit_arr  = np.array(self.fitness)      # raw (for z*, history)
+                ema_arr  = np.array(self.ema_fitness)  # smoothed (drives selection/display)
+                fronts   = _non_dominated_sort(ema_arr)
+                n_front0 = len(fronts[0]) if fronts else 0
+                self.fitness_history.append(fit_arr.tolist())
+                self.front_history.append(n_front0)
 
-                all_params_list = ([ind.params for pool in self.pools.values() for ind in pool]
-                                   + [ind.params for ind in self.meta_pool])
-                diversity = (np.std(np.array(all_params_list), axis=0).mean()
-                             if len(all_params_list) > 1 else 0.0)
+                # ── Elitist archive update ────────────────────────────────────
+                # Use the full 2P merged pool: filtered-out individuals are exactly
+                # what the archive is meant to protect against chunk-noise displacement.
+                if archive_size > 0:
+                    for k in range(len(merged_params)):
+                        f = merged_ema[k]
+                        if not any(_dominates(ef, f) for _, ef in self.elite_archive):
+                            self.elite_archive.append((merged_params[k].copy(), f.copy()))
+                    self.elite_archive = _pareto_prune(self.elite_archive, archive_size)
 
-                pool_str  = ' '.join(f'g{pg}:{len(self.pools[pg])}'
-                                     for pg in sorted(self.pools))
-                meta_best = (np.round(
-                                 np.array([ind.mean_fitness() for ind in self.meta_pool]).max(axis=0), 3)
-                             if self.meta_pool else 'n/a')
-                print(
-                    f'Gen {gen:4d}/{num_generations} | chunk={chunk_idx} | '
-                    f'pools=[{pool_str}] | meta={len(self.meta_pool)} | '
-                    f'surv_new={n_survived_new}/{self.P} | grad={len(graduates)} | '
-                    f'meta_best={meta_best} | '
-                    f'z*={np.round(self.z_star, 3)} | σ={sigma:.5f} | div={diversity:.5f}',
-                    flush=True,
-                )
-
+                # Append per-individual record to population log
                 log_path = os.path.join(output_dir, 'population_log.json')
                 try:
-                    with open(log_path) as f: pop_log = json.load(f)
+                    with open(log_path) as f:
+                        pop_log = json.load(f)
                 except FileNotFoundError:
                     pop_log = {}
+                # Extract per-layer entmax alpha for each population member
+                # alpha occupies the last template.num_layers entries of the flat genome
+                _n_alpha = self.template.num_layers
+                pop_alphas = np.array(
+                    [self.population[j][-_n_alpha:] for j in range(self.P)])
+                mean_alpha_per_layer = pop_alphas.mean(axis=0)   # (num_layers,)
+                mean_alpha           = float(pop_alphas.mean())
+                max_alpha            = float(pop_alphas.max())
+                sparse_frac          = float((pop_alphas > 1.9).mean())
+
                 pop_log[f'gen_{gen:04d}'] = {
-                    'chunk':         chunk_idx,
-                    'n_tasks':       n_tasks,
-                    'n_new':         self.P,
-                    'n_hist':        n_hist,
-                    'surv_new':      n_survived_new,
-                    'graduates':     len(graduates),
-                    'graduate_pool': graduate_gen if graduates else None,
-                    'meta_size':     len(self.meta_pool),
-                    'active_pools':  {str(pg): len(self.pools[pg])
-                                      for pg in sorted(self.pools)},
+                    label: {
+                        'raw':        fit_arr[j].tolist(),
+                        'ema':        ema_arr[j].tolist(),
+                        'alpha_mean': float(pop_alphas[j].mean()),
+                        'alpha':      pop_alphas[j].tolist(),
+                    }
+                    for j, label in enumerate(ind_labels)
                 }
                 with open(log_path, 'w') as f:
                     json.dump(pop_log, f, indent=2)
 
+                print(
+                    f'Gen {gen:4d}/{num_generations} | '
+                    f'front0={n_front0}/{self.P} | '
+                    f'parents_kept={n_parents_kept}/{self.P} | '
+                    f'mean_fit={np.round(ema_arr.mean(axis=0), 3)} | '
+                    f'best_fit={np.round(ema_arr.max(axis=0), 3)} | '
+                    f'z*={np.round(self.z_star, 3)} | '
+                    f'σ={sigma:.5f} | ema_α={cur_alpha:.3f} | '
+                    f'entmax_α={mean_alpha:.3f}(max={max_alpha:.3f},sparse={sparse_frac:.2f}) | '
+                    f'div={diversity:.5f} | arch={len(self.elite_archive)}',
+                    flush=True,
+                )
+
                 if gen % save_every == 0:
                     self._save_checkpoint(output_dir, gen)
 
-                open(_done_path(gen), 'w').close()
+                # ── Convergence check ─────────────────────────────────────────
+                converged = False
+                if convergence_window > 0:
+                    parents_kept_hist.append(n_parents_kept)
+                    diversity_hist.append(diversity)
+                    z_star_hist.append(self.z_star.copy())
+                    if len(parents_kept_hist) >= convergence_window:
+                        avg_kept  = np.mean(parents_kept_hist[-convergence_window:])
+                        delta_div = abs(diversity_hist[-1] - diversity_hist[-convergence_window])
+                        z_stable  = all(
+                            np.array_equal(z_star_hist[-convergence_window], z)
+                            for z in z_star_hist[-convergence_window:])
+                        if avg_kept >= 16.5 and delta_div < 0.002 and z_stable:
+                            print(f'  *** Convergence at gen {gen}: '
+                                  f'avg_kept={avg_kept:.1f}/{self.P}, '
+                                  f'Δdiv={delta_div:.4f} ***', flush=True)
+                            converged = True
 
+                open(_done_path(gen), 'w').close()
+                if converged:
+                    if gen % save_every != 0:
+                        self._save_checkpoint(output_dir, gen)
+                    open(_converged_path, 'w').close()
+                    break
             else:
                 while not os.path.exists(_done_path(gen)):
                     time.sleep(poll_interval)
+                if os.path.exists(_converged_path):
+                    break
 
-        return self.meta_pool
-
+        return self.population
 
 # ---------------------------------------------------------------------------
 # Main script
@@ -857,6 +868,7 @@ elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
         rm_tokenizer=reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions()
 elif script_args.dataset_name == 'argilla/news-summary':
+    # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test
     dataset = build_dataset_news_summary_ppo(
         script_args.dataset_name, sft_tokenizer,
         reward_models.rm_tokenizers[0], split='test')
@@ -873,17 +885,14 @@ else:
                      f'nvidia/HelpSteer, nvidia/HelpSteer2, openbmb/UltraFeedback')
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
-    if key in dataset.column_names:
-        dataset = dataset.remove_columns(key)
+    if key in dataset.column_names:     dataset     = dataset.remove_columns(key)
 
 dataset = dataset.with_format("numpy")
 data_collator = DataCollatorWithPadding(tokenizer=sft_tokenizer)
 print(f'Dataset size: {len(dataset)} | eval_prompts per call: {script_args.eval_prompts}')
 
 _max_new_tokens = (script_args.max_new_tokens if script_args.max_new_tokens > 0
-                   else (128 if script_args.dataset_name in {
-                       'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K',
-                       'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48))
+                   else (128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48))
 generation_kwargs = {
     'max_new_tokens': _max_new_tokens, 'min_length': -1,
     'top_k': 0, 'top_p': 0.9, 'temperature': 0.7, 'do_sample': script_args.do_sample,
@@ -903,17 +912,21 @@ for i, path in enumerate(script_args.expert_model_paths):
 print(f'  All {len(expert_models)} experts loaded on {device}.')
 
 lm_hidden_size = expert_models[0].config.hidden_size
-print(f'lm_hidden_size = {lm_hidden_size}')
+_num_layers    = len(expert_models[0].model.layers)
+print(f'lm_hidden_size = {lm_hidden_size}, num_layers = {_num_layers}')
 
 template_net = GatingNetwork(
     lm_hidden_size=lm_hidden_size,
     num_experts=len(expert_models),
+    num_layers=_num_layers,
+    alpha_init=script_args.alpha_init,
 )
 
 if script_args.warm_start_path:
     from nsgaii_utils import load_gating_network as _load
     loaded = _load(script_args.warm_start_path, lm_hidden_size=lm_hidden_size,
-                   num_experts=len(expert_models), device='cpu')
+                   num_experts=len(expert_models), num_layers=_num_layers,
+                   device='cpu')
     if loaded is not None:
         template_net = loaded.cpu().bfloat16()
         print(f'Warm-start from {script_args.warm_start_path}')
@@ -929,9 +942,9 @@ nsgaii = NSGAII(
     device=device,
 )
 
-print(f'\nStarting Chunk-Based Incremental NSGA-II — {script_args.num_generations} generations, '
-      f'P={nsgaii.P} new children/gen, N={script_args.eval_prompts}-prompt chunks …')
-nsgaii.run(
+print(f'\nStarting NSGA-II — {script_args.num_generations} generations, '
+      f'P={nsgaii.P}, 1 eval per individual …')
+final_population = nsgaii.run(
     dataset=dataset, data_collator=data_collator,
     eval_prompts=script_args.eval_prompts, eval_batch_size=script_args.eval_batch_size,
     moe_model=moe_model, sft_tokenizer=sft_tokenizer,
@@ -939,44 +952,44 @@ nsgaii.run(
     generation_kwargs=generation_kwargs, gpu_id=gpu_id,
     num_generations=script_args.num_generations,
     mutation_sigma=script_args.mutation_sigma, mutation_rate=script_args.mutation_rate,
-    sigma_decay=script_args.sigma_decay, sigma_min=script_args.sigma_min,
-    num_continuations=script_args.num_continuations,
+    sigma_decay=script_args.sigma_decay, num_continuations=script_args.num_continuations,
     save_every=script_args.save_every, output_dir=output_dir,
     verbose=script_args.verbose, seed=script_args.seed,
-    meta_pool_size=script_args.meta_pool_size,
-    crowding_threshold=script_args.crowding_threshold,
+    fitness_ema_alpha=script_args.fitness_ema_alpha,
+    ema_alpha_start=script_args.ema_alpha_start,
+    ema_alpha_decay=script_args.ema_alpha_decay,
+    sigma_min=script_args.sigma_min,
+    archive_size=script_args.archive_size,
+    convergence_window=script_args.convergence_window,
+    child_penalty=script_args.child_penalty,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
 )
 
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
 if is_main:
-    print(f'\nSaving final meta pool to {output_dir}/final …')
+    print(f'\nSaving final population to {output_dir}/final …')
     final_dir = os.path.join(output_dir, 'final')
     os.makedirs(final_dir, exist_ok=True)
-    for i, ind in enumerate(nsgaii.meta_pool):
+    for i, params in enumerate(final_population):
         subdir = os.path.join(final_dir, f'ind_{i:03d}')
-        net    = params_to_net(ind.params, template_net, 'cpu')
+        net    = params_to_net(params, template_net, 'cpu')
         save_gating_network(net, subdir)
-        mf = ind.mean_fitness()
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
-            json.dump({
-                'mean_fitness':  mf.tolist() if mf is not None else None,
-                'chunk_fitness': {str(k): v.tolist() for k, v in ind.chunk_fitness.items()},
-                'entry_gen':     ind.entry_gen,
-            }, f, indent=2)
+            json.dump({'fitness': nsgaii.fitness[i].tolist()}, f, indent=2)
 
+    fronts = _non_dominated_sort(np.array(nsgaii.fitness))
     with open(os.path.join(output_dir, 'nsgaii_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,
             'z_star':          nsgaii.z_star.tolist(),
-            'final_fitness':   [ind.mean_fitness().tolist() for ind in nsgaii.meta_pool
-                                if ind.mean_fitness() is not None],
+            'final_fitness':   [f.tolist() for f in nsgaii.fitness],
             'fitness_history': nsgaii.fitness_history,
+            'front_history':   nsgaii.front_history,
             'num_generations': script_args.num_generations,
             'population_size': nsgaii.P,
             'lm_hidden_size':  lm_hidden_size,
         }, f, indent=2)
 
-    print(f'\nDone. Meta pool: {len(nsgaii.meta_pool)} individuals | '
-          f'z*={np.round(nsgaii.z_star, 4)}')
+    print(f'\nDone. Non-dominated front: {len(fronts[0])}/{nsgaii.P} individuals')
+    print(f'Final ideal point z* = {np.round(nsgaii.z_star, 4)}')

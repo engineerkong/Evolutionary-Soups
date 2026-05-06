@@ -45,6 +45,7 @@ for pref in "${preferences[@]}"; do
         --exp_type "beaver" \
         --preference "${pref}" \
         --epochs 5 \
+        --learning_rate 1e-5 \
         --mini_batch_size 8 \
         --gradient_accumulation_steps 4 \
         --target 6 \

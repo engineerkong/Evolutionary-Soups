@@ -41,12 +41,12 @@ preferences=(
 
 for pref in "${preferences[@]}"; do
     pref_tag="${pref//,/_}"
-    run_name="morlhf_assistant_2704_pref${pref_tag}"
+    run_name="morlhf_assistant_3004_pref${pref_tag}"
 
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-    CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
+    CUDA_VISIBLE_DEVICES=2,3 accelerate launch \
         --num_processes 2 \
-        --main_process_port 29801 \
+        --main_process_port 29802 \
         ./scripts/baselines/morlhf/morlhf.py \
         --base_model_name "${base_model_name}" \
         --sft_model_name "${sft_model_name}" \
@@ -54,9 +54,12 @@ for pref in "${preferences[@]}"; do
         --exp_type "assistant" \
         --preference "${pref}" \
         --epochs 1 \
+        --learning_rate 1e-5 \
         --mini_batch_size 8 \
         --gradient_accumulation_steps 8 \
+        --target 3 \
+        --init_kl_coef 0.2 \
         --save_directory "${save_dir}" \
-        --wandb_name "morlhf_assistant_2704" \
+        --wandb_name "morlhf_assistant_3004" \
         2>&1 | tee ./logs/morlhf/${run_name}.log
 done

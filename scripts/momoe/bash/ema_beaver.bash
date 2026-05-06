@@ -7,14 +7,18 @@ reward_names='beaver_reward,beaver_cost'
 eval_prompts=1024
 population_size=20
 num_generations=100
-sigma_decay=0.97
-meta_pool_size=0
-crowding_threshold=0.05
-run_name='nsgaii_beaver_3004a'
+# --------------------
+fitness_ema_alpha=1.0
+ema_alpha_start=1.0
+ema_alpha_decay=1.0
+archive_size=0
+child_penalty=1.0
+# --------------------
+run_name='nsgaii_beaver_whole_0205'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29604 \
-    ./scripts/momoe/nsgaii.py \
+    ./scripts/momoe/ema.py \
     --base_model_name "${base_model_name}" \
     --expert_model_paths ${expert_model_paths} \
     --dataset_name "${dataset_name}" \
@@ -23,7 +27,10 @@ CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29604 \
     --population_size "${population_size}" \
     --num_generations "${num_generations}" \
     --sigma_decay "${sigma_decay}" \
-    --meta_pool_size "${meta_pool_size}" \
-    --crowding_threshold "${crowding_threshold}" \
+    --fitness_ema_alpha "${fitness_ema_alpha}" \
+    --ema_alpha_start "${ema_alpha_start}" \
+    --ema_alpha_decay "${ema_alpha_decay}" \
+    --archive_size "${archive_size}" \
+    --child_penalty "${child_penalty}" \
     --run_name "${run_name}" \
     2>&1 | tee ./logs/${run_name}.log

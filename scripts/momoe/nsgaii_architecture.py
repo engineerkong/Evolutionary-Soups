@@ -21,32 +21,89 @@ from scripts.utils.utils import get_clean_data
 
 
 # ---------------------------------------------------------------------------
-# Gating Network  (identical to moead_architecture.GatingNetwork)
+# α-entmax helpers (Peters et al., 2019)
+# ---------------------------------------------------------------------------
+
+def _sparsemax(z: torch.Tensor) -> torch.Tensor:
+    """Exact sparsemax (α=2 entmax) — closed-form projection onto the simplex."""
+    z_sorted, _ = torch.sort(z, descending=True, dim=-1)
+    k = torch.arange(1, z.shape[-1] + 1, device=z.device, dtype=z.dtype)
+    z_cumsum = torch.cumsum(z_sorted, dim=-1)
+    mask = (1.0 + k * z_sorted) > z_cumsum
+    k_z = mask.sum(dim=-1, keepdim=True).clamp(min=1)
+    tau = (z_cumsum.gather(-1, k_z - 1) - 1.0) / k_z.to(z.dtype)
+    return torch.clamp(z - tau, min=0.0)
+
+
+def _entmax_bisect(z: torch.Tensor, alpha: float, n_iter: int = 50) -> torch.Tensor:
+    """α-entmax via bisection for arbitrary α > 1 (Peters et al., 2019).
+
+    p_i* = max(0, (α-1)·(z_i - τ))^(1/(α-1)),  τ s.t. Σp=1.
+    """
+    am1 = alpha - 1.0
+    z = z - z.max(dim=-1, keepdim=True).values   # shift for numerical stability
+    K = z.shape[-1]
+    tau_lo = (am1 * z.sum(dim=-1, keepdim=True) - 1.0) / K
+    tau_hi = z.max(dim=-1, keepdim=True).values
+    for _ in range(n_iter):
+        tau_mid = (tau_hi + tau_lo) * 0.5
+        p = torch.clamp(am1 * (z - tau_mid), min=0.0).pow(1.0 / am1)
+        err = p.sum(dim=-1, keepdim=True) - 1.0
+        tau_lo = torch.where(err < 0, tau_mid, tau_lo)
+        tau_hi = torch.where(err >= 0, tau_mid, tau_hi)
+    tau = (tau_hi + tau_lo) * 0.5
+    p = torch.clamp(am1 * (z - tau), min=0.0).pow(1.0 / am1)
+    s = p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    return p / s
+
+
+def _apply_entmax(z: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    """Dispatch α-entmax for a scalar per-layer alpha nn.Parameter."""
+    a = float(alpha.clamp(1.0, 3.0))
+    if a < 1.0 + 1e-4:
+        return F.softmax(z, dim=-1)
+    if abs(a - 2.0) < 1e-4:
+        return _sparsemax(z)
+    return _entmax_bisect(z, a)
+
+
+# ---------------------------------------------------------------------------
+# Gating Network
 # ---------------------------------------------------------------------------
 
 class GatingNetwork(nn.Module):
     """Per-layer gating: mean-pool hidden states → expert merging weights.
 
     Input:  (B, seq, lm_hidden_size)  or  (B, lm_hidden_size)
-    Output: (B, num_experts)  — sum to 1 via softmax
+    Output: (B, num_experts)  — sparse weights via α-entmax (α=1→softmax, α=2→sparsemax)
+
+    alpha is a per-layer nn.Parameter (shape [num_layers]) included in the
+    evolutionary genome via net_to_params / params_to_net.
     """
 
     def __init__(self, lm_hidden_size: int = 4096, num_experts: int = 2,
-                 hidden_size: int = 256):
+                 hidden_size: int = 256, num_layers: int = 32,
+                 alpha_init: float = 1.0):
         super().__init__()
         self.lm_hidden_size = lm_hidden_size
         self.num_experts    = num_experts
         self.hidden_size    = hidden_size
+        self.num_layers     = num_layers
         self.net = nn.Sequential(
             nn.Linear(lm_hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, num_experts),
         ).to(torch.bfloat16)
+        # Per-layer α for α-entmax; registered as Parameter so it's part of the genome
+        self.alpha = nn.Parameter(
+            torch.ones(num_layers, dtype=torch.float32) * alpha_init)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor,
+                layer_idx: int = 0) -> torch.Tensor:
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.mean(dim=1)
-        return F.softmax(self.net(hidden_states.to(self.net[0].weight.dtype)), dim=-1)
+        logits = self.net(hidden_states.to(self.net[0].weight.dtype))
+        return _apply_entmax(logits.float(), self.alpha[layer_idx]).to(logits.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +196,7 @@ class MoEForCausalLM(nn.Module):
 
             # ── Gate on post-attn hidden states (before FFN) ─────────────────
             if is_prefill:
-                coeff = self.gating_net(hidden_states)
+                coeff = self.gating_net(hidden_states, layer_idx=l)
                 seq_coefficients.append(coeff)
             else:
                 coeff = seq_coefficients[l]

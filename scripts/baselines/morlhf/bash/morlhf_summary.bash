@@ -41,12 +41,12 @@ preferences=(
 
 for pref in "${preferences[@]}"; do
     pref_tag="${pref//,/_}"
-    run_name="morlhf_summary_2704_pref${pref_tag}"
+    run_name="morlhf_summary_0105_pref${pref_tag}"
 
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
         --num_processes 2 \
-        --main_process_port 29803 \
+        --main_process_port 29801 \
         ./scripts/baselines/morlhf/morlhf.py \
         --base_model_name "${base_model_name}" \
         --sft_model_name "${sft_model_name}" \
@@ -54,11 +54,12 @@ for pref in "${preferences[@]}"; do
         --exp_type "summary" \
         --preference "${pref}" \
         --epochs 3 \
+        --learning_rate 5e-6 \
         --mini_batch_size 8 \
         --gradient_accumulation_steps 8 \
         --target 6 \
         --init_kl_coef 0.05 \
         --save_directory "${save_dir}" \
-        --wandb_name "morlhf_summary_2704" \
+        --wandb_name "morlhf_summary_0105" \
         2>&1 | tee ./logs/morlhf/${run_name}.log
 done
