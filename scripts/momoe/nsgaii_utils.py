@@ -58,7 +58,8 @@ def save_gating_network(gating_net, save_path: str) -> None:
         'lm_hidden_size': gating_net.lm_hidden_size,
         'num_experts':    gating_net.num_experts,
         'hidden_size':    gating_net.hidden_size,
-        'num_layers':     gating_net.alpha.shape[0],
+        'num_layers':     gating_net.num_layers,
+        'fixed_alpha':    gating_net.fixed_alpha,
     }
     with open(os.path.join(save_path, 'gating_config.json'), 'w') as f:
         json.dump(config, f, indent=2)
@@ -74,6 +75,7 @@ def load_gating_network(save_path: str, lm_hidden_size: int = 4096,
 
     net_type    = 'GatingNetwork'
     hidden_size = 256
+    fixed_alpha = None
     cfg_file = os.path.join(resolved, 'gating_config.json')
     if os.path.exists(cfg_file):
         with open(cfg_file) as f:
@@ -83,9 +85,11 @@ def load_gating_network(save_path: str, lm_hidden_size: int = 4096,
         num_experts    = cfg.get('num_experts',     num_experts)
         hidden_size    = cfg.get('hidden_size',     hidden_size)
         num_layers     = cfg.get('num_layers',      num_layers)
+        fixed_alpha    = cfg.get('fixed_alpha',     None)
 
     net = GatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
-                        hidden_size=hidden_size, num_layers=num_layers)
+                        hidden_size=hidden_size, num_layers=num_layers,
+                        fixed_alpha=fixed_alpha)
     # strict=False allows loading old checkpoints that lack the alpha parameter
     net.load_state_dict(torch.load(ckpt_file, map_location=device), strict=False)
     return net.to(device).bfloat16()

@@ -369,6 +369,11 @@ if args.gating_paths:
             continue
         ckpt_name = os.path.basename(ckpt_path)
         label     = f'MoE NSGAII [{ckpt_name}]'
+        if is_main:
+            alphas = gating.alpha_floats()
+            alpha_str = (f'fixed={gating.fixed_alpha}' if gating.fixed_alpha is not None
+                         else f'learned  min={min(alphas):.3f} max={max(alphas):.3f} mean={sum(alphas)/len(alphas):.3f}')
+            print(f'  loaded {ckpt_name}  α={alpha_str}', flush=True)
         all_configs.append((label, MoEForCausalLM(experts, gating).to(device)))
 
 # ---------------------------------------------------------------------------

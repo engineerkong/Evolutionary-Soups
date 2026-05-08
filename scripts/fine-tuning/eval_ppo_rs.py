@@ -21,6 +21,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import get_clean_data, load_main_tokenizer, save_configs, sample_preferences_uniform, \
     Instructions, Instructions_summary, build_dataset_eval, build_dataset_summary_eval, \
+    build_dataset_summary_ppo, \
     build_dataset_news_summary_ppo, build_dataset_beaver_eval, build_dataset_steer_eval, \
     build_dataset_ultrafeedback_eval
 tqdm.pandas()
@@ -74,6 +75,8 @@ class ScriptArguments:
     dataset_name: Optional[str] = field(default='Anthropic/hh-rlhf', metadata={"help": "dataset: 'Anthropic/hh-rlhf', 'openai/summarize_from_feedback', or 'argilla/news-summary'"})
     save_directory: Optional[str] = field(default='./results/ppo_rs/', metadata={"help": "directory to save results"})
     wandb_name: Optional[str] = field(default='assistant_ppo_rs_eval', metadata={"help": "name for this experiment"})
+    split: Optional[str] = field(default='test', metadata={"help": "dataset split: 'train' or 'test'"})
+    size: Optional[int] = field(default=0, metadata={"help": "number of prompts to use (0 = all)"})
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
@@ -134,11 +137,11 @@ reward_models = RewardModels(reward_model_path_list, rm_tokenizer_path_list, gpu
 tokenizer = load_main_tokenizer(ppo_model_list[0])
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     valid_dataset = build_dataset_eval(
-        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split=script_args.split)
     instructions = Instructions()
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     valid_dataset = build_dataset_summary_eval(
-        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split=script_args.split)
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'argilla/news-summary':
     valid_dataset = build_dataset_news_summary_ppo(
@@ -146,11 +149,11 @@ elif script_args.dataset_name == 'argilla/news-summary':
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     valid_dataset = build_dataset_beaver_eval(
-        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split=script_args.split)
     instructions = Instructions()
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     valid_dataset = build_dataset_steer_eval(
-        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split='test')
+        script_args.dataset_name, tokenizer, reward_models.rm_tokenizers, split=script_args.split)
     instructions = Instructions()
 elif script_args.dataset_name == 'openbmb/UltraFeedback':
     valid_dataset = build_dataset_ultrafeedback_eval(
@@ -158,6 +161,8 @@ elif script_args.dataset_name == 'openbmb/UltraFeedback':
     instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}')
+if script_args.size > 0:
+    valid_dataset = valid_dataset.select(range(min(script_args.size, len(valid_dataset))))
 print(f"Size of the validation set: {len(valid_dataset)}")
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:

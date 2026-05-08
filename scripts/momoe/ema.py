@@ -66,6 +66,7 @@ class ScriptArguments:
     eval_batch_size:      int       = 128
     max_new_tokens:       int       = -1   # -1 = auto-derive from dataset_name (128 hh-rlhf, 48 summary)
     normalize_rewards:    bool      = False
+    normalize_fitness:    bool      = False  # min-max normalize fitness by expert model bounds
     warm_start_path:      str       = ''
     # Algorithm selection
     algorithm:            str       = 'nsgaii'   # 'nsgaii' | 'nsgaiii'
@@ -91,7 +92,8 @@ class ScriptArguments:
 # ---------------------------------------------------------------------------
 
     # α-entmax: per-layer sparsity of gating weights (1.0=softmax, 2.0=sparsemax)
-    alpha_init:           float     = 1.0   # initial α for all layers; evolved jointly with gate weights
+    alpha_init:           float          = 1.5   # initial α for all layers; evolved jointly with gate weights
+    fixed_alpha:          Optional[float] = None  # if set, α is fixed (removed from genome)
 
     gpu_id:               int       = -1
     save_directory:       str       = './models/nsgaii/'
@@ -122,6 +124,21 @@ def params_to_net(params: np.ndarray, template: GatingNetwork,
                                  dtype=p.dtype, device=device))
             offset += n
     return net
+
+
+def _make_onehot_params(template: GatingNetwork, expert_idx: int) -> np.ndarray:
+    """Return params that force gating to output one-hot[expert_idx] for any input.
+
+    Zeroes the last linear weight so only the bias matters, then sets
+    bias[expert_idx]=+100 and all others=-100. Entmax → exactly one-hot.
+    """
+    net = copy.deepcopy(template)
+    with torch.no_grad():
+        last = net.net[-1]          # nn.Linear(hidden_size, num_experts)
+        last.weight.zero_()
+        last.bias.fill_(-100.0)
+        last.bias[expert_idx] = 100.0
+    return net_to_params(net)
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +503,7 @@ class NSGAII:
         child_penalty:         float = 0.95,
         algorithm:             str   = 'nsgaii',
         n_reference_divisions: int   = 12,
+        normalize_fitness:     bool  = False,
     ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
@@ -591,11 +609,55 @@ class NSGAII:
                     time.sleep(poll_interval)
 
         # ── Collect fitness from one task result ──────────────────────────────
+        # bounds is a mutable dict so _collect_fitness can see updates made after
+        # it is defined (expert bounds evaluation fills it before gen 0).
+        bounds: dict = {'min': None, 'range': None}
+
         def _collect_fitness(gen, task_id) -> np.ndarray:
             with open(_result_path(gen, task_id)) as f:
                 r = np.array(json.load(f)['reward_vec'])
+            if bounds['range'] is not None:
+                r = (r - bounds['min']) / bounds['range']
             self._update_z_star(r)
             return r
+
+        # ── Expert reward bounds (normalize_fitness=True) ─────────────────────
+        # Evaluate each expert individually (one-hot gating) on chunk 0 to get
+        # per-objective min/max.  Uses the same task-queue infrastructure as
+        # gen 0 so all workers participate in parallel.
+        if normalize_fitness:
+            _BG = -1   # bounds gen → directory 'gen_-001'
+            if is_main:
+                print(f'Computing expert reward bounds '
+                      f'({self.template.num_experts} experts, chunk 0) …', flush=True)
+                os.makedirs(_gen_dir(_BG), exist_ok=True)
+                for exp_idx in range(self.template.num_experts):
+                    _write_task(_BG, exp_idx, {
+                        'task_id':      exp_idx,
+                        'chunk_idx':    0,
+                        'child_params': _make_onehot_params(self.template, exp_idx).tolist(),
+                    })
+
+            _worker_loop(_BG, 0, self.template.num_experts, _done_path(_BG))
+
+            if is_main:
+                expert_rewards = []
+                for exp_idx in range(self.template.num_experts):
+                    with open(_result_path(_BG, exp_idx)) as f:
+                        r = np.array(json.load(f)['reward_vec'])
+                    expert_rewards.append(r)
+                    print(f'  expert {exp_idx}: {np.round(r, 3)}', flush=True)
+                r_min   = np.min(expert_rewards, axis=0)
+                r_max   = np.max(expert_rewards, axis=0)
+                r_range = np.maximum(r_max - r_min, 1e-6)
+                bounds['min']   = r_min
+                bounds['range'] = r_range
+                print(f'  reward_min={np.round(r_min, 3)}', flush=True)
+                print(f'  reward_max={np.round(r_max, 3)}', flush=True)
+                open(_done_path(_BG), 'w').close()
+            else:
+                while not os.path.exists(_done_path(_BG)):
+                    time.sleep(poll_interval)
 
         # ── Phase 0: initial population ───────────────────────────────────────
         gen = 0
@@ -656,6 +718,10 @@ class NSGAII:
                 cur_alpha = (max(fitness_ema_alpha, ema_alpha_start * (ema_alpha_decay ** gen))
                              if ema_alpha_start > fitness_ema_alpha else fitness_ema_alpha)
 
+                # gen 0: no penalty (parents have no EMA history yet, equal ground).
+                # gen 1+: fixed floor penalty.
+                cur_penalty = 1.0 if gen == 0 else child_penalty
+
                 # Write parent re-eval tasks (0..P-1)
                 for i in range(self.P):
                     _write_task(gen, i, {'task_id': i, 'chunk_idx': chunk_idx,
@@ -672,7 +738,7 @@ class NSGAII:
                     _write_task(gen, self.P + i, {'task_id': self.P + i, 'chunk_idx': chunk_idx,
                                                    'child_params': child.tolist()})
                 log(f'gen {gen} crossover: parents={self.P}, xover={xover_size} '
-                    f'(+{len(self.elite_archive)} arch), α={cur_alpha:.3f}, penalty={child_penalty:.2f}, chunk={chunk_idx}')
+                    f'(+{len(self.elite_archive)} arch), α={cur_alpha:.3f}, penalty={cur_penalty:.2f}, chunk={chunk_idx}')
 
                 open(_tasks_ready_path(gen), 'w').close()
             else:
@@ -702,15 +768,24 @@ class NSGAII:
                 merged_params  = parent_params + child_params_list
                 merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
-                # Child apparent fitness: pure raw with safety penalty.
-                # No EMA inheritance — child competes purely on current-chunk performance,
-                # deflated by child_penalty to require a genuine advantage over parents.
-                # raw - (1 - penalty) * |raw| moves each objective toward worse regardless of sign.
-                child_ema_list = [raw - (1.0 - child_penalty) * np.abs(raw)
-                                  for raw in child_fitness]
-                merged_ema = np.vstack([np.array(self.ema_fitness), np.array(child_ema_list)])
+                # Front 1: raw current-chunk fitness — equal ground for parents and children.
+                # Answers: "is the child genuinely competitive right now?"
+                front1_set = set(_select(merged_fitness, self.P))
 
-                selected         = _select(merged_ema, self.P)
+                # Front 2: EMA parents vs penalized children — historical stability filter.
+                # Answers: "does the child have a stable advantage over the proven parent?"
+                child_ema_list = [raw - (1.0 - cur_penalty) * np.abs(raw)
+                                  for raw in child_fitness]
+                merged_ema  = np.vstack([np.array(self.ema_fitness), np.array(child_ema_list)])
+                front2_list = _select(merged_ema, self.P)
+
+                # Intersection + fill (Plan B): a survivor must pass both fronts;
+                # when intersection < P, fill from Front 2 in NSGA-III rank order.
+                intersection = [k for k in front2_list if k in front1_set]
+                extras       = [k for k in front2_list if k not in front1_set]
+                selected     = intersection + extras[:self.P - len(intersection)]
+
+                n_intersection   = len(intersection)
                 # label each survivor: "{new_pos}-parent{old_pos}" if parent, "{new_pos}-child" if new
                 ind_labels       = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
                                     for j, k in enumerate(selected)]
@@ -718,6 +793,11 @@ class NSGAII:
                 self.population  = [merged_params[k]  for k in selected]
                 self.fitness     = [merged_fitness[k]  for k in selected]
                 self.ema_fitness = [merged_ema[k]      for k in selected]
+                # Penalty was for selection only — reset newly-selected children's EMA
+                # to raw so it does not bias their history as parents next generation.
+                for j, k in enumerate(selected):
+                    if k >= self.P:
+                        self.ema_fitness[j] = merged_fitness[k].copy()
 
             # ── Post-selection bookkeeping and logging ────────────────────────
             if is_main:
@@ -747,22 +827,29 @@ class NSGAII:
                         pop_log = json.load(f)
                 except FileNotFoundError:
                     pop_log = {}
-                # Extract per-layer entmax alpha for each population member
-                # alpha occupies the last template.num_layers entries of the flat genome
-                _n_alpha = self.template.num_layers
-                pop_alphas = np.array(
-                    [self.population[j][-_n_alpha:] for j in range(self.P)])
-                mean_alpha_per_layer = pop_alphas.mean(axis=0)   # (num_layers,)
-                mean_alpha           = float(pop_alphas.mean())
-                max_alpha            = float(pop_alphas.max())
-                sparse_frac          = float((pop_alphas > 1.9).mean())
+                # Extract per-layer entmax alpha (only when alpha is part of the genome)
+                _fixed = self.template.fixed_alpha
+                if _fixed is None:
+                    # alpha is the first nn.Parameter → first num_layers elements of genome
+                    _n_alpha = self.template.num_layers
+                    pop_alphas = np.array(
+                        [self.population[j][:_n_alpha] for j in range(self.P)])
+                    mean_alpha  = float(pop_alphas.mean())
+                    max_alpha   = float(pop_alphas.max())
+                    sparse_frac = float((pop_alphas > 1.9).mean())
+                    alpha_str   = f'entmax_α={mean_alpha:.3f}(max={max_alpha:.3f},sparse={sparse_frac:.2f})'
+                    def _alpha_entry(j):
+                        return {'alpha_mean': float(pop_alphas[j].mean()),
+                                'alpha':      pop_alphas[j].tolist()}
+                else:
+                    alpha_str = f'entmax_α={_fixed:.3f}(fixed)'
+                    def _alpha_entry(j): return {}
 
                 pop_log[f'gen_{gen:04d}'] = {
                     label: {
-                        'raw':        fit_arr[j].tolist(),
-                        'ema':        ema_arr[j].tolist(),
-                        'alpha_mean': float(pop_alphas[j].mean()),
-                        'alpha':      pop_alphas[j].tolist(),
+                        'raw': fit_arr[j].tolist(),
+                        'ema': ema_arr[j].tolist(),
+                        **_alpha_entry(j),
                     }
                     for j, label in enumerate(ind_labels)
                 }
@@ -773,11 +860,12 @@ class NSGAII:
                     f'Gen {gen:4d}/{num_generations} | '
                     f'front0={n_front0}/{self.P} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
+                    f'intersect={n_intersection}/{self.P} | '
                     f'mean_fit={np.round(ema_arr.mean(axis=0), 3)} | '
                     f'best_fit={np.round(ema_arr.max(axis=0), 3)} | '
                     f'z*={np.round(self.z_star, 3)} | '
                     f'σ={sigma:.5f} | ema_α={cur_alpha:.3f} | '
-                    f'entmax_α={mean_alpha:.3f}(max={max_alpha:.3f},sparse={sparse_frac:.2f}) | '
+                    f'{alpha_str} | '
                     f'div={diversity:.5f} | arch={len(self.elite_archive)}',
                     flush=True,
                 )
@@ -855,7 +943,7 @@ if script_args.dataset_name == 'Anthropic/hh-rlhf':
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_ppo(
         script_args.dataset_name, sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train')
+        reward_models.rm_tokenizers[0], split='train', size=128)
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     dataset = build_dataset_beaver_ppo(
@@ -920,6 +1008,7 @@ template_net = GatingNetwork(
     num_experts=len(expert_models),
     num_layers=_num_layers,
     alpha_init=script_args.alpha_init,
+    fixed_alpha=script_args.fixed_alpha,
 )
 
 if script_args.warm_start_path:
@@ -964,6 +1053,7 @@ final_population = nsgaii.run(
     child_penalty=script_args.child_penalty,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
+    normalize_fitness=script_args.normalize_fitness,
 )
 
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)

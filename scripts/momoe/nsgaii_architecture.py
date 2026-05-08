@@ -35,31 +35,32 @@ def _sparsemax(z: torch.Tensor) -> torch.Tensor:
     return torch.clamp(z - tau, min=0.0)
 
 
-def _entmax_bisect(z: torch.Tensor, alpha: float, n_iter: int = 50) -> torch.Tensor:
+def _entmax_bisect(z: torch.Tensor, alpha: float, n_iter: int = 10) -> torch.Tensor:
     """α-entmax via bisection for arbitrary α > 1 (Peters et al., 2019).
 
     p_i* = max(0, (α-1)·(z_i - τ))^(1/(α-1)),  τ s.t. Σp=1.
+
     """
     am1 = alpha - 1.0
     z = z - z.max(dim=-1, keepdim=True).values   # shift for numerical stability
-    K = z.shape[-1]
-    tau_lo = (am1 * z.sum(dim=-1, keepdim=True) - 1.0) / K
-    tau_hi = z.max(dim=-1, keepdim=True).values
+    tau_hi = z.max(dim=-1, keepdim=True).values   # = 0 after shift
+    tau_lo = torch.full_like(tau_hi, -1.0 / am1)  # guaranteed lower bound
     for _ in range(n_iter):
         tau_mid = (tau_hi + tau_lo) * 0.5
         p = torch.clamp(am1 * (z - tau_mid), min=0.0).pow(1.0 / am1)
         err = p.sum(dim=-1, keepdim=True) - 1.0
-        tau_lo = torch.where(err < 0, tau_mid, tau_lo)
-        tau_hi = torch.where(err >= 0, tau_mid, tau_hi)
+        tau_lo = torch.where(err >= 0, tau_mid, tau_lo)  # sum>=1 → tau too low  → raise lo
+        tau_hi = torch.where(err < 0,  tau_mid, tau_hi)  # sum<1  → tau too high → lower hi
     tau = (tau_hi + tau_lo) * 0.5
     p = torch.clamp(am1 * (z - tau), min=0.0).pow(1.0 / am1)
     s = p.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     return p / s
 
 
-def _apply_entmax(z: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    """Dispatch α-entmax for a scalar per-layer alpha nn.Parameter."""
-    a = float(alpha.clamp(1.0, 3.0))
+def _apply_entmax(z: torch.Tensor, alpha) -> torch.Tensor:
+    """Dispatch α-entmax. alpha may be a pre-extracted Python float or a scalar Tensor."""
+    a = alpha if isinstance(alpha, float) else float(alpha.clamp(1.0, 2.0))
+    a = max(1.0, min(2.0, a))
     if a < 1.0 + 1e-4:
         return F.softmax(z, dim=-1)
     if abs(a - 2.0) < 1e-4:
@@ -83,27 +84,39 @@ class GatingNetwork(nn.Module):
 
     def __init__(self, lm_hidden_size: int = 4096, num_experts: int = 2,
                  hidden_size: int = 256, num_layers: int = 32,
-                 alpha_init: float = 1.0):
+                 alpha_init: float = 1.0, fixed_alpha: float = None):
         super().__init__()
         self.lm_hidden_size = lm_hidden_size
         self.num_experts    = num_experts
         self.hidden_size    = hidden_size
         self.num_layers     = num_layers
+        self.fixed_alpha    = fixed_alpha  # None = learnable, float = fixed (not in genome)
         self.net = nn.Sequential(
             nn.Linear(lm_hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, num_experts),
         ).to(torch.bfloat16)
-        # Per-layer α for α-entmax; registered as Parameter so it's part of the genome
-        self.alpha = nn.Parameter(
-            torch.ones(num_layers, dtype=torch.float32) * alpha_init)
+        if fixed_alpha is None:
+            # Per-layer α registered as Parameter so it's part of the evolutionary genome
+            self.alpha = nn.Parameter(
+                torch.ones(num_layers, dtype=torch.float32) * alpha_init)
+
+    def alpha_floats(self) -> list:
+        """Return all per-layer alpha values as Python floats (single GPU→CPU transfer)."""
+        if self.fixed_alpha is not None:
+            return [max(1.0, min(2.0, self.fixed_alpha))] * self.num_layers
+        return self.alpha.detach().clamp(1.0, 2.0).tolist()
 
     def forward(self, hidden_states: torch.Tensor,
-                layer_idx: int = 0) -> torch.Tensor:
+                layer_idx: int = 0,
+                alpha_val: float = None) -> torch.Tensor:
         if hidden_states.dim() == 3:
             hidden_states = hidden_states.mean(dim=1)
         logits = self.net(hidden_states.to(self.net[0].weight.dtype))
-        return _apply_entmax(logits.float(), self.alpha[layer_idx]).to(logits.dtype)
+        if alpha_val is None:
+            alpha_val = (self.fixed_alpha if self.fixed_alpha is not None
+                         else float(self.alpha[layer_idx].clamp(1.0, 2.0)))
+        return _apply_entmax(logits.float(), alpha_val).to(logits.dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +193,8 @@ class MoEForCausalLM(nn.Module):
         is_prefill = seq_coefficients is None
         if is_prefill:
             seq_coefficients = []
+            # Single GPU→CPU transfer for all 32 alpha values instead of one per layer
+            cached_alphas = self.gating_net.alpha_floats()
 
         for l in range(self.num_layers):
             layer0 = self.experts[0].model.layers[l]
@@ -196,7 +211,8 @@ class MoEForCausalLM(nn.Module):
 
             # ── Gate on post-attn hidden states (before FFN) ─────────────────
             if is_prefill:
-                coeff = self.gating_net(hidden_states, layer_idx=l)
+                coeff = self.gating_net(hidden_states, layer_idx=l,
+                                        alpha_val=cached_alphas[l])
                 seq_coefficients.append(coeff)
             else:
                 coeff = seq_coefficients[l]
