@@ -1,18 +1,12 @@
-"""nsgaii.py — Evolve GatingNetwork parameters using standard NSGA-II.
+"""evolutionary_soups.py — Evolve GatingNetwork parameters using standard NSGA-based algorithm.
 
-Algorithm: NSGA-II (Deb et al., 2002).
+NSGA-II (Deb et al., 2002).
   - Population of P individuals (flat GatingNetwork parameter vectors).
   - No preference vector during training — purely Pareto-based selection.
   - Each individual is evaluated ONCE to produce an M-dimensional reward vector.
   - Selection: non-dominated sort + crowding distance on raw reward vectors.
   - Parallel evaluation via file-based work queue (same as moead.py).
   - At inference: given preference λ, select best individual by argmax dot(λ, r_i).
-
-TO RUN:
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii.py \
-    --expert_model_paths './models/ppo/assistant_ppo_harmless_2701/batch_832/' \
-                         './models/ppo/assistant_ppo_helpful_2701/batch_832/' \
-    --run_name 'nsgaii_gating_0101' 2>&1 | tee ./logs/nsgaii_0101.log
 """
 
 import copy
@@ -24,7 +18,7 @@ import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch
@@ -66,10 +60,9 @@ class ScriptArguments:
     eval_batch_size:      int       = 128
     max_new_tokens:       int       = -1   # -1 = auto-derive from dataset_name (128 hh-rlhf, 48 summary)
     normalize_rewards:    bool      = False
-    normalize_fitness:    bool      = False  # min-max normalize fitness by expert model bounds
     warm_start_path:      str       = ''
     # Algorithm selection
-    algorithm:            str       = 'nsgaii'   # 'nsgaii' | 'nsgaiii'
+    algorithm:            str       = 'nsga4'   # 'nsgaii' | 'nsgaiii' | 'nsga4'
     n_reference_divisions: int      = 12         # Das-Dennis divisions for NSGA-III reference points
 
     # Evolutionary hyper-parameters
@@ -81,23 +74,15 @@ class ScriptArguments:
     sigma_decay:          float     = 0.99
     sigma_min:            float     = 0.03 # sigma floor; sigma_decay=0.97→σ_min@gen50, 0.95→@gen30
 # ---------------------------------------------------------------------------
-    fitness_ema_alpha:    float     = 1.0   # EMA smoothing: ema = α·raw + (1-α)·ema_prev
-                                            # 1.0 = no EMA (pure single-phase)
-    ema_alpha_start:      float     = 1.0   # annealing start α; if > fitness_ema_alpha, α decays
-                                            # each gen: α(g) = max(fitness_ema_alpha, start·decay^g)
-    ema_alpha_decay:      float     = 1.0  # per-gen α multiplier (~gen 22: 0.9→0.5)
-    archive_size:         int       = 10    # elitist Pareto archive capacity (0 = disabled)
-    child_penalty:        float     = 1.0  # safety coefficient: child apparent fitness *= (1 - (1-p)*|f|/|f|)
-                                            # i.e. child_ema = raw - (1-p)*|raw|; 1.0 = no penalty
+    parent_stability_bonus:  float  = 0.01  # per-gen bonus on parent baseline for front2
+                                             # effective = min(gen * bonus, cap)
+    parent_stability_cap:    float  = 0.10  # max bonus (10 %)
+    fixed_alpha:          float     = 1.2   # entmax α fixed for all layers (1.0=softmax, 2.0=sparsemax)
+    normalize_fitness:    bool      = True  # min-max normalize fitness by expert model bounds
 # ---------------------------------------------------------------------------
-
-    # α-entmax: per-layer sparsity of gating weights (1.0=softmax, 2.0=sparsemax)
-    alpha_init:           float          = 1.5   # initial α for all layers; evolved jointly with gate weights
-    fixed_alpha:          Optional[float] = None  # if set, α is fixed (removed from genome)
-
     gpu_id:               int       = -1
-    save_directory:       str       = './models/nsgaii/'
-    run_name:             str       = 'nsgaii_gating'
+    save_directory:       str       = './models/ES/'
+    run_name:             str       = 'es_gating'
     save_every:           int       = 5
     seed:                 int       = 8888
     verbose:              bool      = False
@@ -375,20 +360,63 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
     return selected + chosen_from_last
 
 
-def _pareto_prune(archive: list, max_size: int) -> list:
-    """Retain non-dominated (params, fitness) pairs, capped at max_size by crowding distance."""
-    non_dom = []
-    for p, f in archive:
-        if any(_dominates(ef, f) for _, ef in non_dom):
-            continue
-        non_dom = [(pp, ff) for pp, ff in non_dom if not _dominates(f, ff)]
-        non_dom.append((p.copy(), f.copy()))
-    if len(non_dom) > max_size:
-        fits  = np.array([f for _, f in non_dom])
-        dist  = _crowding_distance(fits, list(range(len(non_dom))))
-        order = np.argsort(-dist)[:max_size]
-        non_dom = [non_dom[i] for i in order]
-    return non_dom
+from pymoo.indicators.hv import HV as _PymooHV
+
+
+def _hv(points: np.ndarray, ref: np.ndarray) -> float:
+    """Hypervolume (maximisation) via pymoo.
+
+    pymoo uses minimisation convention: negate both points and ref.
+    """
+    ind = _PymooHV(ref_point=-ref)
+    return float(ind(-points))
+
+
+def _hypervolume_contribution(candidates: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Exclusive hypervolume contribution for each candidate point.
+
+    HVC[i] = HV(candidates) - HV(candidates \\ {i}).
+    """
+    n        = len(candidates)
+    total_hv = _hv(candidates, ref)
+    hvc      = np.zeros(n)
+    for i in range(n):
+        hvc[i] = total_hv - _hv(np.delete(candidates, i, axis=0), ref)
+    return hvc
+
+
+def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
+    """NSGA-IV selection: non-dominated sorting + greedy hypervolume contribution on last front.
+
+    Within the critical last front, individuals are ranked by their exclusive
+    hypervolume contribution (HVC) relative to a dynamic nadir reference point
+    (per-generation minimum - 0.1).  Higher HVC = larger unique coverage of
+    objective space = selected first.  This naturally retains both extreme
+    (corner) points and well-spread intermediate points without requiring
+    pre-specified reference lines or divisions.
+    """
+    fronts   = _non_dominated_sort(rewards)
+    selected: List[int] = []
+
+    for front in fronts:
+        if len(selected) + len(front) <= pop_size:
+            selected.extend(front)
+        else:
+            n_needed   = pop_size - len(selected)
+            candidates = np.array([rewards[i] for i in front])   # (|front|, M)
+
+            # Dynamic nadir: minimum across ALL individuals in the merged pool
+            # (selected + last front), shifted down to ensure ref is below all points.
+            all_pts = np.vstack([rewards[selected], candidates]) if selected else candidates
+            ref     = all_pts.min(axis=0) - 0.1
+
+            hvc     = _hypervolume_contribution(candidates, ref)
+            ranked  = [x for _, x in sorted(zip(-hvc, front))]
+            selected.extend(ranked[:n_needed])
+            break
+
+    return selected
+
 
 
 # ---------------------------------------------------------------------------
@@ -425,15 +453,16 @@ class NSGAII:
             for _ in range(self.P)
         ]
 
-        # fitness[i]:     raw reward vector from the latest evaluation
-        # ema_fitness[i]: EMA-smoothed fitness used for dominance / selection
-        self.fitness     = [np.full(self.M, -np.inf) for _ in range(self.P)]
-        self.ema_fitness = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        # fitness[i]:        raw reward vector from the latest evaluation
+        # parent_baseline[i]: cumulative mean of raw fitness across all generations
+        # parent_eval_count:  number of generations each parent has been evaluated
+        self.fitness          = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        self.parent_baseline  = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        self.parent_eval_count = [0] * self.P
 
         self.z_star          = np.full(self.M, -np.inf, dtype=np.float32)
         self.fitness_history = []
         self.front_history   = []
-        self.elite_archive:  list = []  # List[(params, ema_fitness)] non-dominated elitist store
 
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
@@ -494,16 +523,13 @@ class NSGAII:
         poll_interval:     float = 2.0,
         verbose:           bool  = False,
         seed:              int   = 42,
-        fitness_ema_alpha:     float = 1.0,
-        ema_alpha_start:       float = 1.0,
-        ema_alpha_decay:       float = 0.97,
-        sigma_min:             float = 0.005,
-        archive_size:          int   = 10,
-        convergence_window:    int   = 10,
-        child_penalty:         float = 0.95,
-        algorithm:             str   = 'nsgaii',
-        n_reference_divisions: int   = 12,
-        normalize_fitness:     bool  = False,
+        sigma_min:               float = 0.005,
+        convergence_window:      int   = 10,
+        parent_stability_bonus:  float = 0.01,
+        parent_stability_cap:    float = 0.10,
+        algorithm:               str   = 'nsgaii',
+        n_reference_divisions:   int   = 12,
+        normalize_fitness:       bool  = False,
     ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
@@ -511,14 +537,18 @@ class NSGAII:
         is_main = rank == 0
 
         # ── Algorithm-specific setup ──────────────────────────────────────────
-        assert algorithm in ('nsgaii', 'nsgaiii'), \
-            f"algorithm must be 'nsgaii' or 'nsgaiii', got {algorithm!r}"
+        assert algorithm in ('nsgaii', 'nsgaiii', 'nsga4'), \
+            f"algorithm must be 'nsgaii', 'nsgaiii', or 'nsga4', got {algorithm!r}"
         if algorithm == 'nsgaiii':
             ref_pts = _generate_reference_points(self.M, n_reference_divisions)
             _select = lambda fit, n: _nsga3_select(fit, n, ref_pts)
             if is_main:
                 print(f'NSGA-III: {len(ref_pts)} reference points '
                       f'(M={self.M}, divisions={n_reference_divisions})')
+        elif algorithm == 'nsga4':
+            _select = _nsga4_select
+            if is_main:
+                print(f'NSGA-IV: max-Tchebycheff utility selection (M={self.M})')
         else:
             _select = _nsga2_select
 
@@ -662,7 +692,7 @@ class NSGAII:
         # ── Phase 0: initial population ───────────────────────────────────────
         gen = 0
         if is_main:
-            print(f'NSGA-II — initialising population ({self.P} individuals, '
+            print(f'Evolutionary Soups — initialising population ({self.P} individuals, '
                   f'1 eval each = {self.P} tasks) …')
             os.makedirs(_gen_dir(gen), exist_ok=True)
             for i in range(self.P):
@@ -675,8 +705,9 @@ class NSGAII:
 
         if is_main:
             for i in range(self.P):
-                self.fitness[i]     = _collect_fitness(gen, i)
-                self.ema_fitness[i] = self.fitness[i].copy()   # gen-0: ema = raw
+                self.fitness[i] = _collect_fitness(gen, i)
+                self.parent_baseline[i]   = self.fitness[i].copy()
+                self.parent_eval_count[i] = 1
             open(_done_path(gen), 'w').close()
             log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
             print(f'Gen {gen:4d}/{num_generations}')
@@ -689,8 +720,6 @@ class NSGAII:
         # Single worker loop per generation evaluates 2P individuals on the same chunk:
         #   tasks 0..P-1  : parent re-evals (same chunk as children → fair comparison)
         #   tasks P..2P-1 : children
-        # pre_ema is snapshotted before the current-chunk parent eval so that child EMA
-        # inheritance uses only historical performance, avoiding double-counting.
 
         sigma             = mutation_sigma
         parents_kept_hist: list = []
@@ -699,28 +728,15 @@ class NSGAII:
         for gen in range(1, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
 
-            # evolution and evaluation
             if is_main:
                 os.makedirs(_gen_dir(gen), exist_ok=True)
                 chunk_idx = gen % _num_chunks
                 diversity = np.std(np.array(self.population), axis=0).mean()
 
-                # Snapshot EMA before current-chunk update (for parent EMA update below)
-                pre_ema = [f.copy() for f in self.ema_fitness]
-
                 parent_params = list(self.population)
 
-                # Archive extends the crossover donor pool (params only; no EMA inheritance)
-                xover_params = parent_params + [p for p, _ in self.elite_archive]
+                xover_params = parent_params
                 xover_size   = len(xover_params)
-
-                # Current EMA alpha: annealing from ema_alpha_start → fitness_ema_alpha
-                cur_alpha = (max(fitness_ema_alpha, ema_alpha_start * (ema_alpha_decay ** gen))
-                             if ema_alpha_start > fitness_ema_alpha else fitness_ema_alpha)
-
-                # gen 0: no penalty (parents have no EMA history yet, equal ground).
-                # gen 1+: fixed floor penalty.
-                cur_penalty = 1.0 if gen == 0 else child_penalty
 
                 # Write parent re-eval tasks (0..P-1)
                 for i in range(self.P):
@@ -737,8 +753,7 @@ class NSGAII:
                     child_params_list.append(child)
                     _write_task(gen, self.P + i, {'task_id': self.P + i, 'chunk_idx': chunk_idx,
                                                    'child_params': child.tolist()})
-                log(f'gen {gen} crossover: parents={self.P}, xover={xover_size} '
-                    f'(+{len(self.elite_archive)} arch), α={cur_alpha:.3f}, penalty={cur_penalty:.2f}, chunk={chunk_idx}')
+                log(f'gen {gen} crossover: parents={self.P}, chunk={chunk_idx}')
 
                 open(_tasks_ready_path(gen), 'w').close()
             else:
@@ -751,74 +766,79 @@ class NSGAII:
 
             _worker_loop(gen, 0, 2 * self.P, _done_path(gen))
 
-            # extract fitness for parents and children
             if is_main:
-                # Collect parent results → update fitness and EMA with current chunk
+                # Collect parent results and update cumulative baseline
                 for i in range(self.P):
                     raw = _collect_fitness(gen, i)
                     self.fitness[i] = raw
-                    if cur_alpha >= 1.0 or np.all(pre_ema[i] == -np.inf):
-                        self.ema_fitness[i] = raw.copy()
+                    n = self.parent_eval_count[i]
+                    if n == 0 or np.all(self.parent_baseline[i] == -np.inf):
+                        self.parent_baseline[i] = raw.copy()
                     else:
-                        self.ema_fitness[i] = (cur_alpha * raw
-                                               + (1.0 - cur_alpha) * pre_ema[i])
+                        # cumulative mean: baseline = (baseline * n + raw) / (n + 1)
+                        self.parent_baseline[i] = (self.parent_baseline[i] * n + raw) / (n + 1)
+                    self.parent_eval_count[i] = n + 1
+
                 # Collect child results
                 child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
 
                 merged_params  = parent_params + child_params_list
                 merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
-                # Front 1: raw current-chunk fitness — equal ground for parents and children.
-                # Answers: "is the child genuinely competitive right now?"
+                # Front 1: raw fitness — equal ground for parents and children.
                 front1_set = set(_select(merged_fitness, self.P))
 
-                # Front 2: EMA parents vs penalized children — historical stability filter.
-                # Answers: "does the child have a stable advantage over the proven parent?"
-                child_ema_list = [raw - (1.0 - cur_penalty) * np.abs(raw)
-                                  for raw in child_fitness]
-                merged_ema  = np.vstack([np.array(self.ema_fitness), np.array(child_ema_list)])
-                front2_list = _select(merged_ema, self.P)
+                # Front 2: parent baseline × (1 + per-parent bonus) vs child raw fitness.
+                # Bonus = min(eval_count * rate, cap): older parents get a higher threshold,
+                # so a child must beat the parent's proven historical average by an increasing
+                # margin to displace it.
+                parent_front2 = [
+                    self.parent_baseline[i] * (1.0 + min(self.parent_eval_count[i] * parent_stability_bonus,
+                                                          parent_stability_cap))
+                    for i in range(self.P)
+                ]
+                merged_front2 = np.vstack([np.array(parent_front2), np.array(child_fitness)])
+                front2_list   = _select(merged_front2, self.P)
 
-                # Intersection + fill (Plan B): a survivor must pass both fronts;
-                # when intersection < P, fill from Front 2 in NSGA-III rank order.
+                # Intersection + fill: survivor must pass both fronts.
                 intersection = [k for k in front2_list if k in front1_set]
                 extras       = [k for k in front2_list if k not in front1_set]
                 selected     = intersection + extras[:self.P - len(intersection)]
 
-                n_intersection   = len(intersection)
-                # label each survivor: "{new_pos}-parent{old_pos}" if parent, "{new_pos}-child" if new
-                ind_labels       = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
-                                    for j, k in enumerate(selected)]
-                n_parents_kept   = sum(1 for k in selected if k < self.P)
-                self.population  = [merged_params[k]  for k in selected]
-                self.fitness     = [merged_fitness[k]  for k in selected]
-                self.ema_fitness = [merged_ema[k]      for k in selected]
-                # Penalty was for selection only — reset newly-selected children's EMA
-                # to raw so it does not bias their history as parents next generation.
+                n_intersection = len(intersection)
+                ind_labels     = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
+                                  for j, k in enumerate(selected)]
+                n_parents_kept = sum(1 for k in selected if k < self.P)
+
+                # Update population; reset baseline/count for newly selected children
+                new_population    = [merged_params[k] for k in selected]
+                new_fitness       = [merged_fitness[k] for k in selected]
+                new_baseline      = []
+                new_eval_count    = []
                 for j, k in enumerate(selected):
-                    if k >= self.P:
-                        self.ema_fitness[j] = merged_fitness[k].copy()
+                    if k < self.P:
+                        new_baseline.append(self.parent_baseline[k].copy())
+                        new_eval_count.append(self.parent_eval_count[k])
+                    else:
+                        # Child enters as new parent: baseline starts from its first raw eval
+                        new_baseline.append(merged_fitness[k].copy())
+                        new_eval_count.append(1)
+
+                self.population       = new_population
+                self.fitness          = new_fitness
+                self.parent_baseline  = new_baseline
+                self.parent_eval_count = new_eval_count
 
             # ── Post-selection bookkeeping and logging ────────────────────────
             if is_main:
                 sigma = max(sigma_min, sigma * sigma_decay)
 
-                fit_arr  = np.array(self.fitness)      # raw (for z*, history)
-                ema_arr  = np.array(self.ema_fitness)  # smoothed (drives selection/display)
-                fronts   = _non_dominated_sort(ema_arr)
-                n_front0 = len(fronts[0]) if fronts else 0
+                fit_arr     = np.array(self.fitness)          # raw current-gen
+                base_arr    = np.array(self.parent_baseline)  # cumulative mean
+                fronts      = _non_dominated_sort(fit_arr)
+                n_front0    = len(fronts[0]) if fronts else 0
                 self.fitness_history.append(fit_arr.tolist())
                 self.front_history.append(n_front0)
-
-                # ── Elitist archive update ────────────────────────────────────
-                # Use the full 2P merged pool: filtered-out individuals are exactly
-                # what the archive is meant to protect against chunk-noise displacement.
-                if archive_size > 0:
-                    for k in range(len(merged_params)):
-                        f = merged_ema[k]
-                        if not any(_dominates(ef, f) for _, ef in self.elite_archive):
-                            self.elite_archive.append((merged_params[k].copy(), f.copy()))
-                    self.elite_archive = _pareto_prune(self.elite_archive, archive_size)
 
                 # Append per-individual record to population log
                 log_path = os.path.join(output_dir, 'population_log.json')
@@ -827,28 +847,13 @@ class NSGAII:
                         pop_log = json.load(f)
                 except FileNotFoundError:
                     pop_log = {}
-                # Extract per-layer entmax alpha (only when alpha is part of the genome)
-                _fixed = self.template.fixed_alpha
-                if _fixed is None:
-                    # alpha is the first nn.Parameter → first num_layers elements of genome
-                    _n_alpha = self.template.num_layers
-                    pop_alphas = np.array(
-                        [self.population[j][:_n_alpha] for j in range(self.P)])
-                    mean_alpha  = float(pop_alphas.mean())
-                    max_alpha   = float(pop_alphas.max())
-                    sparse_frac = float((pop_alphas > 1.9).mean())
-                    alpha_str   = f'entmax_α={mean_alpha:.3f}(max={max_alpha:.3f},sparse={sparse_frac:.2f})'
-                    def _alpha_entry(j):
-                        return {'alpha_mean': float(pop_alphas[j].mean()),
-                                'alpha':      pop_alphas[j].tolist()}
-                else:
-                    alpha_str = f'entmax_α={_fixed:.3f}(fixed)'
-                    def _alpha_entry(j): return {}
+                alpha_str = f'entmax_α={self.template.fixed_alpha:.3f}(fixed)'
+                def _alpha_entry(j): return {}
 
                 pop_log[f'gen_{gen:04d}'] = {
                     label: {
-                        'raw': fit_arr[j].tolist(),
-                        'ema': ema_arr[j].tolist(),
+                        'raw':      fit_arr[j].tolist(),
+                        'baseline': base_arr[j].tolist(),
                         **_alpha_entry(j),
                     }
                     for j, label in enumerate(ind_labels)
@@ -861,12 +866,13 @@ class NSGAII:
                     f'front0={n_front0}/{self.P} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
                     f'intersect={n_intersection}/{self.P} | '
-                    f'mean_fit={np.round(ema_arr.mean(axis=0), 3)} | '
-                    f'best_fit={np.round(ema_arr.max(axis=0), 3)} | '
+                    f'bonus={np.mean([min(self.parent_eval_count[i]*parent_stability_bonus, parent_stability_cap) for i in range(self.P)]):.3f} | '
+                    f'mean_fit={np.round(fit_arr.mean(axis=0), 3)} | '
+                    f'best_fit={np.round(fit_arr.max(axis=0), 3)} | '
                     f'z*={np.round(self.z_star, 3)} | '
-                    f'σ={sigma:.5f} | ema_α={cur_alpha:.3f} | '
+                    f'σ={sigma:.5f} | '
                     f'{alpha_str} | '
-                    f'div={diversity:.5f} | arch={len(self.elite_archive)}',
+                    f'div={diversity:.5f}',
                     flush=True,
                 )
 
@@ -943,7 +949,7 @@ if script_args.dataset_name == 'Anthropic/hh-rlhf':
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_ppo(
         script_args.dataset_name, sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train', size=128)
+        reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions_summary()
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     dataset = build_dataset_beaver_ppo(
@@ -1007,7 +1013,7 @@ template_net = GatingNetwork(
     lm_hidden_size=lm_hidden_size,
     num_experts=len(expert_models),
     num_layers=_num_layers,
-    alpha_init=script_args.alpha_init,
+    alpha_init=script_args.fixed_alpha,
     fixed_alpha=script_args.fixed_alpha,
 )
 
@@ -1031,7 +1037,7 @@ nsgaii = NSGAII(
     device=device,
 )
 
-print(f'\nStarting NSGA-II — {script_args.num_generations} generations, '
+print(f'\nStarting Evolutionary Soups — {script_args.num_generations} generations, '
       f'P={nsgaii.P}, 1 eval per individual …')
 final_population = nsgaii.run(
     dataset=dataset, data_collator=data_collator,
@@ -1044,13 +1050,10 @@ final_population = nsgaii.run(
     sigma_decay=script_args.sigma_decay, num_continuations=script_args.num_continuations,
     save_every=script_args.save_every, output_dir=output_dir,
     verbose=script_args.verbose, seed=script_args.seed,
-    fitness_ema_alpha=script_args.fitness_ema_alpha,
-    ema_alpha_start=script_args.ema_alpha_start,
-    ema_alpha_decay=script_args.ema_alpha_decay,
     sigma_min=script_args.sigma_min,
-    archive_size=script_args.archive_size,
     convergence_window=script_args.convergence_window,
-    child_penalty=script_args.child_penalty,
+    parent_stability_bonus=script_args.parent_stability_bonus,
+    parent_stability_cap=script_args.parent_stability_cap,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,
