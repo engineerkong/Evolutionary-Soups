@@ -84,9 +84,12 @@ class Args:
 class FixedGating(torch.nn.Module):
     def __init__(self, coeffs: List[float]):
         super().__init__()
-        self.register_buffer('_c', torch.tensor(coeffs, dtype=torch.bfloat16))
+        self.register_buffer('_c', torch.tensor(coeffs, dtype=torch.float32))
+        self.fixed_alpha = 1.0
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def alpha_floats(self): return [1.0] * 999   # length > num_layers, safe for any model
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self._c.unsqueeze(0).expand(hidden_states.shape[0], -1)
 
 
@@ -349,7 +352,13 @@ lm_hidden_size = experts[0].config.hidden_size
 all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
 # all_configs = []
 
-# 1. Rewarded soups evaluated separately (see loop below) — too large to hold all in all_configs
+# 1. Fixed-preference MoE: use λ directly as per-layer expert mixing weights.
+pref_simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
+for lam in pref_simplex:
+    all_configs.append((f'MoE fixed λ={list(lam)}',
+                        MoEForCausalLM(experts, FixedGating(list(lam))).to(device)))
+if is_main:
+    print(f'  Added {len(pref_simplex)} fixed-pref MoE configs', flush=True)
 
 # 2. NSGA-II GatingNetwork checkpoints — each evaluated ONCE.
 #    At inference: select best individual via argmax dot(λ, reward_i).
@@ -370,11 +379,12 @@ if args.gating_paths:
         ckpt_name = os.path.basename(ckpt_path)
         label     = f'MoE NSGAII [{ckpt_name}]'
         if is_main:
-            alphas = gating.alpha_floats()
+            alphas    = gating.alpha_floats()
             alpha_str = (f'fixed={gating.fixed_alpha}' if gating.fixed_alpha is not None
                          else f'learned  min={min(alphas):.3f} max={max(alphas):.3f} mean={sum(alphas)/len(alphas):.3f}')
             print(f'  loaded {ckpt_name}  α={alpha_str}', flush=True)
         all_configs.append((label, MoEForCausalLM(experts, gating).to(device)))
+
 
 # ---------------------------------------------------------------------------
 # Shard configs across ranks and evaluate

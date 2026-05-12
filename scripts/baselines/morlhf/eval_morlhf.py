@@ -120,10 +120,7 @@ if checkpoint_path:
 
 generation_kwargs = {
     "max_new_tokens": 128 if exp_type in ('assistant', 'beaver') else 48,
-    "min_length": -1,
-    "top_k": 0.0,
-    "top_p": 0.9,
-    "do_sample": True,
+    "do_sample": False,
 }
 
 print('evaluation........')
@@ -141,12 +138,12 @@ else:  # beaver
 
 print(f"Size of the validation set: {len(valid_dataset)}")
 
-for key in ['key', 'text', 'response']:
+for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in valid_dataset.column_names:
         valid_dataset = valid_dataset.remove_columns(key)
 
 data_collator     = DataCollatorWithPadding(tokenizer=tokenizer)
-valid_data_loader = DataLoader(valid_dataset, batch_size=1, drop_last=True, collate_fn=data_collator)
+valid_data_loader = DataLoader(valid_dataset, batch_size=script_args.batch_size, drop_last=False, collate_fn=data_collator)
 model, valid_data_loader = accelerator.prepare(model, valid_data_loader)
 
 full_response_tensors = []

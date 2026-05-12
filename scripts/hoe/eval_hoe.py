@@ -39,6 +39,7 @@ for _p in [str(HoE_ROOT / 'src'), str(HoE_ROOT)]:
 from hoe_utils import (
     build_hoe_model,
     load_hoe_checkpoint,
+    load_router_weights,
     make_number_experts_str,
     parse_comma_int_list,
     parse_comma_str_list as _parse_paths,
@@ -91,7 +92,8 @@ _DEFAULT_REWARD_NAMES = {
 class ScriptArguments:
     base_model_name: str = field(default='meta-llama/Llama-2-7b-hf', metadata={'help': 'Local path or HF id of the base LLaMA model'})
     expert_model_paths: str = field(default='', metadata={'help': 'Comma-separated paths to per-objective PPO LoRA adapters, one per reward (order must match reward_names)'})
-    checkpoint_path: str = field(default='', metadata={'help': 'Path to trained HoE router checkpoint directory'})
+    checkpoint_path: str = field(default='', metadata={'help': 'Path to Stage-2 trained HoE checkpoint directory (contains adapter_model.bin)'})
+    pretrained_moe_path: str = field(default='', metadata={'help': 'Path to Stage-1 router checkpoint directory (contains router_weights.pt). Use this to evaluate the router before Stage-2 PPO.'})
     dataset_name: str = field(default='Anthropic/hh-rlhf', metadata={'help': 'Dataset: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, nvidia/HelpSteer, nvidia/HelpSteer2'})
     reward_names: str = field(default='', metadata={'help': 'Comma-separated reward names; auto-selected from dataset_name if empty'})
     num_pref_samples: int = field(default=11, metadata={'help': 'Number of preference points to evaluate'})
@@ -142,7 +144,11 @@ model = build_hoe_model(
     router_hidden_dim=int(cfg.get('router_hidden_dim', 32)),
 )
 
-if script_args.checkpoint_path:
+if script_args.pretrained_moe_path:
+    # Stage-1 router checkpoint (router_weights.pt from train_hoe_router.py)
+    load_router_weights(model, script_args.pretrained_moe_path)
+elif script_args.checkpoint_path:
+    # Stage-2 PPO checkpoint (adapter_model.bin from train_hoe.py)
     load_hoe_checkpoint(model, script_args.checkpoint_path)
 
 model.eval()

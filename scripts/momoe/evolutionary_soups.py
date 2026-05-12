@@ -77,6 +77,7 @@ class ScriptArguments:
     parent_stability_bonus:  float  = 0.01  # per-gen bonus on parent baseline for front2
                                              # effective = min(gen * bonus, cap)
     parent_stability_cap:    float  = 0.10  # max bonus (10 %)
+    use_dual_front:          bool   = True  # if False, select solely by raw reward front (_select)
     fixed_alpha:          float     = 1.2   # entmax α fixed for all layers (1.0=softmax, 2.0=sparsemax)
     normalize_fitness:    bool      = True  # min-max normalize fitness by expert model bounds
 # ---------------------------------------------------------------------------
@@ -360,6 +361,10 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
     return selected + chosen_from_last
 
 
+# ---------------------------------------------------------------------------
+# NSGA-HVC helpers
+# ---------------------------------------------------------------------------
+
 from pymoo.indicators.hv import HV as _PymooHV
 
 
@@ -420,11 +425,11 @@ def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
-# NSGA-II
+# NSGA evolutionary algorithm class
 # ---------------------------------------------------------------------------
 
 class NSGAII:
-    """Standard NSGA-II for GatingNetwork evolution.
+    """Evolutionary Algorithm for GatingNetwork evolution.
 
     Population: P flat param vectors (no λ association).
     Each individual evaluated ONCE → M-dim reward vector as fitness.
@@ -461,8 +466,6 @@ class NSGAII:
         self.parent_eval_count = [0] * self.P
 
         self.z_star          = np.full(self.M, -np.inf, dtype=np.float32)
-        self.fitness_history = []
-        self.front_history   = []
 
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
@@ -527,6 +530,7 @@ class NSGAII:
         convergence_window:      int   = 10,
         parent_stability_bonus:  float = 0.01,
         parent_stability_cap:    float = 0.10,
+        use_dual_front:          bool  = True,
         algorithm:               str   = 'nsgaii',
         n_reference_divisions:   int   = 12,
         normalize_fitness:       bool  = False,
@@ -548,7 +552,7 @@ class NSGAII:
         elif algorithm == 'nsga4':
             _select = _nsga4_select
             if is_main:
-                print(f'NSGA-IV: max-Tchebycheff utility selection (M={self.M})')
+                print(f'NSGA-HVC: Hypervolume Computing utility selection (M={self.M})')
         else:
             _select = _nsga2_select
 
@@ -785,27 +789,67 @@ class NSGAII:
                 merged_params  = parent_params + child_params_list
                 merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
-                # Front 1: raw fitness — equal ground for parents and children.
-                front1_set = set(_select(merged_fitness, self.P))
+                if not use_dual_front:
+                    # Single-front: select purely by raw reward using the configured algorithm.
+                    selected       = _select(merged_fitness, self.P)
+                    n_intersection = len(selected)
+                else:
+                    # Front 1: complete Pareto front on raw fitness (no size cap).
+                    front1_set = set(_non_dominated_sort(merged_fitness)[0])
 
-                # Front 2: parent baseline × (1 + per-parent bonus) vs child raw fitness.
-                # Bonus = min(eval_count * rate, cap): older parents get a higher threshold,
-                # so a child must beat the parent's proven historical average by an increasing
-                # margin to displace it.
-                parent_front2 = [
-                    self.parent_baseline[i] * (1.0 + min(self.parent_eval_count[i] * parent_stability_bonus,
-                                                          parent_stability_cap))
-                    for i in range(self.P)
-                ]
-                merged_front2 = np.vstack([np.array(parent_front2), np.array(child_fitness)])
-                front2_list   = _select(merged_front2, self.P)
+                    # Front 2: complete Pareto front on parent baseline × (1 + bonus) vs child raw.
+                    # Bonus grows with eval_count so a child must beat the parent's historical
+                    # average by an increasing margin to displace it.
+                    parent_front2 = [
+                        self.parent_baseline[i] * (1.0 + min(self.parent_eval_count[i] * parent_stability_bonus,
+                                                              parent_stability_cap))
+                        for i in range(self.P)
+                    ]
+                    merged_front2 = np.vstack([np.array(parent_front2), np.array(child_fitness)])
+                    front2_fronts = _non_dominated_sort(merged_front2)
+                    front2_set    = set(front2_fronts[0])
 
-                # Intersection + fill: survivor must pass both fronts.
-                intersection = [k for k in front2_list if k in front1_set]
-                extras       = [k for k in front2_list if k not in front1_set]
-                selected     = intersection + extras[:self.P - len(intersection)]
+                    # Greedy HVC fill: starting from a seed set, pick the candidate with the
+                    # highest marginal hypervolume gain each step.
+                    def _greedy_hvc_fill(seed: List[int], pool: List[int], n: int) -> List[int]:
+                        if n <= 0 or not pool:
+                            return []
+                        all_pts = np.array([merged_fitness[k] for k in seed + pool])
+                        ref     = all_pts.min(axis=0) - 0.1
+                        chosen  = [merged_fitness[k] for k in seed]
+                        hv_base = _hv(np.array(chosen), ref) if chosen else 0.0
+                        result, remaining = [], list(range(len(pool)))
+                        for _ in range(min(n, len(remaining))):
+                            gains    = [_hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
+                                        for loc in remaining]
+                            best_pos = int(np.argmax(gains))
+                            best_loc = remaining[best_pos]
+                            hv_base += gains[best_pos]
+                            chosen.append(merged_fitness[pool[best_loc]])
+                            result.append(pool[best_loc])
+                            remaining.remove(best_loc)
+                        return result
 
-                n_intersection = len(intersection)
+                    # Stage 1: intersection of both fronts; trim to P via HVC if oversized.
+                    intersection   = [k for k in front2_set if k in front1_set]
+                    n_intersection = len(intersection)
+                    if len(intersection) > self.P:
+                        intersection = _greedy_hvc_fill([], intersection, self.P)
+
+                    # Stage 2: fill from front2 \ front1 via greedy HVC against intersection seed.
+                    selected = intersection + _greedy_hvc_fill(
+                        intersection,
+                        [k for k in front2_set if k not in front1_set],
+                        self.P - len(intersection),
+                    )
+
+                    # Fallback: if front2's first front is exhausted, pull from deeper fronts.
+                    for deeper_front in front2_fronts[1:]:
+                        if len(selected) >= self.P:
+                            break
+                        pool = [k for k in deeper_front if k not in set(selected)]
+                        selected += _greedy_hvc_fill(selected, pool, self.P - len(selected))
+
                 ind_labels     = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
                                   for j, k in enumerate(selected)]
                 n_parents_kept = sum(1 for k in selected if k < self.P)
@@ -835,10 +879,6 @@ class NSGAII:
 
                 fit_arr     = np.array(self.fitness)          # raw current-gen
                 base_arr    = np.array(self.parent_baseline)  # cumulative mean
-                fronts      = _non_dominated_sort(fit_arr)
-                n_front0    = len(fronts[0]) if fronts else 0
-                self.fitness_history.append(fit_arr.tolist())
-                self.front_history.append(n_front0)
 
                 # Append per-individual record to population log
                 log_path = os.path.join(output_dir, 'population_log.json')
@@ -848,14 +888,9 @@ class NSGAII:
                 except FileNotFoundError:
                     pop_log = {}
                 alpha_str = f'entmax_α={self.template.fixed_alpha:.3f}(fixed)'
-                def _alpha_entry(j): return {}
 
                 pop_log[f'gen_{gen:04d}'] = {
-                    label: {
-                        'raw':      fit_arr[j].tolist(),
-                        'baseline': base_arr[j].tolist(),
-                        **_alpha_entry(j),
-                    }
+                    label: {'raw': fit_arr[j].tolist(), 'baseline': base_arr[j].tolist()}
                     for j, label in enumerate(ind_labels)
                 }
                 with open(log_path, 'w') as f:
@@ -863,7 +898,6 @@ class NSGAII:
 
                 print(
                     f'Gen {gen:4d}/{num_generations} | '
-                    f'front0={n_front0}/{self.P} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
                     f'intersect={n_intersection}/{self.P} | '
                     f'bonus={np.mean([min(self.parent_eval_count[i]*parent_stability_bonus, parent_stability_cap) for i in range(self.P)]):.3f} | '
@@ -891,7 +925,7 @@ class NSGAII:
                         z_stable  = all(
                             np.array_equal(z_star_hist[-convergence_window], z)
                             for z in z_star_hist[-convergence_window:])
-                        if avg_kept >= 16.5 and delta_div < 0.002 and z_stable:
+                        if avg_kept >= 37.5 and delta_div < 0.002 and z_stable:
                             print(f'  *** Convergence at gen {gen}: '
                                   f'avg_kept={avg_kept:.1f}/{self.P}, '
                                   f'Δdiv={delta_div:.4f} ***', flush=True)
@@ -944,7 +978,7 @@ sft_tokenizer.padding_side = 'left'
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_ppo(
         script_args.dataset_name, sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train')
+        reward_models.rm_tokenizers[0], split='train[:512]')
     instructions = Instructions()
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_ppo(
@@ -1054,6 +1088,7 @@ final_population = nsgaii.run(
     convergence_window=script_args.convergence_window,
     parent_stability_bonus=script_args.parent_stability_bonus,
     parent_stability_cap=script_args.parent_stability_cap,
+    use_dual_front=script_args.use_dual_front,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,
@@ -1077,8 +1112,6 @@ if is_main:
             'reward_names':    reward_names,
             'z_star':          nsgaii.z_star.tolist(),
             'final_fitness':   [f.tolist() for f in nsgaii.fitness],
-            'fitness_history': nsgaii.fitness_history,
-            'front_history':   nsgaii.front_history,
             'num_generations': script_args.num_generations,
             'population_size': nsgaii.P,
             'lm_hidden_size':  lm_hidden_size,

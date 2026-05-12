@@ -47,6 +47,7 @@ from hoe_architecture import ConditionedMOEModelWithValueHead, WeightSampler
 from hoe_utils import (
     build_hoe_model,
     clean_response,
+    load_router_weights,
     make_number_experts_str,
     parse_comma_int_list,
     parse_comma_str_list,
@@ -97,8 +98,9 @@ _DEFAULT_REWARD_NAMES = {
 @dataclass
 class ScriptArguments:
     base_model_name: str = field(default='meta-llama/Llama-2-7b-hf', metadata={'help': 'Local path or HF id of the base LLaMA model'})
-    sft_model_name: str = field(default='', metadata={'help': 'Path to the SFT LoRA adapter (tokenizer lives here too)'})
+    sft_model_name: str = field(default='', metadata={'help': 'Path to the SFT LoRA adapter; used as KL reference ONLY when pretrained_moe_path is empty'})
     expert_model_paths: str = field(default='', metadata={'help': 'Comma-separated paths to per-objective PPO LoRA adapters, one per reward (order must match reward_names)'})
+    pretrained_moe_path: str = field(default='', metadata={'help': 'Path to Stage-1 router checkpoint dir (contains router_weights.pt). When set, loads pre-trained router and uses deepcopy as KL reference (original HoE design). When empty, falls back to SFT as reference.'})
     dataset_name: str = field(default='Anthropic/hh-rlhf', metadata={'help': 'Dataset: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, nvidia/HelpSteer, nvidia/HelpSteer2'})
     reward_names: str = field(default='', metadata={'help': 'Comma-separated reward names; auto-selected from dataset_name if empty'})
     save_directory: str = field(default='./results/hoe/', metadata={'help': 'Output directory'})
@@ -153,21 +155,41 @@ hoe_base = build_hoe_model(
     router_hidden_dim=int(cfg.get('router_hidden_dim', 32)),
 )
 
-# trainable_module="all" makes every param name match ('a'/'l' appear in almost all LLaMA names)
-# matching Mymorlhf.py which passes trainable_module="all" to train everything
-moemodel = ConditionedMOEModelWithValueHead(
-    model=hoe_base, num_rewards=num_rewards, trainable_module="all"
-)
+# ========== Stage 1 router weights (original HoE design) ==========
+# When pretrained_moe_path is given: inject pre-trained router weights from
+# train_hoe_router.py and use a deepcopy of the loaded MoE as KL reference.
+# This reproduces Mymorlhf_ref.py exactly.
+# When pretrained_moe_path is empty: fall back to SFT as KL reference
+# (legacy behaviour — avoids requiring Stage 1).
+use_pretrained_router = bool(script_args.pretrained_moe_path.strip())
 
-# ========== reference model (frozen SFT for KL penalty) ==========
-# Mirrors ppo.py: load base then apply SFT LoRA adapter
-ref_model = AutoModelForCausalLM.from_pretrained(
-    script_args.base_model_name,
-    torch_dtype=torch.bfloat16,
-)
-ref_model = _StdPeft.from_pretrained(ref_model, script_args.sft_model_name)
-ref_model = ref_model.merge_and_unload()
-ref_model.config.update({'use_cache': True, 'pad_token_id': ref_model.config.eos_token_id})
+if use_pretrained_router:
+    print(f'[Stage 2] Loading pre-trained router from {script_args.pretrained_moe_path}')
+    load_router_weights(hoe_base, script_args.pretrained_moe_path)
+    # trainable_module=["lora"] — only LoRA expert weights fine-tuned in Stage 2,
+    # router was already trained in Stage 1 (matching Mymorlhf_ref.py)
+    moemodel = ConditionedMOEModelWithValueHead(
+        model=hoe_base, num_rewards=num_rewards, trainable_module=["lora"]
+    )
+    # Reference = deepcopy of the pre-trained MoE (Mymorlhf_ref.py design)
+    import copy
+    ref_model = copy.deepcopy(moemodel)
+    ref_model.train(False)
+    for p in ref_model.parameters():
+        p.requires_grad = False
+    print('[Stage 2] KL reference = deepcopy of pre-trained MoE (original HoE design)')
+else:
+    print('[Stage 2] No pretrained_moe_path — using SFT as KL reference (legacy mode)')
+    moemodel = ConditionedMOEModelWithValueHead(
+        model=hoe_base, num_rewards=num_rewards, trainable_module="all"
+    )
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        script_args.base_model_name,
+        torch_dtype=torch.bfloat16,
+    )
+    ref_model = _StdPeft.from_pretrained(ref_model, script_args.sft_model_name)
+    ref_model = ref_model.merge_and_unload()
+    ref_model.config.update({'use_cache': True, 'pad_token_id': ref_model.config.eos_token_id})
 
 # ========== dataset ==========
 tokenizer = load_main_tokenizer(expert_paths[0])

@@ -38,7 +38,8 @@ class CustomLinearv0(nn.Linear):
         nn.init.constant_(self.weight, 0.0)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input.to(self.weight.dtype))
+        logits = super().forward(input.to(self.weight.dtype))
+        return F.softmax(logits.float(), dim=-1).to(input.dtype)
 
 
 class CustomLinearv1(nn.Linear):
@@ -67,9 +68,10 @@ class CustomLinearv1(nn.Linear):
         assert weights is not None
         assert input.shape[0] % weights.shape[0] == 0
         seq_ratio = input.shape[0] // weights.shape[0]
-        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
+        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device, input.dtype)
         new_input = torch.cat([input, extra], dim=-1)
-        return super().forward(new_input.to(self.weight.dtype))
+        logits = super().forward(new_input.to(self.weight.dtype))
+        return F.softmax(logits.float(), dim=-1).to(input.dtype)
 
 
 class CustomLinearv2(nn.Linear):
@@ -91,9 +93,10 @@ class CustomLinearv2(nn.Linear):
         assert weights is not None
         assert input.shape[0] % weights.shape[0] == 0
         seq_ratio = input.shape[0] // weights.shape[0]
-        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
+        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device, input.dtype)
         new_input = torch.cat([input, extra], dim=-1)
-        output = super().forward(new_input.to(self.weight.dtype))
+        logits = super().forward(new_input.to(self.weight.dtype))
+        output = F.softmax(logits.float(), dim=-1).to(input.dtype)
         return torch.einsum('ln,ln->ln', output, extra)
 
 
@@ -130,7 +133,7 @@ class CustomLinearv3(nn.Module):
         assert weights is not None
         assert input.shape[0] % weights.shape[0] == 0
         seq_ratio = input.shape[0] // weights.shape[0]
-        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device)
+        extra = weights.unsqueeze(1).repeat(1, seq_ratio, 1).view(-1, weights.shape[1]).to(input.device, input.dtype)
         new_input = torch.cat([input, extra], dim=-1).to(self.linear1.weight.dtype)
 
         x0 = torch.relu(self.linear1(new_input))

@@ -135,6 +135,34 @@ def build_hoe_model(
     return mola_model
 
 
+def save_router_weights(model, save_path: str):
+    """Save only router parameters to router_weights.pt."""
+    router_sd = {name: param.detach().cpu()
+                 for name, param in model.named_parameters()
+                 if 'router' in name}
+    torch.save(router_sd, os.path.join(save_path, 'router_weights.pt'))
+    print(f'[hoe_utils] Saved {len(router_sd)} router parameter tensors to {save_path}.')
+
+
+def load_router_weights(model, pretrained_moe_path: str):
+    """Inject pre-trained router weights (from Stage 1) into a freshly built MoLA model."""
+    router_pt = os.path.join(pretrained_moe_path, 'router_weights.pt')
+    if not os.path.exists(router_pt):
+        raise FileNotFoundError(f'Router weights not found: {router_pt}')
+    router_sd = torch.load(router_pt, map_location='cpu')
+    current   = dict(model.named_parameters())
+    loaded, missing = 0, []
+    for name, tensor in router_sd.items():
+        if name in current:
+            current[name].data.copy_(tensor)
+            loaded += 1
+        else:
+            missing.append(name)
+    if missing:
+        print(f'[hoe_utils] WARNING: {len(missing)} router keys not found in model: {missing[:5]}')
+    print(f'[hoe_utils] Loaded {loaded}/{len(router_sd)} router weights from {pretrained_moe_path}.')
+
+
 def load_hoe_checkpoint(model, checkpoint_path: str):
     """Load trained router weights into a HoE model from a saved checkpoint directory."""
     from src.mola_peft_model_hacked import set_peft_model_state_dict_moe
