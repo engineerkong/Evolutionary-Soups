@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Oracle upper-bound pipeline — summary task (summary + faithful + deberta)
 #
-# Step 1: collect_rewards.py  — run all 66 blended models on test set, save per-prompt rewards
+# Step 1: collect_rewards_simple_gating.py — sweep all simplex gating coefficients with
+#         SimpleMoEForCausalLM (experts stay in memory; merge final hidden states)
 # Step 2: build_dataset.py    — find utility-optimal weights per (prompt, preference)
 # Step 3: eval_oracle.py      — report oracle vs naive utility comparison
 #
@@ -18,29 +19,28 @@ expert_model_paths='./models/ppo/ppo_summary_summary_2104/best_model ./models/pp
 reward_names='summary,faithful,deberta'
 simplex_step=0.2
 save_directory='./results/optimal'
-wandb_name='optimal_summary_1205'
+wandb_name='optimal_summary_simple_1305'
 
 mkdir -p ./logs
 
 # ---------------------------------------------------------------------------
-# Step 1: collect per-prompt rewards for all merging coefficients
+# Step 1: collect per-prompt rewards for all SimpleMoEForCausalLM gating coefficients
 # ---------------------------------------------------------------------------
 echo "========================================"
-echo "Step 1: Collecting rewards"
+echo "Step 1: Collecting rewards (SimpleMoEForCausalLM)"
 echo "========================================"
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch --main_process_port 29604 \
-    ./scripts/optimal/collect_rewards.py \
-    --base_model_name   "${base_model_name}" \
-    --sft_model_name    "${sft_model_name}" \
+    ./scripts/optimal/collect_rewards_simple_gating.py \
+    --base_model_name    "${base_model_name}" \
     --expert_model_paths ${expert_model_paths} \
-    --reward_names      "${reward_names}" \
-    --exp_type          summary \
-    --simplex_step      "${simplex_step}" \
-    --split             test \
-    --save_directory    "${save_directory}" \
-    --wandb_name        "${wandb_name}" \
+    --reward_names       "${reward_names}" \
+    --exp_type           summary \
+    --simplex_step       "${simplex_step}" \
+    --split              test \
+    --save_directory     "${save_directory}" \
+    --run_name           "${wandb_name}" \
     2>&1 | tee ./logs/${wandb_name}_collect.log
 
 # ---------------------------------------------------------------------------

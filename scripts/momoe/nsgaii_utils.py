@@ -9,7 +9,7 @@ from typing import List
 import numpy as np
 import torch
 
-from nsgaii_architecture import GatingNetwork
+from nsgaii_architecture import GatingNetwork, SimpleGatingNetwork
 
 # ---------------------------------------------------------------------------
 # Reward model paths
@@ -58,9 +58,10 @@ def save_gating_network(gating_net, save_path: str) -> None:
         'lm_hidden_size': gating_net.lm_hidden_size,
         'num_experts':    gating_net.num_experts,
         'hidden_size':    gating_net.hidden_size,
-        'num_layers':     gating_net.num_layers,
         'fixed_alpha':    gating_net.fixed_alpha,
     }
+    if isinstance(gating_net, GatingNetwork):
+        config['num_layers'] = gating_net.num_layers
     with open(os.path.join(save_path, 'gating_config.json'), 'w') as f:
         json.dump(config, f, indent=2)
 
@@ -91,6 +92,31 @@ def load_gating_network(save_path: str, lm_hidden_size: int = 4096,
                         hidden_size=hidden_size, num_layers=num_layers,
                         fixed_alpha=fixed_alpha)
     # strict=False allows loading old checkpoints that lack the alpha parameter
+    net.load_state_dict(torch.load(ckpt_file, map_location=device), strict=False)
+    return net.to(device).bfloat16()
+
+
+def load_simple_gating_network(save_path: str, lm_hidden_size: int = 4096,
+                                num_experts: int = 2, device: str = 'cuda'):
+    """Load a SimpleGatingNetwork checkpoint saved by save_gating_network."""
+    resolved  = _resolve_checkpoint(save_path, 'gating_network.pt')
+    ckpt_file = os.path.join(resolved, 'gating_network.pt')
+    if not os.path.exists(ckpt_file):
+        return None
+
+    hidden_size = 256
+    fixed_alpha = 1.0
+    cfg_file = os.path.join(resolved, 'gating_config.json')
+    if os.path.exists(cfg_file):
+        with open(cfg_file) as f:
+            cfg = json.load(f)
+        lm_hidden_size = cfg.get('lm_hidden_size', lm_hidden_size)
+        num_experts    = cfg.get('num_experts',     num_experts)
+        hidden_size    = cfg.get('hidden_size',     hidden_size)
+        fixed_alpha    = cfg.get('fixed_alpha',     fixed_alpha)
+
+    net = SimpleGatingNetwork(lm_hidden_size=lm_hidden_size, num_experts=num_experts,
+                              hidden_size=hidden_size, fixed_alpha=fixed_alpha)
     net.load_state_dict(torch.load(ckpt_file, map_location=device), strict=False)
     return net.to(device).bfloat16()
 

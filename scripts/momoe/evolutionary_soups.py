@@ -40,8 +40,8 @@ from scripts.utils.utils import (
     build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
     get_clean_data, load_main_tokenizer,
 )
-from nsgaii_architecture import GatingNetwork, MoEForCausalLM
-from nsgaii_utils import save_gating_network, get_simplex_samples, REWARD_PATHS
+from nsgaii_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from nsgaii_utils import save_gating_network, get_simplex_samples, load_gating_network, load_simple_gating_network, REWARD_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +79,7 @@ class ScriptArguments:
     parent_stability_cap:    float  = 0.10  # max bonus (10 %)
     use_dual_front:          bool   = True  # if False, select solely by raw reward front (_select)
     fixed_alpha:          float     = 1.2   # entmax α fixed for all layers (1.0=softmax, 2.0=sparsemax)
+    gating_type:          str       = 'per_layer'  # 'per_layer' = GatingNetwork, 'simple' = SimpleGatingNetwork
     normalize_fitness:    bool      = True  # min-max normalize fitness by expert model bounds
 # ---------------------------------------------------------------------------
     gpu_id:               int       = -1
@@ -978,7 +979,7 @@ sft_tokenizer.padding_side = 'left'
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_ppo(
         script_args.dataset_name, sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='train[:512]')
+        reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions()
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_ppo(
@@ -1043,26 +1044,44 @@ lm_hidden_size = expert_models[0].config.hidden_size
 _num_layers    = len(expert_models[0].model.layers)
 print(f'lm_hidden_size = {lm_hidden_size}, num_layers = {_num_layers}')
 
-template_net = GatingNetwork(
-    lm_hidden_size=lm_hidden_size,
-    num_experts=len(expert_models),
-    num_layers=_num_layers,
-    alpha_init=script_args.fixed_alpha,
-    fixed_alpha=script_args.fixed_alpha,
-)
+if script_args.gating_type == 'simple':
+    template_net = SimpleGatingNetwork(
+        lm_hidden_size=lm_hidden_size,
+        num_experts=len(expert_models),
+        fixed_alpha=script_args.fixed_alpha,
+    )
+    print(f'Gating type: SimpleGatingNetwork')
+else:
+    template_net = GatingNetwork(
+        lm_hidden_size=lm_hidden_size,
+        num_experts=len(expert_models),
+        num_layers=_num_layers,
+        alpha_init=script_args.fixed_alpha,
+        fixed_alpha=script_args.fixed_alpha,
+    )
+    print(f'Gating type: GatingNetwork (per_layer)')
 
 if script_args.warm_start_path:
-    from nsgaii_utils import load_gating_network as _load
-    loaded = _load(script_args.warm_start_path, lm_hidden_size=lm_hidden_size,
-                   num_experts=len(expert_models), num_layers=_num_layers,
-                   device='cpu')
+    if script_args.gating_type == 'simple':
+        loaded = load_simple_gating_network(script_args.warm_start_path,
+                                            lm_hidden_size=lm_hidden_size,
+                                            num_experts=len(expert_models), device='cpu')
+    else:
+        loaded = load_gating_network(script_args.warm_start_path,
+                                     lm_hidden_size=lm_hidden_size,
+                                     num_experts=len(expert_models), num_layers=_num_layers,
+                                     device='cpu')
     if loaded is not None:
         template_net = loaded.cpu().bfloat16()
         print(f'Warm-start from {script_args.warm_start_path}')
 
-moe_model = MoEForCausalLM(expert_models, template_net).to(device)
+if script_args.gating_type == 'simple':
+    moe_model = SimpleMoEForCausalLM(expert_models, template_net).to(device)
+    print(f'SimpleMoEForCausalLM: {len(expert_models)} experts')
+else:
+    moe_model = MoEForCausalLM(expert_models, template_net).to(device)
+    print(f'MoEForCausalLM: {len(expert_models)} experts × {moe_model.num_layers} layers')
 moe_model.eval()
-print(f'MoEForCausalLM: {len(expert_models)} experts × {moe_model.num_layers} layers')
 
 nsgaii = NSGAII(
     template_net=template_net,

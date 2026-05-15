@@ -7,6 +7,7 @@ evaluated directly on the real collected reward samples (no interpolation).
 Output CSV columns:
     prompt_idx, prompt_text, pref_0, pref_1, ..., optimal_w0, optimal_w1, ...
 """
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -52,6 +53,15 @@ print(f'Using {len(preferences)} preferences:')
 for p in preferences:
     print(f'  {[round(x, 2) for x in p]}')
 
+# Normalize rewards to [0, 1] globally so different reward scales don't dominate utility.
+r_min = df[reward_cols].min().values   # (R,)
+r_max = df[reward_cols].max().values   # (R,)
+r_range = np.where(r_max > r_min, r_max - r_min, 1.0)
+df[reward_cols] = (df[reward_cols].values - r_min) / r_range
+print(f'Reward normalization (global min/max):')
+for name, lo, hi in zip(reward_names, r_min, r_max):
+    print(f'  {name}: [{lo:.4f}, {hi:.4f}]')
+
 # Build dataset: for each (prompt, preference) pair find utility-optimal weights
 rows       = []
 prompt_ids = df['prompt_idx'].unique()
@@ -82,6 +92,14 @@ for prompt_idx in prompt_ids:
 dataset_df = pd.DataFrame(rows)
 out_path   = os.path.join(output_dir, 'gating_dataset.csv')
 dataset_df.to_csv(out_path, index=False, escapechar='\\')
+
+# Save normalization stats for downstream use
+norm_path = os.path.join(output_dir, 'reward_norm.json')
+with open(norm_path, 'w') as f:
+    json.dump({'reward_names': reward_names,
+               'r_min': r_min.tolist(),
+               'r_max': r_max.tolist()}, f, indent=2)
+print(f'Normalization stats saved to {norm_path}')
 
 print(f'\nDataset saved to {out_path}')
 print(f'Total training pairs: {len(dataset_df)}')

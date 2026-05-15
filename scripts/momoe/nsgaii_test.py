@@ -50,8 +50,8 @@ from scripts.utils.utils import (
     build_dataset_beaver_eval, build_dataset_steer_eval, build_dataset_ultrafeedback_eval,
     get_clean_data, load_main_tokenizer,
 )
-from nsgaii_architecture import GatingNetwork, MoEForCausalLM
-from nsgaii_utils import REWARD_PATHS, load_gating_network, get_simplex_samples
+from nsgaii_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from nsgaii_utils import REWARD_PATHS, load_gating_network, load_simple_gating_network, get_simplex_samples
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,7 @@ class Args:
     do_sample:          bool      = False
     num_continuations:  int       = 1
     pref_step:          float     = 0.1   # simplex step for λ-selection table
+    norm_rewards:       str       = ''   # path to reward_norm.json; if set, normalize rewards for utility comparison
     gpu_id:             int       = -1
     save_directory:     str       = './results/nsgaii/'
     run_name:           str       = 'nsgaii_test'
@@ -202,6 +203,7 @@ def eval_configs(configs, loader, tokenizer, reward_models, instructions,
 
         if partial_path:
             record = {'config_idx': config_idx, 'label': label, 'rewards': mean_r,
+                      'batch_rewards': batch_rewards,
                       'reward_names': reward_names or [], 'rank': rank}
             partial_file.write(json.dumps(record) + '\n')
             partial_file.flush()
@@ -349,16 +351,16 @@ lm_hidden_size = experts[0].config.hidden_size
 # Build config list
 # ---------------------------------------------------------------------------
 
-all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
-# all_configs = []
+# all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
+all_configs = []
 
-# 1. Fixed-preference MoE: use λ directly as per-layer expert mixing weights.
-pref_simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
-for lam in pref_simplex:
-    all_configs.append((f'MoE fixed λ={list(lam)}',
-                        MoEForCausalLM(experts, FixedGating(list(lam))).to(device)))
-if is_main:
-    print(f'  Added {len(pref_simplex)} fixed-pref MoE configs', flush=True)
+# # 1. Fixed-preference MoE: use λ directly as per-layer expert mixing weights.
+# pref_simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
+# for lam in pref_simplex:
+#     all_configs.append((f'MoE fixed λ={list(lam)}',
+#                         MoEForCausalLM(experts, FixedGating(list(lam))).to(device)))
+# if is_main:
+#     print(f'  Added {len(pref_simplex)} fixed-pref MoE configs', flush=True)
 
 # 2. NSGA-II GatingNetwork checkpoints — each evaluated ONCE.
 #    At inference: select best individual via argmax dot(λ, reward_i).
@@ -370,8 +372,19 @@ if args.gating_paths:
         print(f'\nFound {len(resolved)} gating checkpoint(s) ...', flush=True)
 
     for ckpt_path in resolved:
-        gating = load_gating_network(ckpt_path, lm_hidden_size=lm_hidden_size,
-                                     num_experts=n, device=device)
+        # Detect checkpoint type from config to choose correct architecture
+        cfg_file = os.path.join(ckpt_path, 'gating_config.json')
+        ckpt_type = 'GatingNetwork'
+        if os.path.exists(cfg_file):
+            with open(cfg_file) as _f:
+                ckpt_type = json.load(_f).get('type', 'GatingNetwork')
+
+        if ckpt_type == 'SimpleGatingNetwork':
+            gating = load_simple_gating_network(ckpt_path, lm_hidden_size=lm_hidden_size,
+                                                num_experts=n, device=device)
+        else:
+            gating = load_gating_network(ckpt_path, lm_hidden_size=lm_hidden_size,
+                                         num_experts=n, device=device)
         if gating is None:
             if is_main:
                 print(f'  [SKIP] {ckpt_path}', flush=True)
@@ -382,8 +395,13 @@ if args.gating_paths:
             alphas    = gating.alpha_floats()
             alpha_str = (f'fixed={gating.fixed_alpha}' if gating.fixed_alpha is not None
                          else f'learned  min={min(alphas):.3f} max={max(alphas):.3f} mean={sum(alphas)/len(alphas):.3f}')
-            print(f'  loaded {ckpt_name}  α={alpha_str}', flush=True)
-        all_configs.append((label, MoEForCausalLM(experts, gating).to(device)))
+            print(f'  loaded {ckpt_name} ({ckpt_type})  α={alpha_str}', flush=True)
+
+        if ckpt_type == 'SimpleGatingNetwork':
+            moe_model = SimpleMoEForCausalLM(experts, gating).to(device)
+        else:
+            moe_model = MoEForCausalLM(experts, gating).to(device)
+        all_configs.append((label, moe_model))
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +444,24 @@ if is_main:
                    for idx, label, mean_r in flat], f, indent=2)
     print(f'\nResults saved → {out_path}', flush=True)
 
+    # ── Load normalisation stats if requested ──────────────────────────────
+    r_min = r_max = r_range = None
+    if args.norm_rewards:
+        with open(args.norm_rewards) as f:
+            norm = json.load(f)
+        r_min   = np.array(norm['r_min'],  dtype=np.float64)
+        r_max   = np.array(norm['r_max'],  dtype=np.float64)
+        r_range = np.where(r_max > r_min, r_max - r_min, 1.0)
+        print(f'\nReward normalisation loaded from {args.norm_rewards}')
+        for n, lo, hi in zip(reward_names, r_min, r_max):
+            print(f'  {n}: [{lo:.4f}, {hi:.4f}]')
+
+    def maybe_norm(r):
+        """Return normalised reward array if norm_rewards is set, else raw."""
+        if r_min is None:
+            return np.array(r)
+        return (np.array(r) - r_min) / r_range
+
     col = 52
     print(f'\n{"Config":<{col}}  ' + '  '.join(f'{rn:>10}' for rn in reward_names))
     print('-' * (col + 14 * len(reward_names)))
@@ -433,19 +469,25 @@ if is_main:
         print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))
 
     # ── λ-selection table: for each preference, which NSGA-II individual wins? ──
+    # Selection uses normalised rewards when norm_rewards is set so that
+    # λ weights are applied on a consistent [0,1] scale (matching oracle).
     nsgaii_results = [(label, mean_r) for _, label, mean_r in flat
                       if label.startswith('MoE NSGAII')]
     if nsgaii_results:
-        rewards_arr = np.array([r for _, r in nsgaii_results])  # (K, M)
-        labels_arr  = [l for l, _ in nsgaii_results]
+        rewards_arr      = np.array([r for _, r in nsgaii_results])       # (K, M) raw
+        rewards_arr_norm = np.array([maybe_norm(r) for _, r in nsgaii_results])  # (K, M) normed
+        labels_arr       = [l for l, _ in nsgaii_results]
 
-        print(f'\n{"λ":<30}  {"best individual":<40}  ' +
+        norm_tag = ' [normalised]' if r_min is not None else ''
+        print(f'\n{"λ":<30}  {"best individual":<40}  {"utility"+norm_tag:>14}  ' +
               '  '.join(f'{rn:>10}' for rn in reward_names))
-        print('-' * (30 + 44 + 14 * len(reward_names)))
+        print('-' * (30 + 44 + 18 + 14 * len(reward_names)))
         for lam in get_simplex_samples(len(reward_names), step=args.pref_step):
-            scores = rewards_arr @ np.array(lam)
-            best_i = int(np.argmax(scores))
-            print(f'{str(lam):<30}  {labels_arr[best_i]:<40}  ' +
+            lam_arr = np.array(lam)
+            scores  = rewards_arr_norm @ lam_arr   # always use normed for selection
+            best_i  = int(np.argmax(scores))
+            utility = float(scores[best_i])
+            print(f'{str(lam):<30}  {labels_arr[best_i]:<40}  {utility:>14.4f}  ' +
                   '  '.join(f'{v:>10.4f}' for v in rewards_arr[best_i]))
 
 # ---------------------------------------------------------------------------
@@ -484,83 +526,83 @@ def _build_rewarded_soup(base_model_name, expert_sds, peft_config, coeffs, devic
     return model
 
 
-if args.expert_model_paths:
-    if is_main:
-        print('\n' + '=' * 80, flush=True)
-        print('Rewarded Soups evaluation', flush=True)
-        print('=' * 80, flush=True)
+# if args.expert_model_paths:
+#     if is_main:
+#         print('\n' + '=' * 80, flush=True)
+#         print('Rewarded Soups evaluation', flush=True)
+#         print('=' * 80, flush=True)
 
-    expert_sds   = [_load_adapter_sd(p) for p in args.expert_model_paths]
-    peft_cfg_rs  = LoraConfig.from_pretrained(args.expert_model_paths[0])
-    rs_simplex   = get_simplex_samples(len(reward_names), step=args.pref_step)
-    rs_partial   = os.path.join(output_dir, f'rs_rank{rank}.jsonl')
+#     expert_sds   = [_load_adapter_sd(p) for p in args.expert_model_paths]
+#     peft_cfg_rs  = LoraConfig.from_pretrained(args.expert_model_paths[0])
+#     rs_simplex   = get_simplex_samples(len(reward_names), step=args.pref_step)
+#     rs_partial   = os.path.join(output_dir, f'rs_rank{rank}.jsonl')
 
-    rs_done = {}
-    if os.path.exists(rs_partial):
-        with open(rs_partial) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    rs_done[rec['config_idx']] = rec['rewards']
-                except json.JSONDecodeError:
-                    pass
-        if rs_done:
-            print(f'  rs rank{rank}: resuming — {len(rs_done)} pref(s) already done', flush=True)
+#     rs_done = {}
+#     if os.path.exists(rs_partial):
+#         with open(rs_partial) as f:
+#             for line in f:
+#                 line = line.strip()
+#                 if not line:
+#                     continue
+#                 try:
+#                     rec = json.loads(line)
+#                     rs_done[rec['config_idx']] = rec['rewards']
+#                 except json.JSONDecodeError:
+#                     pass
+#         if rs_done:
+#             print(f'  rs rank{rank}: resuming — {len(rs_done)} pref(s) already done', flush=True)
 
-    rs_results = []
-    with open(rs_partial, 'a') as rs_file:
-        for idx, coeffs in enumerate(rs_simplex):
-            if idx % world_size != rank:
-                continue
-            label = f'RewardedSoups {list(coeffs)}'
-            if idx in rs_done:
-                print(f'  rs rank{rank} skip (cached): {label}', flush=True)
-                rs_results.append((idx, label, rs_done[idx]))
-                continue
+#     rs_results = []
+#     with open(rs_partial, 'a') as rs_file:
+#         for idx, coeffs in enumerate(rs_simplex):
+#             if idx % world_size != rank:
+#                 continue
+#             label = f'RewardedSoups {list(coeffs)}'
+#             if idx in rs_done:
+#                 print(f'  rs rank{rank} skip (cached): {label}', flush=True)
+#                 rs_results.append((idx, label, rs_done[idx]))
+#                 continue
 
-            model = _build_rewarded_soup(
-                args.base_model_name,
-                expert_sds, peft_cfg_rs, coeffs, device)
-            model.resize_token_embeddings(len(tokenizer))
+#             model = _build_rewarded_soup(
+#                 args.base_model_name,
+#                 expert_sds, peft_cfg_rs, coeffs, device)
+#             model.resize_token_embeddings(len(tokenizer))
 
-            batch_rewards = []
-            for batch in loader:
-                r = generate_and_score(
-                    model, batch['input_ids'], batch['attention_mask'],
-                    tokenizer, reward_models, instructions,
-                    generation_kwargs, gpu_id, args.num_continuations)
-                batch_rewards.append(r)
-            mean_r = np.mean(batch_rewards, axis=0).tolist()
-            rs_results.append((idx, label, mean_r))
-            print(f'  rs rank{rank}: {label}  {mean_r}', flush=True)
+#             batch_rewards = []
+#             for batch in loader:
+#                 r = generate_and_score(
+#                     model, batch['input_ids'], batch['attention_mask'],
+#                     tokenizer, reward_models, instructions,
+#                     generation_kwargs, gpu_id, args.num_continuations)
+#                 batch_rewards.append(r)
+#             mean_r = np.mean(batch_rewards, axis=0).tolist()
+#             rs_results.append((idx, label, mean_r))
+#             print(f'  rs rank{rank}: {label}  {mean_r}', flush=True)
 
-            rs_file.write(json.dumps({'config_idx': idx, 'label': label, 'rewards': mean_r,
-                                      'reward_names': reward_names, 'rank': rank}) + '\n')
-            rs_file.flush()
+#             rs_file.write(json.dumps({'config_idx': idx, 'label': label, 'rewards': mean_r,
+#                                       'reward_names': reward_names, 'rank': rank}) + '\n')
+#             rs_file.flush()
 
-            del model
-            gc.collect()
-            torch.cuda.empty_cache()
+#             del model
+#             gc.collect()
+#             torch.cuda.empty_cache()
 
-    if world_size > 1:
-        all_rs = [None] * world_size
-        torch.distributed.all_gather_object(all_rs, rs_results)
-    else:
-        all_rs = [rs_results]
+#     if world_size > 1:
+#         all_rs = [None] * world_size
+#         torch.distributed.all_gather_object(all_rs, rs_results)
+#     else:
+#         all_rs = [rs_results]
 
-    if is_main:
-        flat_rs = sorted([item for sub in all_rs for item in sub], key=lambda x: x[0])
-        rs_path = os.path.join(output_dir, 'results_rs.json')
-        with open(rs_path, 'w') as f:
-            json.dump([{'config_idx': idx, 'label': label, 'rewards': mean_r,
-                        'reward_names': reward_names}
-                       for idx, label, mean_r in flat_rs], f, indent=2)
-        print(f'\nRewarded Soups results saved → {rs_path}', flush=True)
-        col = 52
-        print(f'\n{"Config":<{col}}  ' + '  '.join(f'{rn:>10}' for rn in reward_names))
-        print('-' * (col + 14 * len(reward_names)))
-        for _, label, mean_r in flat_rs:
-            print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))
+#     if is_main:
+#         flat_rs = sorted([item for sub in all_rs for item in sub], key=lambda x: x[0])
+#         rs_path = os.path.join(output_dir, 'results_rs.json')
+#         with open(rs_path, 'w') as f:
+#             json.dump([{'config_idx': idx, 'label': label, 'rewards': mean_r,
+#                         'reward_names': reward_names}
+#                        for idx, label, mean_r in flat_rs], f, indent=2)
+#         print(f'\nRewarded Soups results saved → {rs_path}', flush=True)
+#         col = 52
+#         print(f'\n{"Config":<{col}}  ' + '  '.join(f'{rn:>10}' for rn in reward_names))
+#         print('-' * (col + 14 * len(reward_names)))
+#         for _, label, mean_r in flat_rs:
+#             print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))

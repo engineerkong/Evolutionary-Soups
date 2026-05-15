@@ -41,6 +41,13 @@ print(f'Loaded {len(df)} rows | {df["prompt_idx"].nunique()} prompts')
 weight_cols  = sorted([c for c in df.columns if c.startswith('w') and c[1:].isdigit()],
                       key=lambda c: int(c[1:]))
 reward_cols  = [f'reward_{n}' for n in reward_names]
+
+# Normalize rewards to [0, 1] globally (same as build_dataset.py)
+r_min = df[reward_cols].min().values
+r_max = df[reward_cols].max().values
+r_range = np.where(r_max > r_min, r_max - r_min, 1.0)
+df[reward_cols] = (df[reward_cols].values - r_min) / r_range
+print(f'Reward normalization: ' + ', '.join(f'{n}=[{lo:.3f},{hi:.3f}]' for n, lo, hi in zip(reward_names, r_min, r_max)))
 pref_simplex = get_simplex_samples(n_rewards, step=script_args.simplex_step)
 
 prompt_ids = sorted(df['prompt_idx'].unique())

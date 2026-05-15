@@ -61,10 +61,10 @@ class ScriptArguments:
     save_directory:     str = './models/hoe_router/'
     run_name:           str = 'hoe_router'
     max_seq_length:     int = 512
-    learning_rate:      float = 1e-5
-    num_train_epochs:   float = 3.0
-    per_device_batch:   int = 2
-    grad_accum_steps:   int = 2
+    learning_rate:      float = 1.4e-4
+    num_train_epochs:   float = 3
+    per_device_batch:   int = 16
+    grad_accum_steps:   int = 1
     seed:               int = 8888
 
 _DEFAULT_REWARD_NAMES = {
