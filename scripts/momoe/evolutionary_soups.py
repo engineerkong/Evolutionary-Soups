@@ -487,7 +487,8 @@ class NSGAII:
         mask = np.random.random(x.shape) < rate
         return x + mask.astype(x.dtype) * np.random.normal(0.0, sigma, x.shape).astype(x.dtype)
 
-    def _save_checkpoint(self, output_dir: str, gen: int):
+    def _save_checkpoint(self, output_dir: str, gen: int, sigma: float,
+                         bounds: dict = None):
         ckpt_dir = os.path.join(output_dir, f'gen_{gen:04d}')
         os.makedirs(ckpt_dir, exist_ok=True)
         for i in range(self.P):
@@ -497,13 +498,34 @@ class NSGAII:
             with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
                 json.dump({'fitness': self.fitness[i].tolist()}, f, indent=2)
         meta = {
-            'generation': gen,
-            'z_star':     self.z_star.tolist(),
-            'fitness':    [f.tolist() for f in self.fitness],
+            'generation':       gen,
+            'sigma':            sigma,
+            'z_star':           self.z_star.tolist(),
+            'fitness':          [f.tolist() for f in self.fitness],
+            'parent_baseline':  [b.tolist() for b in self.parent_baseline],
+            'parent_eval_count': self.parent_eval_count,
         }
+        if bounds and bounds.get('min') is not None:
+            meta['bounds'] = {
+                'min':   bounds['min'].tolist(),
+                'range': bounds['range'].tolist(),
+            }
         with open(os.path.join(ckpt_dir, 'nsgaii_state.json'), 'w') as f:
             json.dump(meta, f, indent=2)
         print(f'  Checkpoint saved → {ckpt_dir}', flush=True)
+
+    @staticmethod
+    def _find_latest_checkpoint(output_dir: str):
+        """Return (gen, ckpt_dir) of the latest gen_XXXX checkpoint, or (-1, None)."""
+        gen_dirs = sorted([
+            d for d in os.listdir(output_dir)
+            if d.startswith('gen_') and d[4:].isdigit()
+            and os.path.isfile(os.path.join(output_dir, d, 'nsgaii_state.json'))
+        ])
+        if not gen_dirs:
+            return -1, None
+        latest = gen_dirs[-1]
+        return int(latest[4:]), os.path.join(output_dir, latest)
 
     def run(
         self,
@@ -535,6 +557,8 @@ class NSGAII:
         algorithm:               str   = 'nsgaii',
         n_reference_divisions:   int   = 12,
         normalize_fitness:       bool  = False,
+        resume:                  bool  = False,
+        resume_dir:              str   = None,
     ) -> List[np.ndarray]:
 
         dist_on = torch.distributed.is_initialized()
@@ -604,6 +628,113 @@ class NSGAII:
         ]
         print(f'Dataset chunks: {_num_chunks} × {_chunk_size} prompts', flush=True)
 
+        # ── Resume: load latest checkpoint ────────────────────────────────────
+        resume_gen   = -1
+        sigma        = mutation_sigma
+        bounds       = {'min': None, 'range': None}
+
+        if resume and is_main:
+            resume_gen, ckpt_dir = self._find_latest_checkpoint(resume_dir or output_dir)
+            if resume_gen >= 0:
+                state_path = os.path.join(ckpt_dir, 'nsgaii_state.json')
+                with open(state_path) as f:
+                    state = json.load(f)
+
+                # Prefer live_state.json (written every gen) for mutable training state;
+                # fall back to nsgaii_state.json fields for older checkpoints.
+                live_path = os.path.join(resume_dir or output_dir, 'live_state.json')
+                live: dict = {}
+                if os.path.exists(live_path):
+                    with open(live_path) as f:
+                        live = json.load(f)
+                    # live_state.json may be from a more recent gen than the checkpoint
+                    live_gen = live.get('generation', resume_gen)
+                    print(f'  live_state.json found (gen={live_gen})', flush=True)
+
+                # Restore population weights (always from checkpoint dir)
+                for i in range(self.P):
+                    ind_dir = os.path.join(ckpt_dir, f'ind_{i:03d}')
+                    g = load_gating_network(ind_dir, lm_hidden_size=self.template.lm_hidden_size,
+                                            num_experts=self.template.num_experts,
+                                            num_layers=getattr(self.template, 'num_layers', 32),
+                                            device='cpu')
+                    if g is None:
+                        g = load_simple_gating_network(ind_dir,
+                                                       lm_hidden_size=self.template.lm_hidden_size,
+                                                       num_experts=self.template.num_experts,
+                                                       device='cpu')
+                    self.population[i] = net_to_params(g)
+                    self.fitness[i]    = np.array(state['fitness'][i])
+
+                # parent_baseline: live_state > nsgaii_state > population_log > fitness
+                if 'parent_baseline' in live:
+                    for i in range(self.P):
+                        self.parent_baseline[i] = np.array(live['parent_baseline'][i])
+                    print('  parent_baseline restored from live_state.json', flush=True)
+                elif 'parent_baseline' in state:
+                    for i in range(self.P):
+                        self.parent_baseline[i] = np.array(state['parent_baseline'][i])
+                    print('  parent_baseline restored from nsgaii_state.json', flush=True)
+                else:
+                    pop_log_path = os.path.join(
+                        os.path.dirname(ckpt_dir), 'population_log.json')
+                    gen_key = f'gen_{resume_gen:04d}'
+                    if os.path.exists(pop_log_path):
+                        with open(pop_log_path) as f:
+                            pop_log = json.load(f)
+                        if gen_key in pop_log:
+                            ind_labels = sorted(pop_log[gen_key].keys())
+                            for i, lbl in enumerate(ind_labels[:self.P]):
+                                self.parent_baseline[i] = np.array(
+                                    pop_log[gen_key][lbl]['baseline'])
+                            print(f'  parent_baseline restored from population_log '
+                                  f'({gen_key})', flush=True)
+                        else:
+                            for i in range(self.P):
+                                self.parent_baseline[i] = self.fitness[i].copy()
+                            print(f'  parent_baseline fallback to fitness '
+                                  f'(gen_key {gen_key} not in population_log)', flush=True)
+                    else:
+                        for i in range(self.P):
+                            self.parent_baseline[i] = self.fitness[i].copy()
+                        print('  parent_baseline fallback to fitness '
+                              '(no population_log found)', flush=True)
+
+                # parent_eval_count: live_state > nsgaii_state > default 1
+                if 'parent_eval_count' in live:
+                    for i in range(self.P):
+                        self.parent_eval_count[i] = live['parent_eval_count'][i]
+                    print('  parent_eval_count restored from live_state.json', flush=True)
+                elif 'parent_eval_count' in state:
+                    for i in range(self.P):
+                        self.parent_eval_count[i] = state['parent_eval_count'][i]
+                    print('  parent_eval_count restored from nsgaii_state.json', flush=True)
+                else:
+                    for i in range(self.P):
+                        self.parent_eval_count[i] = 1
+                    print('  parent_eval_count not in checkpoint — defaulting to 1 '
+                          '(stability bonus will ramp from 0)', flush=True)
+
+                # z_star / sigma / bounds: live_state > nsgaii_state > defaults
+                self.z_star = np.array(live.get('z_star', state['z_star']))
+                sigma       = live.get('sigma', state.get('sigma', mutation_sigma))
+                live_bounds = live.get('bounds', state.get('bounds'))
+                if live_bounds:
+                    bounds['min']   = np.array(live_bounds['min'])
+                    bounds['range'] = np.array(live_bounds['range'])
+
+                print(f'Resumed from checkpoint gen_{resume_gen:04d}  '
+                      f'(σ={sigma:.5f}, z*={np.round(self.z_star, 3)})', flush=True)
+            else:
+                print('No checkpoint found — starting from scratch.', flush=True)
+                resume_gen = -1
+
+        if resume and torch.distributed.is_initialized():
+            # Broadcast resume_gen so all ranks know whether to skip phase 0
+            t = torch.tensor([resume_gen], dtype=torch.long)
+            torch.distributed.broadcast(t, src=0)
+            resume_gen = int(t[0])
+
         # ── Eval helper ───────────────────────────────────────────────────────
         def _eval_individual(params, chunk_idx, label=''):
             log(f'eval [{label}] chunk={chunk_idx % _num_chunks}')
@@ -646,7 +777,7 @@ class NSGAII:
         # ── Collect fitness from one task result ──────────────────────────────
         # bounds is a mutable dict so _collect_fitness can see updates made after
         # it is defined (expert bounds evaluation fills it before gen 0).
-        bounds: dict = {'min': None, 'range': None}
+        # On resume, bounds may already be populated from the checkpoint.
 
         def _collect_fitness(gen, task_id) -> np.ndarray:
             with open(_result_path(gen, task_id)) as f:
@@ -660,7 +791,8 @@ class NSGAII:
         # Evaluate each expert individually (one-hot gating) on chunk 0 to get
         # per-objective min/max.  Uses the same task-queue infrastructure as
         # gen 0 so all workers participate in parallel.
-        if normalize_fitness:
+        # Skipped on resume if bounds were saved in the checkpoint.
+        if normalize_fitness and bounds['min'] is None:
             _BG = -1   # bounds gen → directory 'gen_-001'
             if is_main:
                 print(f'Computing expert reward bounds '
@@ -694,43 +826,41 @@ class NSGAII:
                 while not os.path.exists(_done_path(_BG)):
                     time.sleep(poll_interval)
 
-        # ── Phase 0: initial population ───────────────────────────────────────
-        gen = 0
-        if is_main:
-            print(f'Evolutionary Soups — initialising population ({self.P} individuals, '
-                  f'1 eval each = {self.P} tasks) …')
-            os.makedirs(_gen_dir(gen), exist_ok=True)
-            for i in range(self.P):
-                _write_task(gen, i, {'task_id': i,
-                                     'chunk_idx': 0,
-                                     'child_params': self.population[i].tolist()})
-            log(f'gen 0 all {self.P} init tasks written (chunk 0)')
+        # ── Phase 0: initial population (skipped on resume) ──────────────────
+        if resume_gen < 0:
+            gen = 0
+            if is_main:
+                print(f'Evolutionary Soups — initialising population ({self.P} individuals, '
+                      f'1 eval each = {self.P} tasks) …')
+                os.makedirs(_gen_dir(gen), exist_ok=True)
+                for i in range(self.P):
+                    _write_task(gen, i, {'task_id': i,
+                                         'chunk_idx': 0,
+                                         'child_params': self.population[i].tolist()})
+                log(f'gen 0 all {self.P} init tasks written (chunk 0)')
 
-        _worker_loop(gen, 0, self.P, _done_path(gen))
+            _worker_loop(gen, 0, self.P, _done_path(gen))
 
-        if is_main:
-            for i in range(self.P):
-                self.fitness[i] = _collect_fitness(gen, i)
-                self.parent_baseline[i]   = self.fitness[i].copy()
-                self.parent_eval_count[i] = 1
-            open(_done_path(gen), 'w').close()
-            log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
-            print(f'Gen {gen:4d}/{num_generations}')
-
-        else:
-            while not os.path.exists(_done_path(gen)):
-                time.sleep(poll_interval)
+            if is_main:
+                for i in range(self.P):
+                    self.fitness[i] = _collect_fitness(gen, i)
+                    self.parent_baseline[i]   = self.fitness[i].copy()
+                    self.parent_eval_count[i] = 1
+                open(_done_path(gen), 'w').close()
+                log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
+                print(f'Gen {gen:4d}/{num_generations}')
+            else:
+                while not os.path.exists(_done_path(gen)):
+                    time.sleep(poll_interval)
 
         # ── Generational loop ─────────────────────────────────────────────────
         # Single worker loop per generation evaluates 2P individuals on the same chunk:
         #   tasks 0..P-1  : parent re-evals (same chunk as children → fair comparison)
         #   tasks P..2P-1 : children
 
-        sigma             = mutation_sigma
-        parents_kept_hist: list = []
-        diversity_hist:    list = []
-        z_star_hist:       list = []
-        for gen in range(1, num_generations + 1):
+
+        start_gen = resume_gen + 1 if resume_gen >= 0 else 1
+        for gen in range(start_gen, num_generations + 1):
             log(f'gen {gen}/{num_generations} start')
 
             if is_main:
@@ -763,11 +893,7 @@ class NSGAII:
                 open(_tasks_ready_path(gen), 'w').close()
             else:
                 while not os.path.exists(_tasks_ready_path(gen)):
-                    if os.path.exists(_converged_path):
-                        break
                     time.sleep(poll_interval)
-                if os.path.exists(_converged_path):
-                    break
 
             _worker_loop(gen, 0, 2 * self.P, _done_path(gen))
 
@@ -897,8 +1023,29 @@ class NSGAII:
                 with open(log_path, 'w') as f:
                     json.dump(pop_log, f, indent=2)
 
+                # Write live state every generation for crash-safe resume
+                live_state: dict = {
+                    'generation':        gen,
+                    'sigma':             sigma,
+                    'z_star':            self.z_star.tolist(),
+                    'parent_baseline':   [b.tolist() if hasattr(b, 'tolist') else list(b)
+                                          for b in self.parent_baseline],
+                    'parent_eval_count': list(self.parent_eval_count),
+                }
+                if bounds.get('min') is not None:
+                    live_state['bounds'] = {
+                        'min':   bounds['min'].tolist(),
+                        'range': bounds['range'].tolist(),
+                    }
+                live_path = os.path.join(output_dir, 'live_state.json')
+                tmp_live  = live_path + '.tmp'
+                with open(tmp_live, 'w') as f:
+                    json.dump(live_state, f)
+                os.replace(tmp_live, live_path)
+
                 print(
                     f'Gen {gen:4d}/{num_generations} | '
+                    f'chunk={chunk_idx % _num_chunks} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
                     f'intersect={n_intersection}/{self.P} | '
                     f'bonus={np.mean([min(self.parent_eval_count[i]*parent_stability_bonus, parent_stability_cap) for i in range(self.P)]):.3f} | '
@@ -912,37 +1059,12 @@ class NSGAII:
                 )
 
                 if gen % save_every == 0:
-                    self._save_checkpoint(output_dir, gen)
-
-                # ── Convergence check ─────────────────────────────────────────
-                converged = False
-                if convergence_window > 0:
-                    parents_kept_hist.append(n_parents_kept)
-                    diversity_hist.append(diversity)
-                    z_star_hist.append(self.z_star.copy())
-                    if len(parents_kept_hist) >= convergence_window:
-                        avg_kept  = np.mean(parents_kept_hist[-convergence_window:])
-                        delta_div = abs(diversity_hist[-1] - diversity_hist[-convergence_window])
-                        z_stable  = all(
-                            np.array_equal(z_star_hist[-convergence_window], z)
-                            for z in z_star_hist[-convergence_window:])
-                        if avg_kept >= 37.5 and delta_div < 0.002 and z_stable:
-                            print(f'  *** Convergence at gen {gen}: '
-                                  f'avg_kept={avg_kept:.1f}/{self.P}, '
-                                  f'Δdiv={delta_div:.4f} ***', flush=True)
-                            converged = True
+                    self._save_checkpoint(output_dir, gen, sigma, bounds)
 
                 open(_done_path(gen), 'w').close()
-                if converged:
-                    if gen % save_every != 0:
-                        self._save_checkpoint(output_dir, gen)
-                    open(_converged_path, 'w').close()
-                    break
             else:
                 while not os.path.exists(_done_path(gen)):
                     time.sleep(poll_interval)
-                if os.path.exists(_converged_path):
-                    break
 
         return self.population
 
@@ -1061,19 +1183,26 @@ else:
     )
     print(f'Gating type: GatingNetwork (per_layer)')
 
+# warm_start_path: try resume first (gen_XXXX checkpoints), fallback to single-net template load
+_resume = False
 if script_args.warm_start_path:
-    if script_args.gating_type == 'simple':
-        loaded = load_simple_gating_network(script_args.warm_start_path,
-                                            lm_hidden_size=lm_hidden_size,
-                                            num_experts=len(expert_models), device='cpu')
+    _ckpt_gen, _ = NSGAII._find_latest_checkpoint(script_args.warm_start_path)
+    if _ckpt_gen >= 0:
+        _resume = True
+        print(f'Resume detected: latest checkpoint gen_{_ckpt_gen:04d} in {script_args.warm_start_path}')
     else:
-        loaded = load_gating_network(script_args.warm_start_path,
-                                     lm_hidden_size=lm_hidden_size,
-                                     num_experts=len(expert_models), num_layers=_num_layers,
-                                     device='cpu')
-    if loaded is not None:
-        template_net = loaded.cpu().bfloat16()
-        print(f'Warm-start from {script_args.warm_start_path}')
+        if script_args.gating_type == 'simple':
+            loaded = load_simple_gating_network(script_args.warm_start_path,
+                                                lm_hidden_size=lm_hidden_size,
+                                                num_experts=len(expert_models), device='cpu')
+        else:
+            loaded = load_gating_network(script_args.warm_start_path,
+                                         lm_hidden_size=lm_hidden_size,
+                                         num_experts=len(expert_models), num_layers=_num_layers,
+                                         device='cpu')
+        if loaded is not None:
+            template_net = loaded.cpu().bfloat16()
+            print(f'Warm-start (template) from {script_args.warm_start_path}')
 
 if script_args.gating_type == 'simple':
     moe_model = SimpleMoEForCausalLM(expert_models, template_net).to(device)
@@ -1111,6 +1240,8 @@ final_population = nsgaii.run(
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,
+    resume=_resume,
+    resume_dir=script_args.warm_start_path if _resume else None,
 )
 
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)

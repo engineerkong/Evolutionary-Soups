@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -50,7 +52,7 @@ def pf_sorted(pts):
 datasets = [
     ('RS',     pts_rs,     '#FF69B4', 'P',  7),
     ('HoE',    pts_hoe,    '#808000', 'D',  7),
-    ('MORLHF', pts_morlhf, '#B22222', 'o',  8),
+    ('MORLHF', pts_morlhf, '#B22222', 'o',  7),
     ('ES',     pts_es,     '#9400D3', 's',  7),
 ]
 
@@ -85,6 +87,7 @@ ax.legend(fontsize=9, framealpha=0.9, loc='lower left',
           facecolor='white', edgecolor='#cccccc')
 
 plt.tight_layout()
-plt.savefig('beaver_pareto.png', dpi=150, bbox_inches='tight', facecolor='white', edgecolor='none')
-plt.savefig('beaver_pareto.svg', format='svg', bbox_inches='tight', facecolor='white', edgecolor='none')
-print("Saved: beaver_pareto.png and beaver_pareto.svg")
+os.makedirs('plots', exist_ok=True)
+plt.savefig('plots/beaver_pareto.png', dpi=150, bbox_inches='tight', facecolor='white', edgecolor='none')
+plt.savefig('plots/beaver_pareto.svg', format='svg', bbox_inches='tight', facecolor='white', edgecolor='none')
+print("Saved: plots/beaver_pareto.png and plots/beaver_pareto.svg")

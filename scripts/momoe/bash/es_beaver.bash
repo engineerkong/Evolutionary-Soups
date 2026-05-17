@@ -7,7 +7,7 @@ use_dual_front=true
 algorithm='nsga4'
 population_size=20
 num_generations=100
-warm_start_path=''
+warm_start_path=''    # set to a run directory (e.g. ./models/ES/es_beaver_1105) to resume evolution
 # --------------------
 parent_stability_bonus=0.01
 parent_stability_cap=0.10
@@ -34,6 +34,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29601 \
     --parent_stability_cap "${parent_stability_cap}" \
     --fixed_alpha "${fixed_alpha}" \
     --gating_type "${gating_type}" \
-    --normalize_fitness "${normalize_fitness}"\
+    --normalize_fitness "${normalize_fitness}" \
     --run_name "${run_name}" \
     2>&1 | tee ./logs/${run_name}.log

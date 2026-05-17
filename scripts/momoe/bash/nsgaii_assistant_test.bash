@@ -6,12 +6,12 @@ set -e
 
 base_model_name='meta-llama/Llama-2-7b-hf'
 expert_model_paths='./models/ppo/ppo_assistant_harmless_2104/best_model ./models/ppo/ppo_assistant_helpful_2104/best_model ./models/ppo/ppo_assistant_humor_2104/best_model'
-gating_paths='./models/ES/es_assistant_1405/gen_0010'
+gating_paths='./models/ES/es_assistant_1505/gen_0030'
 dataset_name='Anthropic/hh-rlhf'
 reward_names='harmless,helpful,humor'
 eval_prompts=0
 pref_step=0.2
-run_name='es_assistant_test_gen10_1405'
+run_name='es_assistant_test_gen30_1505'
 
 mkdir -p ./logs
 

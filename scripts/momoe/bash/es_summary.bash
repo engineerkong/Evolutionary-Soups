@@ -17,7 +17,7 @@ fixed_alpha=1.2
 gating_type='per_layer'   # 'per_layer' = GatingNetwork | 'simple' = SimpleGatingNetwork
 normalize_fitness=true
 # --------------------
-run_name='es_summary_1505'
+run_name='es_summary_1705'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=4,5,6 accelerate launch --main_process_port 29602 \

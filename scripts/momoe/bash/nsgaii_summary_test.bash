@@ -6,12 +6,12 @@ set -e
 
 base_model_name='meta-llama/Llama-2-7b-hf'
 expert_model_paths='./models/ppo/ppo_summary_summary_2104/best_model/ ./models/ppo/ppo_summary_faithful_2104/best_model/ ./models/ppo/ppo_summary_deberta_2104/best_model/'
-gating_paths='./models/ES/es_summary_1405/gen_0025'
+gating_paths='./models/ES/es_summary_1505/gen_0030'
 dataset_name='openai/summarize_from_feedback'
 reward_names='summary,faithful,deberta'
 eval_prompts=0
 pref_step=0.2
-run_name='es_summary_test_gen25_1405'
+run_name='es_summary_test_gen30_1505'
 
 mkdir -p ./logs
 
