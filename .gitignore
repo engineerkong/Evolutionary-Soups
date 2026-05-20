@@ -4,5 +4,7 @@ models/
 wandb/
 tmp/
 results/
+datasets/
+plots/
 __pycache__/
 *.pyc
