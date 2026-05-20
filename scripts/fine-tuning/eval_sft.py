@@ -98,9 +98,9 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.bfloat16,
     device_map=gpu_id,
 )
+model.resize_token_embeddings(len(tokenizer))
 model = PeftModel.from_pretrained(model, script_args.sft_model_name)
 model = model.merge_and_unload()
-model.resize_token_embeddings(len(tokenizer))
 
 # ========== define generation kwargs ==========
 generation_kwargs = {

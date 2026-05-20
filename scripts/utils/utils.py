@@ -412,13 +412,38 @@ def load_reward_model(reward_peft_path, gpu_id):
 
 # Load main tokenizer without adding special tokens
 def load_main_tokenizer(tokenizer_name):
-    # use_fast=False avoids tokenizers-version mismatch when tokenizer.json was
-    # saved with a newer tokenizers library than is installed (ModelWrapper parse error)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
+    # use_fast=False avoids tokenizers-version mismatch for Llama-style tokenizers,
+    # but Qwen2 requires the fast tokenizer (no slow tokenizer shipped).
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=False)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
     return tokenizer
+
+
+# model_type → LoRA target modules
+_LORA_TARGETS = {
+    'llama':   ["gate_proj", "up_proj", "down_proj"],
+    'mistral': ["gate_proj", "up_proj", "down_proj"],
+    'qwen2':   ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    'qwen':    ["c_attn", "c_proj", "w1", "w2"],
+}
+
+def get_lora_target_modules(model_name_or_path: str) -> list:
+    """Return appropriate LoRA target modules based on model_type in the config."""
+    from transformers import AutoConfig
+    try:
+        cfg = AutoConfig.from_pretrained(model_name_or_path)
+        model_type = getattr(cfg, 'model_type', '').lower()
+    except Exception:
+        model_type = ''
+    for key, modules in _LORA_TARGETS.items():
+        if key in model_type:
+            return modules
+    return ["gate_proj", "up_proj", "down_proj"]  # fallback: Llama2-style FFN
 
 def get_rewards(reward_model, texts_for_rewards, reward_mean_std=None, sub_position=0, round_digits=1):
     rewards = []

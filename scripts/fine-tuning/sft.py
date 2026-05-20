@@ -16,7 +16,7 @@ sys.path.insert(0, str(project_root))
 from scripts.utils.utils import load_config, Instructions, Instructions_summary, \
     build_dataset_sft, build_dataset_summary_sft, build_dataset_news_summary_sft, \
     build_dataset_beaver_sft, build_dataset_steer_sft, build_dataset_ultrafeedback_sft, \
-    load_main_tokenizer
+    load_main_tokenizer, get_lora_target_modules
 tqdm.pandas()
 
 SUMMARIZATION_DATASETS = {'openai/summarize_from_feedback', 'argilla/news-summary'}
@@ -52,12 +52,13 @@ training_args = TrainingArguments(
         output_dir=output_dir,
         run_name=script_args.wandb_name,
         report_to=script_args.log_with,
+        eval_strategy="no",
     )
 
 lora_config = LoraConfig(
     r=64, 
     lora_alpha=128, 
-    target_modules=["gate_proj", "up_proj", "down_proj"], # FFN layers in Llama2
+    target_modules=get_lora_target_modules(script_args.base_model_name),
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM",
@@ -79,32 +80,55 @@ else:
     )
 model.resize_token_embeddings(len(tokenizer))
 
+# BPE tokenizers can merge ':' with the first word of the response
+# (e.g. Qwen2 merges ':The' into one token), making the colon unfindable.
+# Strip the trailing colon and encode with a leading space to get the stable
+# in-context token IDs (e.g. Qwen2: [ĠĊĊ, Assistant], Llama2: [▁, \n, \n, Ass, istant]).
+def get_response_template_ids(template: str) -> list:
+    template_safe = template.rstrip(':')
+    # Leading space simulates that a sentence precedes the template in the data.
+    ids_with_space = tokenizer.encode(" " + template_safe, add_special_tokens=False)
+    ids_no_space   = tokenizer.encode(template_safe, add_special_tokens=False)
+    test_seq = tokenizer.encode(
+        "\n\nHuman: hello \n\nAssistant:The quick brown fox",
+        add_special_tokens=False,
+    )
+    for candidate_full in [ids_with_space, ids_no_space]:
+        for start in range(len(candidate_full)):
+            candidate = candidate_full[start:]
+            if len(candidate) >= 2 and any(
+                test_seq[i: i + len(candidate)] == candidate
+                for i in range(len(test_seq))
+            ):
+                return candidate
+    return ids_no_space  # fallback
+
 # ========== prepare dataset and data collator ==========
 if script_args.dataset_name == 'Anthropic/hh-rlhf':
     dataset = build_dataset_sft(script_args.dataset_name, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name == 'openai/summarize_from_feedback':
     dataset = build_dataset_summary_sft(script_args.dataset_name, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions_summary.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name == 'argilla/news-summary':
     # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test for training
     dataset = build_dataset_news_summary_sft(script_args.dataset_name, tokenizer, split='test')
-    response_template_ids = tokenizer.encode(Instructions_summary.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions_summary.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
     dataset = build_dataset_beaver_sft(script_args.dataset_name, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
     dataset = build_dataset_steer_sft(script_args.dataset_name, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 elif script_args.dataset_name == 'openbmb/UltraFeedback':
     dataset = build_dataset_ultrafeedback_sft(script_args.dataset_name, tokenizer, split='train')
-    response_template_ids = tokenizer.encode(Instructions.response_split, add_special_tokens=False)[1:]
-    collator = DataCollatorForCompletionOnlyLM(response_template=response_template_ids, tokenizer=tokenizer, mlm=False)
+    response_template = get_response_template_ids(Instructions.response_split)
+    collator = DataCollatorForCompletionOnlyLM(response_template=response_template, tokenizer=tokenizer, mlm=False)
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
                      f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, argilla/news-summary, '

@@ -141,6 +141,7 @@ if script_args.load_in_8bit:
         device_map=gpu_id,
     )
     model.pretrained_model = prepare_model_for_kbit_training(model.pretrained_model)
+    model.pretrained_model.resize_token_embeddings(len(tokenizer))
     model.pretrained_model = PeftModel.from_pretrained(
         model.pretrained_model,
         script_args.sft_model_name,
@@ -152,13 +153,13 @@ else:
         torch_dtype=torch.bfloat16,
         device_map=gpu_id,
     )
+    model.pretrained_model.resize_token_embeddings(len(tokenizer))
     model.pretrained_model = PeftModel.from_pretrained(
         model.pretrained_model,
         script_args.sft_model_name,
         is_trainable=True
     )
 print_trainable_parameters(model)
-model.pretrained_model.resize_token_embeddings(len(tokenizer))
 
 # ========== prepare dataset and dataloader ==========
 _normalise_query_for_rm = False  # overridden below for HelpSteer2 + gpt2 rewards
@@ -265,6 +266,8 @@ for epoch in range(epochs):
             response = response.strip('[PAD] ')
             response = response.strip('<unk>')
             temp_resp = response.strip('<s>').strip('</s>')
+            # Qwen2 stop tokens
+            temp_resp = temp_resp.split('<|im_end|>')[0].split('<|endoftext|>')[0].strip()
             temp_resp = temp_resp.split('\n\nHuman:')[0].strip()
             temp_resp = temp_resp.split('\nHuman:')[0].strip()
             temp_resp = temp_resp.split('\n\nuser:')[0].strip()

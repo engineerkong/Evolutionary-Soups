@@ -9,7 +9,7 @@ use_dual_front=true
 algorithm='nsga4'
 population_size=80
 num_generations=100
-warm_start_path=''
+warm_start_path='./models/ES/es_summary_1705'
 # --------------------
 parent_stability_bonus=0.005
 parent_stability_cap=0.10
@@ -17,10 +17,10 @@ fixed_alpha=1.2
 gating_type='per_layer'   # 'per_layer' = GatingNetwork | 'simple' = SimpleGatingNetwork
 normalize_fitness=true
 # --------------------
-run_name='es_summary_1705'
+run_name='es_summary_1705_continue1'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-CUDA_VISIBLE_DEVICES=4,5,6 accelerate launch --main_process_port 29602 \
+CUDA_VISIBLE_DEVICES=6,7 accelerate launch --main_process_port 29602 \
     ./scripts/momoe/evolutionary_soups.py \
     --base_model_name "${base_model_name}" \
     --expert_model_paths ${expert_model_paths} \

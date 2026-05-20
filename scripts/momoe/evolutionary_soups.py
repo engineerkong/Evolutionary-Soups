@@ -646,10 +646,15 @@ class NSGAII:
                 live: dict = {}
                 if os.path.exists(live_path):
                     with open(live_path) as f:
-                        live = json.load(f)
-                    # live_state.json may be from a more recent gen than the checkpoint
-                    live_gen = live.get('generation', resume_gen)
-                    print(f'  live_state.json found (gen={live_gen})', flush=True)
+                        _live_candidate = json.load(f)
+                    live_gen = _live_candidate.get('generation', resume_gen)
+                    if live_gen == resume_gen:
+                        live = _live_candidate
+                        print(f'  live_state.json matches checkpoint (gen={live_gen}) — '
+                              f'using for full state restore', flush=True)
+                    else:
+                        print(f'  live_state.json gen={live_gen} != checkpoint gen={resume_gen} '
+                              f'— ignoring live_state, using nsgaii_state.json only', flush=True)
 
                 # Restore population weights (always from checkpoint dir)
                 for i in range(self.P):
@@ -715,25 +720,48 @@ class NSGAII:
                     print('  parent_eval_count not in checkpoint — defaulting to 1 '
                           '(stability bonus will ramp from 0)', flush=True)
 
-                # z_star / sigma / bounds: live_state > nsgaii_state > defaults
+                # z_star / sigma / bounds: live_state > nsgaii_state > bounds.json > defaults
                 self.z_star = np.array(live.get('z_star', state['z_star']))
                 sigma       = live.get('sigma', state.get('sigma', mutation_sigma))
                 live_bounds = live.get('bounds', state.get('bounds'))
+                if not live_bounds:
+                    # fallback: standalone bounds.json written right after first computation
+                    bounds_path = os.path.join(resume_dir or output_dir, 'bounds.json')
+                    if os.path.exists(bounds_path):
+                        with open(bounds_path) as f:
+                            live_bounds = json.load(f)
+                        print(f'  bounds restored from bounds.json', flush=True)
                 if live_bounds:
                     bounds['min']   = np.array(live_bounds['min'])
                     bounds['range'] = np.array(live_bounds['range'])
+                    r_max = bounds['min'] + bounds['range']
+                    print(f'  reward_min={np.round(bounds["min"], 3)}', flush=True)
+                    print(f'  reward_max={np.round(r_max, 3)}', flush=True)
 
-                print(f'Resumed from checkpoint gen_{resume_gen:04d}  '
+                print(f'Resuming: weights from ckpt, state from live_state — '
+                      f'next gen={resume_gen + 1}  '
                       f'(σ={sigma:.5f}, z*={np.round(self.z_star, 3)})', flush=True)
             else:
                 print('No checkpoint found — starting from scratch.', flush=True)
                 resume_gen = -1
 
         if resume and torch.distributed.is_initialized():
-            # Broadcast resume_gen so all ranks know whether to skip phase 0
-            t = torch.tensor([resume_gen], dtype=torch.long)
+            # Broadcast resume_gen + actual bounds so all ranks stay in sync
+            device = torch.device(f'cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}')
+            n_obj = len(reward_names)
+            # Pack: [resume_gen, bounds_ready, min×n_obj, range×n_obj]
+            if bounds['min'] is not None:
+                payload = np.array([resume_gen, 1] + bounds['min'].tolist() + bounds['range'].tolist(),
+                                   dtype=np.float64)
+            else:
+                payload = np.array([resume_gen, 0] + [0.0] * n_obj + [1.0] * n_obj, dtype=np.float64)
+            t = torch.tensor(payload, dtype=torch.float64, device=device)
             torch.distributed.broadcast(t, src=0)
-            resume_gen = int(t[0])
+            arr        = t.cpu().numpy()
+            resume_gen = int(arr[0])
+            if int(arr[1]):
+                bounds['min']   = arr[2:2 + n_obj]
+                bounds['range'] = arr[2 + n_obj:]
 
         # ── Eval helper ───────────────────────────────────────────────────────
         def _eval_individual(params, chunk_idx, label=''):
@@ -821,6 +849,9 @@ class NSGAII:
                 bounds['range'] = r_range
                 print(f'  reward_min={np.round(r_min, 3)}', flush=True)
                 print(f'  reward_max={np.round(r_max, 3)}', flush=True)
+                bounds_path = os.path.join(output_dir, 'bounds.json')
+                with open(bounds_path, 'w') as f:
+                    json.dump({'min': r_min.tolist(), 'range': r_range.tolist()}, f)
                 open(_done_path(_BG), 'w').close()
             else:
                 while not os.path.exists(_done_path(_BG)):
@@ -1184,25 +1215,40 @@ else:
     print(f'Gating type: GatingNetwork (per_layer)')
 
 # warm_start_path: try resume first (gen_XXXX checkpoints), fallback to single-net template load
-_resume = False
+_resume     = False
+_resume_dir = None
 if script_args.warm_start_path:
-    _ckpt_gen, _ = NSGAII._find_latest_checkpoint(script_args.warm_start_path)
-    if _ckpt_gen >= 0:
-        _resume = True
-        print(f'Resume detected: latest checkpoint gen_{_ckpt_gen:04d} in {script_args.warm_start_path}')
+    wsp      = script_args.warm_start_path.rstrip('/')
+    wsp_name = os.path.basename(wsp)
+    # Case 1: warm_start_path points directly to a gen_XXXX checkpoint directory
+    if (wsp_name.startswith('gen_') and wsp_name[4:].isdigit()
+            and os.path.isfile(os.path.join(wsp, 'nsgaii_state.json'))):
+        _resume     = True
+        _resume_dir = os.path.dirname(os.path.abspath(wsp))
+        _ckpt_gen   = int(wsp_name[4:])
+        print(f'Resume detected: checkpoint {wsp_name} (gen={_ckpt_gen}) — '
+              f'resume_dir={_resume_dir}')
     else:
-        if script_args.gating_type == 'simple':
-            loaded = load_simple_gating_network(script_args.warm_start_path,
-                                                lm_hidden_size=lm_hidden_size,
-                                                num_experts=len(expert_models), device='cpu')
+        # Case 2: warm_start_path is the run directory; find latest gen_XXXX inside it
+        _ckpt_gen, _ = NSGAII._find_latest_checkpoint(wsp)
+        if _ckpt_gen >= 0:
+            _resume     = True
+            _resume_dir = wsp
+            print(f'Resume detected: latest checkpoint gen_{_ckpt_gen:04d} in {wsp}')
         else:
-            loaded = load_gating_network(script_args.warm_start_path,
-                                         lm_hidden_size=lm_hidden_size,
-                                         num_experts=len(expert_models), num_layers=_num_layers,
-                                         device='cpu')
-        if loaded is not None:
-            template_net = loaded.cpu().bfloat16()
-            print(f'Warm-start (template) from {script_args.warm_start_path}')
+            # Case 3: no population checkpoint — load single net as template
+            if script_args.gating_type == 'simple':
+                loaded = load_simple_gating_network(wsp,
+                                                    lm_hidden_size=lm_hidden_size,
+                                                    num_experts=len(expert_models), device='cpu')
+            else:
+                loaded = load_gating_network(wsp,
+                                             lm_hidden_size=lm_hidden_size,
+                                             num_experts=len(expert_models), num_layers=_num_layers,
+                                             device='cpu')
+            if loaded is not None:
+                template_net = loaded.cpu().bfloat16()
+                print(f'Warm-start (template) from {wsp}')
 
 if script_args.gating_type == 'simple':
     moe_model = SimpleMoEForCausalLM(expert_models, template_net).to(device)
@@ -1241,7 +1287,7 @@ final_population = nsgaii.run(
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,
     resume=_resume,
-    resume_dir=script_args.warm_start_path if _resume else None,
+    resume_dir=_resume_dir,
 )
 
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)

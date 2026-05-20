@@ -103,22 +103,28 @@ save_configs(save_info, os.path.join(script_args.save_directory, script_args.wan
 save_path = os.path.join(script_args.save_directory, script_args.wandb_name)
 os.makedirs(save_path, exist_ok=True)
 
-# offline training — start from SFT LoRA adapter if provided
-initial_peft = script_args.sft_model_name if script_args.sft_model_name else None
-dataset = train_model(
-    base_model_name=base_model_name,
-    reward_model_path_list=reward_model_path_list,
-    train_dataset=train_dataset_path,
-    save_path=save_path + '/model_iter0',
-    tokenizer_name=tokenizer_name,
-    rm_tokenizer_path_list=rm_tokenizer_path_list,
-    peft_name=initial_peft,
-    training_steps=script_args.training_steps,
-    learning_rate=1.414e-4,
-    args=script_args,
-    exp_type=exp_type,
-)
-clean_gpu_memory()
+# offline training — skip if model_iter0 already exists
+model_iter0_path = save_path + '/model_iter0'
+if os.path.exists(os.path.join(model_iter0_path, 'adapter_model.safetensors')):
+    print('model_iter0 already exists, skipping offline training')
+    from datasets import load_from_disk
+    dataset = load_from_disk(train_dataset_path)
+else:
+    initial_peft = script_args.sft_model_name if script_args.sft_model_name else None
+    dataset = train_model(
+        base_model_name=base_model_name,
+        reward_model_path_list=reward_model_path_list,
+        train_dataset=train_dataset_path,
+        save_path=model_iter0_path,
+        tokenizer_name=tokenizer_name,
+        rm_tokenizer_path_list=rm_tokenizer_path_list,
+        peft_name=initial_peft,
+        training_steps=script_args.training_steps,
+        learning_rate=1.414e-4,
+        args=script_args,
+        exp_type=exp_type,
+    )
+    clean_gpu_memory()
 
 online_dataset = None
 model_path     = base_model_name

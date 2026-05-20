@@ -8,8 +8,8 @@ base_model_name='meta-llama/Llama-2-7b-hf'
 reward_names='beaver_reward,beaver_cost'
 batch_size=64
 train_run='morlhf_beaver_2704'
-save_dir="./results/morlhf/eval_${train_run}"
-log_file="./logs/morlhf/eval_${train_run}.log"
+save_dir="./results/morlhf/eval_${train_run}_1"
+log_file="./logs/morlhf/eval_${train_run}_1.log"
 
 mkdir -p ./logs/morlhf
 

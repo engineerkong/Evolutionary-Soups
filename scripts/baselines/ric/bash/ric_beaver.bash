@@ -12,28 +12,25 @@ sft_model_name='./models/sft/sft_beaver_2004/model/'
 reward_names='beaver_reward,beaver_cost'
 dataset_path='./datasets/ric_beaver_rewardcost.hf'
 save_dir='./results/ric/'
-run_name='ric_beaver_2704'
-eval_name='ric_beaver_eval_2704'
+run_name='ric_beaver_1805'
+eval_name='ric_beaver_eval_1805'
 
 mkdir -p ./logs/ric ./datasets
 
-# ---- Step 1: Prepare training dataset with reward scores ----
-CUDA_VISIBLE_DEVICES=4 python ./scripts/baselines/ric/prepare_dataset.py \
-    --reward_names "${reward_names}" \
-    --save_directory "${dataset_path}" \
-    --exp_type "beaver" \
-    2>&1 | tee ./logs/ric/${run_name}_prepare.log
+# # ---- Step 1: Prepare training dataset with reward scores ----
+# python ./scripts/baselines/ric/prepare_dataset.py \
+#     --reward_names "${reward_names}" \
+#     --save_directory "${dataset_path}" \
+#     --exp_type "beaver" \
+#     2>&1 | tee ./logs/ric/${run_name}_prepare.log
 
 # ---- Step 2: Train RiC ----
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-CUDA_VISIBLE_DEVICES=4,5 accelerate launch \
-    --num_processes 2 \
-    --main_process_port 29815 \
-    ./scripts/baselines/ric/main.py \
+python ./scripts/baselines/ric/main.py \
     --base_model_name "${base_model_name}" \
     --sft_model_name "${sft_model_name}" \
     --reward_names "${reward_names}" \
     --exp_type "beaver" \
+    --load_in_8bit False \
     --train_dataset_path "${dataset_path}" \
     --save_directory "${save_dir}" \
     --wandb_name "${run_name}" \
@@ -45,10 +42,7 @@ CUDA_VISIBLE_DEVICES=4,5 accelerate launch \
 # ---- Step 3: Evaluate across preference simplex ----
 model_path="${save_dir}${run_name}/model_iter1"
 
-CUDA_VISIBLE_DEVICES=4,5 accelerate launch \
-    --num_processes 2 \
-    --main_process_port 29816 \
-    ./scripts/baselines/ric/evaluation.py \
+python ./scripts/baselines/ric/evaluation.py \
     --base_model_name "${base_model_name}" \
     --peft_name "${model_path}" \
     --reward_names "${reward_names}" \
