@@ -78,6 +78,7 @@ class ScriptArguments:
                                              # effective = min(gen * bonus, cap)
     parent_stability_cap:    float  = 0.10  # max bonus (10 %)
     use_dual_front:          bool   = True  # if False, select solely by raw reward front (_select)
+    use_greedy_hvc:          bool   = True  # if False, use _select (crowding distance) instead of greedy HVC fill
     fixed_alpha:          float     = 1.2   # entmax α fixed for all layers (1.0=softmax, 2.0=sparsemax)
     gating_type:          str       = 'per_layer'  # 'per_layer' = GatingNetwork, 'simple' = SimpleGatingNetwork
     normalize_fitness:    bool      = True  # min-max normalize fitness by expert model bounds
@@ -392,14 +393,11 @@ def _hypervolume_contribution(candidates: np.ndarray, ref: np.ndarray) -> np.nda
 
 
 def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-    """NSGA-IV selection: non-dominated sorting + greedy hypervolume contribution on last front.
+    """NSGA-IV selection: non-dominated sorting + sequential greedy HVC on last front.
 
-    Within the critical last front, individuals are ranked by their exclusive
-    hypervolume contribution (HVC) relative to a dynamic nadir reference point
-    (per-generation minimum - 0.1).  Higher HVC = larger unique coverage of
-    objective space = selected first.  This naturally retains both extreme
-    (corner) points and well-spread intermediate points without requiring
-    pre-specified reference lines or divisions.
+    Complete fronts are accepted whole; the critical overflow front is filled by
+    sequential greedy marginal-hypervolume maximisation, seeded with the
+    already-selected individuals.
     """
     fronts   = _non_dominated_sort(rewards)
     selected: List[int] = []
@@ -408,17 +406,21 @@ def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
         if len(selected) + len(front) <= pop_size:
             selected.extend(front)
         else:
-            n_needed   = pop_size - len(selected)
-            candidates = np.array([rewards[i] for i in front])   # (|front|, M)
-
-            # Dynamic nadir: minimum across ALL individuals in the merged pool
-            # (selected + last front), shifted down to ensure ref is below all points.
-            all_pts = np.vstack([rewards[selected], candidates]) if selected else candidates
-            ref     = all_pts.min(axis=0) - 0.1
-
-            hvc     = _hypervolume_contribution(candidates, ref)
-            ranked  = [x for _, x in sorted(zip(-hvc, front))]
-            selected.extend(ranked[:n_needed])
+            n_needed  = pop_size - len(selected)
+            all_pts   = rewards[np.array(selected + front)] if selected else rewards[np.array(front)]
+            ref       = all_pts.min(axis=0) - 0.1
+            chosen    = [rewards[k] for k in selected]
+            hv_base   = _hv(np.array(chosen), ref) if chosen else 0.0
+            remaining = list(range(len(front)))
+            for _ in range(n_needed):
+                gains    = [_hv(np.array(chosen + [rewards[front[loc]]]), ref) - hv_base
+                            for loc in remaining]
+                best_pos = int(np.argmax(gains))
+                best_loc = remaining[best_pos]
+                hv_base += gains[best_pos]
+                chosen.append(rewards[front[best_loc]])
+                selected.append(front[best_loc])
+                remaining.remove(best_loc)
             break
 
     return selected
@@ -554,6 +556,7 @@ class NSGAII:
         parent_stability_bonus:  float = 0.01,
         parent_stability_cap:    float = 0.10,
         use_dual_front:          bool  = True,
+        use_greedy_hvc:          bool  = True,
         algorithm:               str   = 'nsgaii',
         n_reference_divisions:   int   = 12,
         normalize_fitness:       bool  = False,
@@ -580,6 +583,10 @@ class NSGAII:
                 print(f'NSGA-HVC: Hypervolume Computing utility selection (M={self.M})')
         else:
             _select = _nsga2_select
+
+        # use_greedy_hvc forces _select to sequential greedy HVC regardless of algorithm
+        if use_greedy_hvc:
+            _select = _nsga4_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -947,9 +954,42 @@ class NSGAII:
                 merged_params  = parent_params + child_params_list
                 merged_fitness = np.vstack([np.array(self.fitness), np.array(child_fitness)])
 
+                # Greedy HVC fill: starting from a seed set, pick the candidate with the
+                # highest marginal hypervolume gain each step.
+                def _greedy_hvc_fill(seed: List[int], pool: List[int], n: int) -> List[int]:
+                    if n <= 0 or not pool:
+                        return []
+                    all_pts = np.array([merged_fitness[k] for k in seed + pool])
+                    ref     = all_pts.min(axis=0) - 0.1
+                    chosen  = [merged_fitness[k] for k in seed]
+                    hv_base = _hv(np.array(chosen), ref) if chosen else 0.0
+                    result, remaining = [], list(range(len(pool)))
+                    for _ in range(min(n, len(remaining))):
+                        gains    = [_hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
+                                    for loc in remaining]
+                        best_pos = int(np.argmax(gains))
+                        best_loc = remaining[best_pos]
+                        hv_base += gains[best_pos]
+                        chosen.append(merged_fitness[pool[best_loc]])
+                        result.append(pool[best_loc])
+                        remaining.remove(best_loc)
+                    return result
+
+                def _fill(seed: List[int], pool: List[int], n: int) -> List[int]:
+                    """Fill n slots from pool; greedy HVC if use_greedy_hvc else _select."""
+                    if n <= 0 or not pool:
+                        return []
+                    if use_greedy_hvc:
+                        return _greedy_hvc_fill(seed, pool, n)
+                    sub = merged_fitness[np.array(pool)]
+                    return [pool[i] for i in _select(sub, min(n, len(pool)))]
+
                 if not use_dual_front:
-                    # Single-front: select purely by raw reward using the configured algorithm.
-                    selected       = _select(merged_fitness, self.P)
+                    # Single-front: select from full merged pool.
+                    if use_greedy_hvc:
+                        selected = _greedy_hvc_fill([], list(range(len(merged_fitness))), self.P)
+                    else:
+                        selected = _select(merged_fitness, self.P)
                     n_intersection = len(selected)
                 else:
                     # Front 1: complete Pareto front on raw fitness (no size cap).
@@ -967,35 +1007,14 @@ class NSGAII:
                     front2_fronts = _non_dominated_sort(merged_front2)
                     front2_set    = set(front2_fronts[0])
 
-                    # Greedy HVC fill: starting from a seed set, pick the candidate with the
-                    # highest marginal hypervolume gain each step.
-                    def _greedy_hvc_fill(seed: List[int], pool: List[int], n: int) -> List[int]:
-                        if n <= 0 or not pool:
-                            return []
-                        all_pts = np.array([merged_fitness[k] for k in seed + pool])
-                        ref     = all_pts.min(axis=0) - 0.1
-                        chosen  = [merged_fitness[k] for k in seed]
-                        hv_base = _hv(np.array(chosen), ref) if chosen else 0.0
-                        result, remaining = [], list(range(len(pool)))
-                        for _ in range(min(n, len(remaining))):
-                            gains    = [_hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
-                                        for loc in remaining]
-                            best_pos = int(np.argmax(gains))
-                            best_loc = remaining[best_pos]
-                            hv_base += gains[best_pos]
-                            chosen.append(merged_fitness[pool[best_loc]])
-                            result.append(pool[best_loc])
-                            remaining.remove(best_loc)
-                        return result
-
-                    # Stage 1: intersection of both fronts; trim to P via HVC if oversized.
+                    # Stage 1: intersection of both fronts; trim to P if oversized.
                     intersection   = [k for k in front2_set if k in front1_set]
                     n_intersection = len(intersection)
                     if len(intersection) > self.P:
-                        intersection = _greedy_hvc_fill([], intersection, self.P)
+                        intersection = _fill([], intersection, self.P)
 
-                    # Stage 2: fill from front2 \ front1 via greedy HVC against intersection seed.
-                    selected = intersection + _greedy_hvc_fill(
+                    # Stage 2: fill from front2 \ front1 against intersection seed.
+                    selected = intersection + _fill(
                         intersection,
                         [k for k in front2_set if k not in front1_set],
                         self.P - len(intersection),
@@ -1006,7 +1025,7 @@ class NSGAII:
                         if len(selected) >= self.P:
                             break
                         pool = [k for k in deeper_front if k not in set(selected)]
-                        selected += _greedy_hvc_fill(selected, pool, self.P - len(selected))
+                        selected += _fill(selected, pool, self.P - len(selected))
 
                 ind_labels     = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
                                   for j, k in enumerate(selected)]
@@ -1283,6 +1302,7 @@ final_population = nsgaii.run(
     parent_stability_bonus=script_args.parent_stability_bonus,
     parent_stability_cap=script_args.parent_stability_cap,
     use_dual_front=script_args.use_dual_front,
+    use_greedy_hvc=script_args.use_greedy_hvc,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,

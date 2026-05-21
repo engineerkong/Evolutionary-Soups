@@ -19,7 +19,7 @@ normalize_fitness=true
 run_name='es_beaver_abl_no_dualfront'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29601 \
+CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29604 \
     ./scripts/momoe/evolutionary_soups.py \
     --base_model_name "${base_model_name}" \
     --expert_model_paths ${expert_model_paths} \
