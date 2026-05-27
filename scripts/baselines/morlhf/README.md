@@ -19,8 +19,8 @@ the Pareto front.
 
 | # | Change | Reason |
 |---|--------|--------|
-| 1 | **Imports**: `sys.path` → `MOMoE/scripts/utils`; uses `scripts.utils.{utils, multi_reward_models}` | Centralised utils with beaver support |
-| 2 | **Dataset builders**: `build_dataset` / `build_dataset_summary` → `build_dataset_ppo` / `build_dataset_summary_ppo` | MOMoE equivalents with optional rm_tokenizer |
+| 1 | **Imports**: `sys.path` → `ES/scripts/baselines/utils`; uses `scripts.baselines.utils.{utils, multi_reward_models}` | Centralised utils with beaver support |
+| 2 | **Dataset builders**: `build_dataset` / `build_dataset_summary` → `build_dataset_ppo` / `build_dataset_summary_ppo` | ES equivalents with optional rm_tokenizer |
 | 3 | **Beaver support**: `exp_type='beaver'` added; uses `build_dataset_beaver_ppo` and `Instructions()` (same Human/Assistant format) | New task |
 | 4 | **Reward dict**: extended with `beaver_reward` / `beaver_cost` | New task |
 | 5 | **`--preference`**: changed from single `float` to comma-separated `str` (e.g. `'0.2,0.4,0.4'`) covering all N reward dimensions; the original equal-weight override for N==3 removed | Multi-objective simplex sampling from bash |
@@ -34,7 +34,7 @@ the Pareto front.
 
 | # | Change | Reason |
 |---|--------|--------|
-| 1 | **Imports**: same sys.path + MOMoE utils | Centralised utils |
+| 1 | **Imports**: same sys.path + ES utils | Centralised utils |
 | 2 | **Beaver support**: `exp_type='beaver'` uses `build_dataset_beaver_eval` and `Instructions()` | New task |
 | 3 | **Reward dict**: extended with beaver entries | New task |
 | 4 | **Model loading**: `base_model_name` (bare LLaMA) + `checkpoint_path` (trained LoRA adapter from `ppo_trainer.save_pretrained`). Loads base, applies LoRA via `PeftModel.from_pretrained`, then `merge_and_unload()` | Correct loading of LoRA checkpoints |
@@ -44,7 +44,7 @@ the Pareto front.
 
 ## Usage
 
-All commands run from `MOMoE/` directory.
+All commands run from `ES/` directory.
 
 ### Train
 
