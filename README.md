@@ -29,15 +29,27 @@ pip install git+https://github.com/PKU-Alignment/safe-rlhf.git
 
 ## Usage
 
+### Installation
+
 ```bash
-# 1. Install PyTorch matching your CUDA version (see https://pytorch.org/get-started/locally/)
+# Install PyTorch matching your CUDA version (see https://pytorch.org/get-started/locally/)
 pip install torch
 
-# 2. Install the remaining Python dependencies
+# Install the remaining Python dependencies
 pip install -r requirements.txt
+```
 
-# 3. Run any evolutionary entry point, e.g.
-bash ./scripts/evolutionary/bash/es_train.bash
+### Running
+
+All commands are run from the repository root. Per-objective experts must be trained first; ES consumes their checkpoints.
+
+```bash
+# 1. Per-objective experts: one SFT init + one PPO LoRA per reward dimension
+bash ./scripts/baselines/fine-tuning/bash/sft.bash
+bash ./scripts/baselines/fine-tuning/bash/ppo_xxx.bash      
+
+# 2. Evolutionary Soups: evolve, select per preference, evaluate
+bash ./scripts/evolutionary/bash/es_xxx.bash                 
 ```
 
 ---
