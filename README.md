@@ -27,6 +27,19 @@ Beaver requires the PKU safe-rlhf package:
 pip install git+https://github.com/PKU-Alignment/safe-rlhf.git
 ```
 
+## Usage
+
+```bash
+# 1. Install PyTorch matching your CUDA version (see https://pytorch.org/get-started/locally/)
+pip install torch
+
+# 2. Install the remaining Python dependencies
+pip install -r requirements.txt
+
+# 3. Run any evolutionary entry point, e.g.
+bash ./scripts/evolutionary/bash/es_train.bash
+```
+
 ---
 
 ## 1. Per-objective experts ([scripts/baselines/fine-tuning](scripts/baselines/fine-tuning))
