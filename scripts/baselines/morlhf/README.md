@@ -19,7 +19,7 @@ the Pareto front.
 
 | # | Change | Reason |
 |---|--------|--------|
-| 1 | **Imports**: `sys.path` → `ES/scripts/baselines/utils`; uses `scripts.baselines.utils.{utils, multi_reward_models}` | Centralised utils with beaver support |
+| 1 | **Imports**: `sys.path` → `Evolutionary-Soups/scripts/baselines/utils`; uses `scripts.baselines.utils.{utils, multi_reward_models}` | Centralised utils with beaver support |
 | 2 | **Dataset builders**: `build_dataset` / `build_dataset_summary` → `build_dataset_ppo` / `build_dataset_summary_ppo` | ES equivalents with optional rm_tokenizer |
 | 3 | **Beaver support**: `exp_type='beaver'` added; uses `build_dataset_beaver_ppo` and `Instructions()` (same Human/Assistant format) | New task |
 | 4 | **Reward dict**: extended with `beaver_reward` / `beaver_cost` | New task |
@@ -44,7 +44,7 @@ the Pareto front.
 
 ## Usage
 
-All commands run from `ES/` directory.
+All commands run from `Evolutionary-Soups/` directory.
 
 ### Train
 
