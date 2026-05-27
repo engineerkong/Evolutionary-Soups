@@ -1,8 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
 
-fig, ax = plt.subplots(figsize=(6, 6))
-ax.set_aspect('equal')
+fig, ax = plt.subplots(figsize=(6, 4))
+# Don't force ax.set_aspect('equal') — it locks the axes box to a square
+# whenever xlim/ylim spans match, which then makes bbox_inches='tight' crop
+# the figure back to a square regardless of figsize.
 
 # ── Convex Pareto fronts (both bow outward toward upper-right) ──
 # Parametric: angle θ from 90° to 0°, x = r(θ)*cos(θ), y = r(θ)*sin(θ)
@@ -76,7 +78,7 @@ bbox_red  = dict(boxstyle='round,pad=0.4', facecolor='#FCEBEB',
 
 ax.annotate(
     '"Recommend a red wine?"\noptimal $\\lambda$ = [0.8, 0.2]',
-    xy=(px_safe, py_safe), xytext=(0.55, 0.68),
+    xy=(px_safe, py_safe), xytext=(0.75, 0.68),
     fontsize=8.5, color='#0C447C', bbox=bbox_blue,
     arrowprops=dict(arrowstyle='->', color='#185FA5', lw=0.9,
                     connectionstyle='arc3,rad=0.2'),
@@ -95,27 +97,27 @@ ax.annotate(
 # ── Tangent line labels ──────────────────────────────────────────
 ax.text(xl_s[-1] - 0.15, yl_s[-1] + 0.25,
         r'$0.5h + 0.5H = C_1$',
-        fontsize=8, color='#185FA5', ha='left', va='top')
+        fontsize=8.5, color='#185FA5', ha='left', va='top')
 ax.text(xl_r[-1] - 0.15, yl_r[-1] + 0.25,
         r'$0.5h + 0.5H = C_2$',
-        fontsize=8, color='#A32D2D', ha='left', va='top')
+        fontsize=8.5, color='#A32D2D', ha='left', va='top')
 
 # ── Key insight ──────────────────────────────────────────────────
 ax.text(0.85, 0.78,
         'Same preference [0.5, 0.5]\n$\\Rightarrow$ different optimal $\\lambda$',
-        fontsize=9, ha='center', va='bottom', color='#444441',
+        fontsize=8.5, ha='center', va='bottom', color='#444441',
         style='italic', transform=ax.transAxes,
         multialignment='center')
 
 # ── Axes ─────────────────────────────────────────────────────────
 ax.set_xlim(0, 1)
 ax.set_ylim(0, 1)
-ax.set_xlabel('Helpful',   fontsize=11)
-ax.set_ylabel('Harmless',  fontsize=11)
+ax.set_xlabel('Helpful',   fontsize=12)
+ax.set_ylabel('Harmless',  fontsize=12)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
-ax.tick_params(labelsize=9)
-ax.legend(fontsize=9, loc='lower left', frameon=True,
+ax.tick_params(labelsize=10)
+ax.legend(fontsize=10, loc='lower left', frameon=True,
           framealpha=0.9, edgecolor='#D3D1C7', facecolor='white')
 
 plt.tight_layout()

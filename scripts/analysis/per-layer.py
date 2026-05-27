@@ -83,7 +83,7 @@ surface_points = np.array(surface_points)
 # Plot
 # ============================================================
 
-fig, ax = plt.subplots(figsize=(6, 6))
+fig, ax = plt.subplots(figsize=(6, 4))
 
 # ------------------------------------------------------------
 # Dashed polygon edges
@@ -141,10 +141,10 @@ ax.scatter(*f11, s=260, marker='*', color='green', zorder=5)
 # Labels
 # ------------------------------------------------------------
 
-ax.text(f22[0] + 0.015, f22[1] + 0.015, r'$f_{22}$', fontsize=11)
-ax.text(f21[0] + 0.015, f21[1] + 0.015, r'$f_{21}$', fontsize=11)
-ax.text(f12[0] + 0.015, f12[1] + 0.015, r'$f_{12}$', fontsize=11)
-ax.text(f11[0] + 0.015, f11[1] + 0.015, r'$f_{11}$', fontsize=11)
+ax.text(f22[0] + 0.015, f22[1] + 0.015, r'$f_{22}$', fontsize=12)
+ax.text(f21[0] + 0.015, f21[1] + 0.015, r'$f_{21}$', fontsize=12)
+ax.text(f12[0] + 0.015, f12[1] + 0.015, r'$f_{12}$', fontsize=12)
+ax.text(f11[0] + 0.015, f11[1] + 0.015, r'$f_{11}$', fontsize=12)
 
 # ------------------------------------------------------------
 # Axes / title
@@ -153,12 +153,12 @@ ax.text(f11[0] + 0.015, f11[1] + 0.015, r'$f_{11}$', fontsize=11)
 ax.set_xlim(0, 1.0)
 ax.set_ylim(0, 1.0)
 
-ax.set_xlabel('Helpful', fontsize=11)
-ax.set_ylabel('Harmless', fontsize=11)
+ax.set_xlabel('Helpful', fontsize=12)
+ax.set_ylabel('Harmless', fontsize=12)
 
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
-ax.tick_params(labelsize=9)
+ax.tick_params(labelsize=10)
 
 ax.grid(False)
 
@@ -167,7 +167,7 @@ ax.grid(False)
 # ------------------------------------------------------------
 
 ax.legend(
-    fontsize=9,
+    fontsize=10,
     loc='lower left',
     frameon=True,
     framealpha=0.9,

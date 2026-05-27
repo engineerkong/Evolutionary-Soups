@@ -1,6 +1,6 @@
-"""dummy.py — Initialise a random NSGA-II population with a fixed seed and save it.
+"""dummy.py — Initialise a random ES population with a fixed seed and save it.
 
-Imitates evolutionary_soups.py up to and including NSGAII.__init__, then saves
+Imitates es_train.py up to and including ES.__init__, then saves
 the un-evolved initial population directly as 'final'.  No evaluation, no evolution.
 Useful as a reproducible random-init baseline against which evolved populations can
 be compared.
@@ -27,12 +27,12 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
 from scripts.utils.utils import load_main_tokenizer
-from nsgaii_architecture import GatingNetwork, SimpleGatingNetwork
-from nsgaii_utils import save_gating_network, REWARD_PATHS
+from scripts.es.es_architecture import GatingNetwork, SimpleGatingNetwork
+from scripts.es.es_utils import save_gating_network, REWARD_PATHS
 
 
 # ---------------------------------------------------------------------------
-# Script arguments  (mirrors evolutionary_soups.py)
+# Script arguments  (mirrors es_train.py)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -51,7 +51,7 @@ class ScriptArguments:
 
 
 # ---------------------------------------------------------------------------
-# Genome helpers  (copied verbatim from evolutionary_soups.py)
+# Genome helpers  (copied verbatim from es_train.py)
 # ---------------------------------------------------------------------------
 
 def net_to_params(net: GatingNetwork) -> np.ndarray:
@@ -107,8 +107,8 @@ for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
     base = AutoModelForCausalLM.from_pretrained(
         script_args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
+    base.resize_token_embeddings(len(sft_tokenizer))
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
-    m.resize_token_embeddings(len(sft_tokenizer))
     m.eval()
     for p in m.parameters(): p.requires_grad = False
     expert_models.append(m)
@@ -137,11 +137,11 @@ else:
 
 if script_args.warm_start_path:
     if script_args.gating_type == 'simple':
-        from nsgaii_utils import load_simple_gating_network as _load
+        from scripts.es.es_utils import load_simple_gating_network as _load
         loaded = _load(script_args.warm_start_path, lm_hidden_size=lm_hidden_size,
                        num_experts=len(expert_models), device='cpu')
     else:
-        from nsgaii_utils import load_gating_network as _load
+        from scripts.es.es_utils import load_gating_network as _load
         loaded = _load(script_args.warm_start_path, lm_hidden_size=lm_hidden_size,
                        num_experts=len(expert_models), num_layers=_num_layers,
                        device='cpu')
@@ -149,7 +149,7 @@ if script_args.warm_start_path:
         template_net = loaded.cpu().bfloat16()
         print(f'Warm-start from {script_args.warm_start_path}')
 
-# Initialise population with the fixed seed — identical to NSGAII.__init__
+# Initialise population with the fixed seed — identical to ES.__init__
 base_params    = net_to_params(template_net)
 param_dim      = len(base_params)
 population     = [
@@ -161,7 +161,7 @@ dummy_fitness  = [np.zeros(n_objectives) for _ in range(script_args.population_s
 print(f'\nPopulation of {script_args.population_size} individuals initialised '
       f'(seed={script_args.seed}, param_dim={param_dim}).  Skipping evolution.')
 
-# Save directly as 'final'  (same layout as evolutionary_soups.py)
+# Save directly as 'final'  (same layout as es_train.py)
 is_main = (not torch.distributed.is_initialized()) or (torch.distributed.get_rank() == 0)
 if is_main:
     final_dir = os.path.join(output_dir, 'final')
@@ -173,7 +173,7 @@ if is_main:
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
             json.dump({'fitness': dummy_fitness[i].tolist()}, f, indent=2)
 
-    with open(os.path.join(output_dir, 'nsgaii_meta.json'), 'w') as f:
+    with open(os.path.join(output_dir, 'es_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,
             'z_star':          [0.0] * n_objectives,

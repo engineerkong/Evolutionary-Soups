@@ -64,7 +64,7 @@ class LogitsFusionModel(torch.nn.Module):
     @torch.no_grad()
     def generate(self, input_ids, attention_mask=None,
                  max_new_tokens=128, min_length=-1,
-                 do_sample=True, temperature=0.7, top_p=0.9, **kwargs):
+                 do_sample=False, temperature=0.7, top_p=0.9, **kwargs):
         batch_size = input_ids.shape[0]
         cfg = self.model.config
 
@@ -181,7 +181,7 @@ class ScriptArguments:
     base_model_name:   str       = field(default='meta-llama/Llama-2-7b-hf')
     expert_model_paths: List[str] = field(default_factory=list,
                                           metadata={'help': 'PPO adapter paths (space-separated on CLI)'})
-    num_pref_samples:  int       = field(default=10)
+    num_pref_samples:  int       = field(default=11)
     reward_names:      str       = field(default='',
                                          metadata={'help': 'comma-separated; auto-selected from dataset_name if empty'})
     dataset_name:      str       = field(default='Anthropic/hh-rlhf')
@@ -189,7 +189,7 @@ class ScriptArguments:
     wandb_name:        str       = field(default='eval_mod')
     split:             str       = field(default='test')
     size:              int       = field(default=0, metadata={'help': 'prompts to use (0 = all)'})
-    num_continuations: int       = field(default=3, metadata={'help': 'generations per prompt; rewards are averaged'})
+    num_continuations: int       = field(default=1, metadata={'help': 'generations per prompt; rewards are averaged'})
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -289,17 +289,14 @@ generation_kwargs = {
     'max_new_tokens': 128 if script_args.dataset_name in {
         'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K',
         'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48,
-    'min_length':  -1,
-    'do_sample':   True,
-    'temperature': 0.7,
-    'top_p':       0.9,
+    'do_sample':   False,
 }
 
 # ── Evaluation function ───────────────────────────────────────────────────────
 def evaluate_preference(preference):
     model = LogitsFusionModel(peft_model=peft_model, weights=preference)
     data_collator     = DataCollatorWithPadding(tokenizer=tokenizer)
-    valid_data_loader = DataLoader(valid_dataset, batch_size=8,
+    valid_data_loader = DataLoader(valid_dataset, batch_size=16,
                                    drop_last=False, collate_fn=data_collator)
     acc = Accelerator()
     model, valid_data_loader = acc.prepare(model, valid_data_loader)
@@ -314,7 +311,7 @@ def evaluate_preference(preference):
     # keep one set of responses (last continuation) for CSV logging
     full_responses_last = []
 
-    pbar = tqdm(total=len(valid_dataset) // 8 // acc.num_processes)
+    pbar = tqdm(total=len(valid_dataset) // 16 // acc.num_processes)
     with torch.no_grad():
         for batch in valid_data_loader:
             batch_prompts = tokenizer.batch_decode(batch['input_ids'])
@@ -362,6 +359,11 @@ for i, pref in enumerate(sampled_preferences):
     print(f'  Pref {i+1}: [{pref_str}]')
 
 for k, preference in enumerate(sampled_preferences):
+    pref_str = '_'.join(str(p) for p in preference)
+    out_csv  = os.path.join(output_dir, f'eval_data_pref{pref_str}.csv')
+    if os.path.exists(out_csv):  # all processes skip uniformly (shared FS) to avoid gather deadlock
+        print(f'\n[{k+1}/{len(sampled_preferences)}] skip, exists: {out_csv}')
+        continue
     print(f'\n[{k+1}/{len(sampled_preferences)}] preference={preference}')
     all_rewards, all_prompts, all_responses = evaluate_preference(preference)
     gc.collect(); torch.cuda.empty_cache()
@@ -373,6 +375,4 @@ for k, preference in enumerate(sampled_preferences):
             print(f'  total average score {i+1}: {np.mean(all_rewards[i]):.4f}')
 
         dataframe = pd.DataFrame(evaluation_result)
-        pref_str  = '_'.join(str(p) for p in preference)
-        dataframe.to_csv(os.path.join(output_dir, f'eval_data_pref{pref_str}.csv'),
-                         escapechar='\\')
+        dataframe.to_csv(out_csv, escapechar='\\')

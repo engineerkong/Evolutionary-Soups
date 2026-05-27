@@ -1,4 +1,4 @@
-"""nsgaii_utils.py — Utilities for standard NSGA-II with plain GatingNetwork."""
+"""es_utils.py — Utilities for ES with plain GatingNetwork."""
 
 import json
 import os
@@ -9,7 +9,7 @@ from typing import List
 import numpy as np
 import torch
 
-from nsgaii_architecture import GatingNetwork, SimpleGatingNetwork
+from scripts.es.es_architecture import GatingNetwork, SimpleGatingNetwork
 
 # ---------------------------------------------------------------------------
 # Reward model paths

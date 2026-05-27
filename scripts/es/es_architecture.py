@@ -1,6 +1,6 @@
-"""nsgaii_architecture.py — GatingNetwork + MoEForCausalLM for NSGA-II.
+"""es_architecture.py — GatingNetwork + MoEForCausalLM for ES.
 
-Standard NSGA-II design: each population individual is a plain GatingNetwork
+Standard ES design: each population individual is a plain GatingNetwork
 (no preference conditioning).  At inference, select the individual whose
 reward vector best matches the desired preference:
     best_i = argmax_i  dot(λ, fitness_i)

@@ -18,6 +18,8 @@ Changes vs original (RiC/ric/evaluation.py):
 """
 
 import os
+import sys
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 from accelerate import Accelerator
@@ -29,12 +31,18 @@ from peft import PeftModel
 from trl import set_seed
 import numpy as np
 import pandas as pd
+
 from utils import get_clean_data, Instructions_n, build_dataset_with_preference_n, \
                   load_main_tokenizer, Instructions_summary_n
 from multi_reward_models import RewardModels
 tqdm.pandas()
 from utils import save_configs, map_rewards_from_preference, build_summary_dataset_with_preference_n, \
                   clean_gpu_memory, build_beaver_dataset_with_preference_n
+
+script_dir = Path(__file__).resolve().parent.parent
+project_root = script_dir.parent.parent       # project/
+sys.path.insert(0, str(project_root))
+from scripts.utils.utils import sample_preferences_uniform
 
 hhrlhf_dataset_path  = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'
@@ -123,39 +131,22 @@ else:
 generation_kwargs = {
     "max_new_tokens": 128 if exp_type in ('assistant', 'beaver') else 48,
     "min_length": -1,
-    "top_k": 0.0,
-    "top_p": 0.9,
-    "do_sample": True,
+    "do_sample": False,
 }
 
 print('evaluation........')
 tokenizer.padding_side = "left"
 
-# preference grid
-if reward_models.num_rewards == 2:
-    N = script_args.num_prefer_points
-    preferences = np.zeros((N+1, 2))
-    preferences[:, 0] = np.arange(0, 1 + 1/N, 1/N)
-    preferences[:, 1] = 1 - preferences[:, 0]
-    preferences = np.round(preferences, 1)
-elif reward_models.num_rewards == 3:
-    preferences = np.array([
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0],
-        [0.1, 0.1, 0.8],
-        [0.1, 0.8, 0.1],
-        [0.2, 0.2, 0.6],
-        [0.2, 0.4, 0.4],
-        [0.2, 0.6, 0.2],
-        [0.33, 0.33, 0.33],
-        [0.4, 0.4, 0.2],
-        [0.4, 0.2, 0.4],
-        [0.6, 0.2, 0.2],
-        [0.8, 0.1, 0.1],
-        [1.0, 0.0, 0.0],
-    ])
-else:
-    raise NotImplementedError
+# prepare model once — not inside evaluate_model per preference round
+model = accelerator.prepare(model)
+
+# preference grid — use same logic as eval_ppo_rs.py
+preferences = sample_preferences_uniform(reward_models.num_rewards, num_samples=script_args.num_prefer_points)
+
+if process_id == 0:
+    print(f"\nAll {len(preferences)} preference samples:")
+    for i, pref in enumerate(preferences):
+        print(f"  [{i}] {pref}")
 
 # Gaussian reference for target score mapping
 rewards_reference_list = [np.random.randn(50000) for _ in range(len(preferences[0]))]
@@ -182,16 +173,16 @@ def evaluate_model(model, reward_models, tokenizer, target_rewards, instructions
         if key in valid_dataset.column_names:
             valid_dataset = valid_dataset.remove_columns(key)
     data_collator    = DataCollatorWithPadding(tokenizer=tokenizer)
-    valid_data_loader = DataLoader(valid_dataset, batch_size=1, drop_last=True, collate_fn=data_collator)
-    accelerator      = Accelerator()
-    model, valid_data_loader = accelerator.prepare(model, valid_data_loader)
+    valid_data_loader = DataLoader(valid_dataset, batch_size=32, drop_last=True, collate_fn=data_collator)
+    valid_data_loader = accelerator.prepare(valid_data_loader)
 
     full_response_tensors = []
     full_prompts          = []
-    pbar = tqdm(total=len(valid_dataset) // accelerator.num_processes)
+    pbar = tqdm(total=len(valid_dataset) // accelerator.num_processes // 32)
     with torch.no_grad():
         for i, batch in enumerate(valid_data_loader):
-            response_tensors = accelerator.unwrap_model(model).generate(batch['input_ids'], **generation_kwargs)
+            response_tensors = accelerator.unwrap_model(model).generate(
+                batch['input_ids'], attention_mask=batch['attention_mask'], **generation_kwargs)
             full_response_tensors.extend(response_tensors)
             full_prompts.extend(batch['input_ids'])
             pbar.update(1)
@@ -226,7 +217,6 @@ def evaluate_model(model, reward_models, tokenizer, target_rewards, instructions
 for k in range(len(preferences)):
     preference    = preferences[k]
     target_rewards = map_rewards_from_preference(rewards_reference_list, preference, method='l2').reshape(-1)
-    print(k, target_rewards)
     all_rewards, all_desired_rewards, all_full_prompts, all_full_responses = evaluate_model(
         model, reward_models, tokenizer, target_rewards, instructions, gpu_id,
     )
@@ -235,11 +225,18 @@ for k in range(len(preferences)):
             'prompt':   all_full_prompts,
             'response': all_full_responses,
         }
+        obtained_means = []
+        desired_means  = []
         for i in range(num_rewards):
             evaluation_result['obtained_score{}'.format(i+1)] = all_rewards[i]
             evaluation_result['desired_score{}'.format(i+1)]  = all_desired_rewards[i]
-            print('total average obtained score {}: {}'.format(i+1, np.mean(evaluation_result['obtained_score{}'.format(i+1)])))
-            print('total average desired score {}: {}'.format(i+1, np.mean(evaluation_result['desired_score{}'.format(i+1)])))
+            obtained_means.append(np.mean(all_rewards[i]))
+            desired_means.append(np.mean(all_desired_rewards[i]))
+        obtained_str = '  '.join(f'r{i+1}={obtained_means[i]:.4f}' for i in range(num_rewards))
+        desired_str  = '  '.join(f'r{i+1}={desired_means[i]:.4f}'  for i in range(num_rewards))
+        print(f'[pref {k}] preference={preference}')
+        print(f'         obtained: {obtained_str}')
+        print(f'         desired:  {desired_str}')
 
         dataframe = pd.DataFrame(evaluation_result)
         if len(preference) == 3:

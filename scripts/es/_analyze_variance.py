@@ -45,8 +45,8 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
 from scripts.utils.utils import load_main_tokenizer
-from nsgaii_architecture import GatingNetwork, SimpleGatingNetwork, _apply_entmax
-from nsgaii_utils import load_gating_network, load_simple_gating_network
+from scripts.es.es_architecture import GatingNetwork, SimpleGatingNetwork, _apply_entmax
+from scripts.es.es_utils import load_gating_network, load_simple_gating_network
 
 
 # ---------------------------------------------------------------------------

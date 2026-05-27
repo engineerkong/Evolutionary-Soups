@@ -1,8 +1,8 @@
-"""nsgaii_test.py — Evaluate reward scores for NSGA-II trained GatingNetwork checkpoints.
+"""es_test.py — Evaluate reward scores for ES trained GatingNetwork checkpoints.
 
 Two modes:
   1. Fixed-coefficient MoE baselines (sanity check).
-  2. NSGA-II trained GatingNetwork checkpoints (--gating_paths).
+  2. ES trained GatingNetwork checkpoints (--gating_paths).
      Each individual checkpoint is evaluated ONCE to obtain its reward vector.
      At inference, select the best individual for a given preference λ by:
          best_i = argmax_i  dot(λ, reward_i)
@@ -13,15 +13,15 @@ gating_paths accepts:
     (e.g. gen_0030/ which contains gen_0030/ind_000/, gen_0030/ind_001/, …)
 
 TO RUN:
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/momoe/nsgaii_test.py \
+CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch ./scripts/es/es_test.py \
     --expert_model_paths ./models/ppo/assistant_ppo_harmless_2701/batch_832/ \
                          ./models/ppo/assistant_ppo_helpful_2701/batch_832/ \
-    --gating_paths ./models/nsgaii/nsgaii_gating_0101/gen_0020/ \
-    --run_name 'nsgaii_test_0101' 2>&1 | tee ./logs/nsgaii_test_0101.log
+    --gating_paths ./models/es/es_gating_0101/gen_0020/ \
+    --run_name 'es_test_0101' 2>&1 | tee ./logs/es_test_0101.log
 """
 
+import csv
 import datetime
-import gc
 import json
 import os
 import sys
@@ -32,7 +32,7 @@ from typing import List
 import numpy as np
 import torch
 from accelerate import Accelerator
-from peft import LoraConfig, PeftModel, get_peft_model, set_peft_model_state_dict
+from peft import PeftModel
 from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from torch.utils.data import DataLoader
 
@@ -44,14 +44,12 @@ sys.path.insert(0, str(script_dir))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
-    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
-    build_dataset_eval, build_dataset_summary_eval,
-    build_dataset_beaver_eval, build_dataset_steer_eval, build_dataset_ultrafeedback_eval,
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
+    build_dataset_eval, build_dataset_summary_eval, build_dataset_beaver_eval,
     get_clean_data, load_main_tokenizer,
 )
-from nsgaii_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
-from nsgaii_utils import REWARD_PATHS, load_gating_network, load_simple_gating_network, get_simplex_samples
+from scripts.es.es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from scripts.es.es_utils import REWARD_PATHS, load_gating_network, load_simple_gating_network, get_simplex_samples
 
 
 # ---------------------------------------------------------------------------
@@ -73,25 +71,9 @@ class Args:
     pref_step:          float     = 0.1   # simplex step for λ-selection table
     norm_rewards:       str       = ''   # path to reward_norm.json; if set, normalize rewards for utility comparison
     gpu_id:             int       = -1
-    save_directory:     str       = './results/nsgaii/'
-    run_name:           str       = 'nsgaii_test'
+    save_directory:     str       = './results/es/'
+    run_name:           str       = 'es_test'
     seed:               int       = 8888
-
-
-# ---------------------------------------------------------------------------
-# Fixed-coefficient gating (baseline)
-# ---------------------------------------------------------------------------
-
-class FixedGating(torch.nn.Module):
-    def __init__(self, coeffs: List[float]):
-        super().__init__()
-        self.register_buffer('_c', torch.tensor(coeffs, dtype=torch.float32))
-        self.fixed_alpha = 1.0
-
-    def alpha_floats(self): return [1.0] * 999   # length > num_layers, safe for any model
-
-    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
-        return self._c.unsqueeze(0).expand(hidden_states.shape[0], -1)
 
 
 # ---------------------------------------------------------------------------
@@ -125,11 +107,18 @@ def _resolve_gating_paths(paths: List[str]) -> List[str]:
 
 def generate_and_score(model, input_ids, attention_mask, tokenizer,
                        reward_models, instructions, generation_kwargs,
-                       gpu_id, num_continuations):
+                       gpu_id, num_continuations, sample_writer=None):
+    """Generate + reward-score one batch.
+
+    sample_writer : optional callable invoked once per (continuation, prompt)
+        with (continuation_idx, prompt_idx, prompt_text, response_text,
+              [reward_0, reward_1, ...]).  Used to dump per-sample rows to a
+        CSV without changing the aggregation behaviour.
+    """
     device      = f'cuda:{gpu_id}'
     accumulated = None
 
-    for _ in range(num_continuations):
+    for cont_idx in range(num_continuations):
         outputs         = model.generate(input_ids.to(device),
                                          attention_mask=attention_mask.to(device),
                                          **generation_kwargs)
@@ -152,6 +141,9 @@ def generate_and_score(model, input_ids, attention_mask, tokenizer,
         for p in range(n_prompts):
             for k in range(n_rewards):
                 accumulated[p][k].append(scores[k][p])
+            if sample_writer is not None:
+                sample_writer(cont_idx, p, prompts_clean[p], responses_clean[p],
+                              [float(scores[k][p]) for k in range(n_rewards)])
         torch.cuda.empty_cache()
 
     per_prompt = np.array([[np.mean(accumulated[p][k]) for k in range(n_rewards)]
@@ -161,7 +153,8 @@ def generate_and_score(model, input_ids, attention_mask, tokenizer,
 
 def eval_configs(configs, loader, tokenizer, reward_models, instructions,
                  generation_kwargs, gpu_id, num_continuations,
-                 results_dir='', rank=0, reward_names=None):
+                 results_dir='', rank=0, reward_names=None,
+                 samples_csv_path=None):
     partial_path = os.path.join(results_dir, f'rank{rank}.jsonl') if results_dir else None
 
     done = {}
@@ -183,6 +176,20 @@ def eval_configs(configs, loader, tokenizer, reward_models, instructions,
         os.makedirs(results_dir, exist_ok=True)
         partial_file = open(partial_path, 'a')
 
+    # ---- per-sample CSV (input / output / rewards) ----
+    samples_file = samples_writer_csv = None
+    if samples_csv_path is not None:
+        os.makedirs(os.path.dirname(samples_csv_path) or '.', exist_ok=True)
+        new_file = not os.path.exists(samples_csv_path)
+        samples_file = open(samples_csv_path, 'a', newline='', encoding='utf-8')
+        samples_writer_csv = csv.writer(samples_file)
+        if new_file:
+            reward_cols = [f'reward_{n}' for n in (reward_names or [])]
+            samples_writer_csv.writerow(
+                ['config_idx', 'label', 'batch_idx', 'continuation',
+                 'prompt_idx_in_batch', 'prompt', 'response'] + reward_cols)
+            samples_file.flush()
+
     results = []
     for config_idx, label, model in configs:
         if config_idx in done:
@@ -192,11 +199,26 @@ def eval_configs(configs, loader, tokenizer, reward_models, instructions,
 
         model.eval()
         batch_rewards = []
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
+            # Per-config sink: closes over (config_idx, label, batch_idx) so
+            # generate_and_score only sees a (cont, prompt, ...) signature.
+            if samples_writer_csv is not None:
+                def _writer(cont_idx, prompt_idx, prompt, response, rewards,
+                            _ci=config_idx, _lbl=label, _bi=batch_idx):
+                    samples_writer_csv.writerow(
+                        [_ci, _lbl, _bi, cont_idx, prompt_idx, prompt, response]
+                        + rewards)
+            else:
+                _writer = None
+
             r = generate_and_score(model, batch['input_ids'], batch['attention_mask'],
                                    tokenizer, reward_models, instructions,
-                                   generation_kwargs, gpu_id, num_continuations)
+                                   generation_kwargs, gpu_id, num_continuations,
+                                   sample_writer=_writer)
             batch_rewards.append(r)
+
+            if samples_file is not None:
+                samples_file.flush()    # checkpoint after each batch
         mean_r = np.mean(batch_rewards, axis=0).tolist()
         print(f'  rank{rank} done: {label}  {mean_r}', flush=True)
         results.append((config_idx, label, mean_r))
@@ -210,6 +232,8 @@ def eval_configs(configs, loader, tokenizer, reward_models, instructions,
 
     if partial_path:
         partial_file.close()
+    if samples_file is not None:
+        samples_file.close()
     return results
 
 
@@ -242,7 +266,7 @@ tokenizer.padding_side = 'left'
 _rm_paths = [REWARD_PATHS[n] for n in reward_names]
 reward_models = RewardModels(_rm_paths, _rm_paths, gpu_id)
 
-_max_new_tokens = 128 if args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48
+_max_new_tokens = 128 if args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48
 generation_kwargs = dict(max_new_tokens=_max_new_tokens, do_sample=args.do_sample)
 if args.do_sample:
     generation_kwargs.update(top_k=0, top_p=0.9, temperature=0.7)
@@ -258,26 +282,10 @@ if args.use_train_split:
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
-    elif args.dataset_name == 'argilla/news-summary':
-        # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — swap
-        ds = build_dataset_news_summary_ppo(
-            args.dataset_name, tokenizer,
-            reward_models.rm_tokenizers[0], split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions_summary()
     elif args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
         ds = build_dataset_beaver_ppo(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions()
-    elif args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-        ds = build_dataset_steer_ppo(
-            args.dataset_name, tokenizer,
-            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions()
-    elif args.dataset_name == 'openbmb/UltraFeedback':
-        ds = build_dataset_ultrafeedback_ppo(
-            args.dataset_name, tokenizer,
-            rm_tokenizer=reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
@@ -292,26 +300,10 @@ else:
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions_summary()
-    elif args.dataset_name == 'argilla/news-summary':
-        # argilla/news-summary has no structured eval split — use test split via ppo builder
-        ds = build_dataset_news_summary_ppo(
-            args.dataset_name, tokenizer,
-            reward_models.rm_tokenizers[0], split='train', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions_summary()
     elif args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
         ds = build_dataset_beaver_eval(
             args.dataset_name, tokenizer,
             reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions()
-    elif args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-        ds = build_dataset_steer_eval(
-            args.dataset_name, tokenizer,
-            reward_models.rm_tokenizers, split='test', size=args.eval_prompts if args.eval_prompts > 0 else None)
-        instructions = Instructions()
-    elif args.dataset_name == 'openbmb/UltraFeedback':
-        ds = build_dataset_ultrafeedback_eval(
-            args.dataset_name, tokenizer,
-            reward_models.rm_tokenizers, size=args.eval_prompts if args.eval_prompts > 0 else None)
         instructions = Instructions()
     else:
         raise ValueError(f'Unsupported dataset_name: {args.dataset_name!r}')
@@ -335,8 +327,8 @@ experts = []
 for i, path in enumerate(args.expert_model_paths):
     base = AutoModelForCausalLM.from_pretrained(
         args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
+    base.resize_token_embeddings(len(tokenizer))
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
-    m.resize_token_embeddings(len(tokenizer))
     m.eval()
     for p in m.parameters():
         p.requires_grad = False
@@ -348,23 +340,11 @@ n              = len(experts)
 lm_hidden_size = experts[0].config.hidden_size
 
 # ---------------------------------------------------------------------------
-# Build config list
+# Build config list — every ES GatingNetwork checkpoint evaluated ONCE.
+# At inference: select the best individual via argmax dot(λ, reward_i).
 # ---------------------------------------------------------------------------
 
-# all_configs = [(f'expert[{i}] standalone', experts[i]) for i in range(n)]
 all_configs = []
-
-# # 1. Fixed-preference MoE: use λ directly as per-layer expert mixing weights.
-# pref_simplex = get_simplex_samples(len(reward_names), step=args.pref_step)
-# for lam in pref_simplex:
-#     all_configs.append((f'MoE fixed λ={list(lam)}',
-#                         MoEForCausalLM(experts, FixedGating(list(lam))).to(device)))
-# if is_main:
-#     print(f'  Added {len(pref_simplex)} fixed-pref MoE configs', flush=True)
-
-# 2. NSGA-II GatingNetwork checkpoints — each evaluated ONCE.
-#    At inference: select best individual via argmax dot(λ, reward_i).
-nsgaii_start_idx = len(all_configs)   # index of first NSGA-II config
 
 if args.gating_paths:
     resolved = _resolve_gating_paths(args.gating_paths)
@@ -390,7 +370,7 @@ if args.gating_paths:
                 print(f'  [SKIP] {ckpt_path}', flush=True)
             continue
         ckpt_name = os.path.basename(ckpt_path)
-        label     = f'MoE NSGAII [{ckpt_name}]'
+        label     = f'MoE ES [{ckpt_name}]'
         if is_main:
             alphas    = gating.alpha_floats()
             alpha_str = (f'fixed={gating.fixed_alpha}' if gating.fixed_alpha is not None
@@ -418,10 +398,12 @@ if is_main:
     print(f'  {world_size} rank(s), ~{len(all_configs)//world_size + 1} configs per rank\n',
           flush=True)
 
+samples_csv_path = os.path.join(output_dir, f'samples_rank{rank}.csv')
 my_results = eval_configs(my_configs, loader, tokenizer, reward_models, instructions,
                           generation_kwargs, gpu_id, args.num_continuations,
                           results_dir=output_dir, rank=rank,
-                          reward_names=reward_names)
+                          reward_names=reward_names,
+                          samples_csv_path=samples_csv_path)
 
 # ---------------------------------------------------------------------------
 # Gather and print results
@@ -468,15 +450,15 @@ if is_main:
     for _, label, mean_r in flat:
         print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))
 
-    # ── λ-selection table: for each preference, which NSGA-II individual wins? ──
+    # ── λ-selection table: for each preference, which ES individual wins? ──
     # Selection uses normalised rewards when norm_rewards is set so that
     # λ weights are applied on a consistent [0,1] scale (matching oracle).
-    nsgaii_results = [(label, mean_r) for _, label, mean_r in flat
-                      if label.startswith('MoE NSGAII')]
-    if nsgaii_results:
-        rewards_arr      = np.array([r for _, r in nsgaii_results])       # (K, M) raw
-        rewards_arr_norm = np.array([maybe_norm(r) for _, r in nsgaii_results])  # (K, M) normed
-        labels_arr       = [l for l, _ in nsgaii_results]
+    es_results = [(label, mean_r) for _, label, mean_r in flat
+                  if label.startswith('MoE ES')]
+    if es_results:
+        rewards_arr      = np.array([r for _, r in es_results])       # (K, M) raw
+        rewards_arr_norm = np.array([maybe_norm(r) for _, r in es_results])  # (K, M) normed
+        labels_arr       = [l for l, _ in es_results]
 
         norm_tag = ' [normalised]' if r_min is not None else ''
         print(f'\n{"λ":<30}  {"best individual":<40}  {"utility"+norm_tag:>14}  ' +
@@ -490,119 +472,5 @@ if is_main:
             print(f'{str(lam):<30}  {labels_arr[best_i]:<40}  {utility:>14.4f}  ' +
                   '  '.join(f'{v:>10.4f}' for v in rewards_arr[best_i]))
 
-# ---------------------------------------------------------------------------
-# Rewarded soups evaluation (true weight blending of LoRA adapters)
-# ---------------------------------------------------------------------------
-
-def _load_adapter_sd(adapter_dir: str) -> dict:
-    p = Path(adapter_dir)
-    st_path = p / 'adapter_model.safetensors'
-    bin_path = p / 'adapter_model.bin'
-    if st_path.exists():
-        from safetensors import safe_open
-        sd = {}
-        with safe_open(str(st_path), framework='pt', device='cpu') as f:
-            for k in f.keys():
-                sd[k] = f.get_tensor(k)
-        return sd
-    elif bin_path.exists():
-        return torch.load(str(bin_path), map_location='cpu')
-    raise FileNotFoundError(f'No adapter weights found in {adapter_dir}')
-
-
-def _build_rewarded_soup(base_model_name, expert_sds, peft_config, coeffs, device):
-    base = AutoModelForCausalLM.from_pretrained(
-        base_model_name, torch_dtype=torch.bfloat16, device_map=device)
-    blended_sd = {
-        k: sum(coeffs[i] * expert_sds[i][k].to(torch.bfloat16) for i in range(len(coeffs)))
-        for k in expert_sds[0]
-    }
-    model = get_peft_model(base, peft_config)
-    set_peft_model_state_dict(model, blended_sd)
-    model = model.merge_and_unload()
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    return model
-
-
-# if args.expert_model_paths:
-#     if is_main:
-#         print('\n' + '=' * 80, flush=True)
-#         print('Rewarded Soups evaluation', flush=True)
-#         print('=' * 80, flush=True)
-
-#     expert_sds   = [_load_adapter_sd(p) for p in args.expert_model_paths]
-#     peft_cfg_rs  = LoraConfig.from_pretrained(args.expert_model_paths[0])
-#     rs_simplex   = get_simplex_samples(len(reward_names), step=args.pref_step)
-#     rs_partial   = os.path.join(output_dir, f'rs_rank{rank}.jsonl')
-
-#     rs_done = {}
-#     if os.path.exists(rs_partial):
-#         with open(rs_partial) as f:
-#             for line in f:
-#                 line = line.strip()
-#                 if not line:
-#                     continue
-#                 try:
-#                     rec = json.loads(line)
-#                     rs_done[rec['config_idx']] = rec['rewards']
-#                 except json.JSONDecodeError:
-#                     pass
-#         if rs_done:
-#             print(f'  rs rank{rank}: resuming — {len(rs_done)} pref(s) already done', flush=True)
-
-#     rs_results = []
-#     with open(rs_partial, 'a') as rs_file:
-#         for idx, coeffs in enumerate(rs_simplex):
-#             if idx % world_size != rank:
-#                 continue
-#             label = f'RewardedSoups {list(coeffs)}'
-#             if idx in rs_done:
-#                 print(f'  rs rank{rank} skip (cached): {label}', flush=True)
-#                 rs_results.append((idx, label, rs_done[idx]))
-#                 continue
-
-#             model = _build_rewarded_soup(
-#                 args.base_model_name,
-#                 expert_sds, peft_cfg_rs, coeffs, device)
-#             model.resize_token_embeddings(len(tokenizer))
-
-#             batch_rewards = []
-#             for batch in loader:
-#                 r = generate_and_score(
-#                     model, batch['input_ids'], batch['attention_mask'],
-#                     tokenizer, reward_models, instructions,
-#                     generation_kwargs, gpu_id, args.num_continuations)
-#                 batch_rewards.append(r)
-#             mean_r = np.mean(batch_rewards, axis=0).tolist()
-#             rs_results.append((idx, label, mean_r))
-#             print(f'  rs rank{rank}: {label}  {mean_r}', flush=True)
-
-#             rs_file.write(json.dumps({'config_idx': idx, 'label': label, 'rewards': mean_r,
-#                                       'reward_names': reward_names, 'rank': rank}) + '\n')
-#             rs_file.flush()
-
-#             del model
-#             gc.collect()
-#             torch.cuda.empty_cache()
-
-#     if world_size > 1:
-#         all_rs = [None] * world_size
-#         torch.distributed.all_gather_object(all_rs, rs_results)
-#     else:
-#         all_rs = [rs_results]
-
-#     if is_main:
-#         flat_rs = sorted([item for sub in all_rs for item in sub], key=lambda x: x[0])
-#         rs_path = os.path.join(output_dir, 'results_rs.json')
-#         with open(rs_path, 'w') as f:
-#             json.dump([{'config_idx': idx, 'label': label, 'rewards': mean_r,
-#                         'reward_names': reward_names}
-#                        for idx, label, mean_r in flat_rs], f, indent=2)
-#         print(f'\nRewarded Soups results saved → {rs_path}', flush=True)
-#         col = 52
-#         print(f'\n{"Config":<{col}}  ' + '  '.join(f'{rn:>10}' for rn in reward_names))
-#         print('-' * (col + 14 * len(reward_names)))
-#         for _, label, mean_r in flat_rs:
-#             print(f'{label:<{col}}  ' + '  '.join(f'{v:>10.4f}' for v in mean_r))
+if torch.distributed.is_initialized():
+    torch.distributed.destroy_process_group()

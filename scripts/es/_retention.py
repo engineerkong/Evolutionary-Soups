@@ -48,14 +48,12 @@ sys.path.insert(0, str(script_dir))
 
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_sft, build_dataset_summary_sft, build_dataset_news_summary_sft,
-    build_dataset_beaver_sft, build_dataset_steer_sft, build_dataset_ultrafeedback_sft,
-    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
-    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
+    build_dataset_sft, build_dataset_summary_sft, build_dataset_beaver_sft,
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
     get_clean_data, load_main_tokenizer,
 )
 from scripts.utils.multi_reward_models import RewardModels
-from nsgaii_utils import REWARD_PATHS
+from scripts.es.es_utils import REWARD_PATHS
 
 tqdm.pandas()
 
@@ -77,7 +75,7 @@ class ScriptArguments:
                                           metadata={"help": "coefficient for gating entropy regularization (prevents collapse)"})
     gating_hidden_size: int       = field(default=256,
                                           metadata={"help": "hidden size of the gating MLP"})
-    # ---- Stage 2: NSGA-II evolution ----
+    # ---- Stage 2: ES evolution ----
     reward_names:           str   = field(default='beaver_reward,beaver_cost')
     do_sample:              bool  = field(default=False)
     num_continuations:      int   = field(default=1)
@@ -86,7 +84,7 @@ class ScriptArguments:
     max_new_tokens:         int   = field(default=-1)
     normalize_rewards:      bool  = field(default=False)
     warm_start_path:        str   = field(default='')
-    algorithm:              str   = field(default='nsga4')
+    algorithm:              str   = field(default='greedy_hvc')
     population_size:        int   = field(default=20)
     num_generations:        int   = field(default=100)
     convergence_window:     int   = field(default=10)
@@ -405,7 +403,7 @@ def generate_and_score(
 
 
 # =========================================================================
-# Stage 2 — NSGA-II / NSGA-HVC selection
+# Stage 2 — ES selection (NSGA-II / greedy_hvc)
 # =========================================================================
 
 def _dominates(a: np.ndarray, b: np.ndarray) -> bool:
@@ -483,7 +481,7 @@ try:
             hvc[i] = total_hv - _hv(np.delete(candidates, i, axis=0), ref)
         return hvc
 
-    def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
+    def _greedy_hvc_select(rewards: np.ndarray, pop_size: int) -> List[int]:
         fronts   = _non_dominated_sort(rewards)
         selected: List[int] = []
         for front in fronts:
@@ -506,13 +504,13 @@ except ImportError:
 
 
 # =========================================================================
-# Stage 2 — NSGAII evolutionary algorithm
+# Stage 2 — ES evolutionary algorithm
 # =========================================================================
 
-class NSGAII:
+class ES:
     """Evolutionary algorithm for SimpleGatingNetwork evolution.
 
-    Identical in structure to evolutionary_soups.py's NSGAII class,
+    Identical in structure to es_train.py's ES class,
     adapted for SimpleGatingNetwork (no per-layer alpha, no num_layers).
     """
 
@@ -564,7 +562,7 @@ class NSGAII:
                 json.dump({'fitness': self.fitness[i].tolist()}, f, indent=2)
         meta = {'generation': gen, 'z_star': self.z_star.tolist(),
                 'fitness':    [f.tolist() for f in self.fitness]}
-        with open(os.path.join(ckpt_dir, 'nsgaii_state.json'), 'w') as f:
+        with open(os.path.join(ckpt_dir, 'es_state.json'), 'w') as f:
             json.dump(meta, f, indent=2)
         print(f'  Checkpoint saved → {ckpt_dir}', flush=True)
 
@@ -580,7 +578,7 @@ class NSGAII:
         verbose: bool = False, seed: int = 42,
         sigma_min: float = 0.005, convergence_window: int = 10,
         parent_stability_bonus: float = 0.01, parent_stability_cap: float = 0.10,
-        use_dual_front: bool = True, algorithm: str = 'nsga4',
+        use_dual_front: bool = True, algorithm: str = 'greedy_hvc',
         normalize_rewards: bool = False, normalize_fitness: bool = False,
     ) -> List[np.ndarray]:
 
@@ -588,12 +586,12 @@ class NSGAII:
         rank     = torch.distributed.get_rank() if dist_on else 0
         is_main  = rank == 0
 
-        assert algorithm in ('nsgaii', 'nsga4'), \
-            f"algorithm must be 'nsgaii' or 'nsga4', got {algorithm!r}"
-        if algorithm == 'nsga4' and not _PYMOO_AVAILABLE:
+        assert algorithm in ('nsgaii', 'greedy_hvc'), \
+            f"algorithm must be 'nsgaii' or 'greedy_hvc', got {algorithm!r}"
+        if algorithm == 'greedy_hvc' and not _PYMOO_AVAILABLE:
             print('pymoo not available — falling back to nsgaii', flush=True)
             algorithm = 'nsgaii'
-        _select = _nsga4_select if algorithm == 'nsga4' else _nsga2_select
+        _select = _greedy_hvc_select if algorithm == 'greedy_hvc' else _nsga2_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -721,7 +719,7 @@ class NSGAII:
         # ── Phase 0: initial population ──────────────────────────────────────
         gen = 0
         if is_main:
-            print(f'Stage 2 NSGA-II — {self.P} individuals …')
+            print(f'Stage 2 ES — {self.P} individuals …')
             os.makedirs(_gen_dir(gen), exist_ok=True)
             for i in range(self.P):
                 _write_task(gen, i, {'task_id': i, 'chunk_idx': 0,
@@ -1090,7 +1088,7 @@ if process_id == 0:
     print(f"Stage 1 saved to {sft_save_path}")
 
 # =========================================================================
-# Stage 2 — NSGA-II evolution from SFT-pretrained gating network
+# Stage 2 — ES evolution from SFT-pretrained gating network
 # =========================================================================
 
 reward_names       = [x.strip() for x in script_args.reward_names.split(',')]
@@ -1115,23 +1113,10 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
         script_args.dataset_name, tokenizer,
         rm_tokenizer=reward_models_obj.rm_tokenizers[0], split='train')
     instructions = Instructions()
-elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-    eval_dataset = build_dataset_steer_ppo(
-        script_args.dataset_name, tokenizer,
-        rm_tokenizer=reward_models_obj.rm_tokenizers[0], split='train')
-    instructions = Instructions()
-elif script_args.dataset_name == 'argilla/news-summary':
-    eval_dataset = build_dataset_news_summary_ppo(
-        script_args.dataset_name, tokenizer,
-        reward_models_obj.rm_tokenizers[0], split='test')
-    instructions = Instructions_summary()
-elif script_args.dataset_name == 'openbmb/UltraFeedback':
-    eval_dataset = build_dataset_ultrafeedback_ppo(
-        script_args.dataset_name, tokenizer,
-        rm_tokenizer=reward_models_obj.rm_tokenizers[0], split='train')
-    instructions = Instructions()
 else:
-    raise ValueError(f'Unsupported dataset_name for Stage 2: {script_args.dataset_name!r}')
+    raise ValueError(f'Unsupported dataset_name for Stage 2: {script_args.dataset_name!r}. '
+                     f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, '
+                     f'PKU-Alignment/PKU-SafeRLHF-10K')
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in eval_dataset.column_names:
@@ -1169,7 +1154,7 @@ if script_args.warm_start_path:
 model.eval()
 model.gating_net = template_net.to(device)
 
-nsgaii = NSGAII(
+es = ES(
     template_net=template_net,
     num_objectives=n_objectives,
     population_size=script_args.population_size,
@@ -1177,8 +1162,8 @@ nsgaii = NSGAII(
 )
 
 print(f'\nStarting Stage 2 — {script_args.num_generations} generations, '
-      f'P={nsgaii.P}, algorithm={script_args.algorithm} …')
-final_population = nsgaii.run(
+      f'P={es.P}, algorithm={script_args.algorithm} …')
+final_population = es.run(
     dataset=eval_dataset, data_collator=eval_collator,
     eval_prompts=script_args.eval_prompts, eval_batch_size=script_args.eval_batch_size,
     moe_model=model, sft_tokenizer=tokenizer,
@@ -1209,18 +1194,18 @@ if is_main:
         net    = params_to_net(params, template_net, 'cpu')
         _save_simple_gating_network(net, subdir)
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
-            json.dump({'fitness': nsgaii.fitness[i].tolist()}, f, indent=2)
+            json.dump({'fitness': es.fitness[i].tolist()}, f, indent=2)
 
-    fronts = _non_dominated_sort(np.array(nsgaii.fitness))
-    with open(os.path.join(es_output_dir, 'nsgaii_meta.json'), 'w') as f:
+    fronts = _non_dominated_sort(np.array(es.fitness))
+    with open(os.path.join(es_output_dir, 'es_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,
-            'z_star':          nsgaii.z_star.tolist(),
-            'final_fitness':   [f.tolist() for f in nsgaii.fitness],
+            'z_star':          es.z_star.tolist(),
+            'final_fitness':   [f.tolist() for f in es.fitness],
             'num_generations': script_args.num_generations,
-            'population_size': nsgaii.P,
+            'population_size': es.P,
             'lm_hidden_size':  lm_hidden_size,
         }, f, indent=2)
 
-    print(f'\nDone. Non-dominated front: {len(fronts[0])}/{nsgaii.P} individuals')
-    print(f'Final ideal point z* = {np.round(nsgaii.z_star, 4)}')
+    print(f'\nDone. Non-dominated front: {len(fronts[0])}/{es.P} individuals')
+    print(f'Final ideal point z* = {np.round(es.z_star, 4)}')

@@ -49,9 +49,9 @@ for t in np.linspace(0, 1, 300):
     wiggle = (
         0.10
         + 0.04 * np.sin(2.3 * np.pi * t + 0.7)
-        - 0.03 * np.sin(4.1 * np.pi * t + 1.3)
+        - 0.025 * np.sin(3.5 * np.pi * t + 1.9)
         + 0.02 * np.sin(6.7 * np.pi * t + 0.4)
-        - 0.03 * np.sin(5.2 * np.pi * t + 1.1)
+        - 0.035 * np.sin(5.2 * np.pi * t + 1.1)
     )
     offset = envelope * wiggle
     p = p_base + offset * normal
@@ -71,7 +71,7 @@ gap_y = np.concatenate([true_curve[:, 1], conv_curve[::-1, 1]])
 # Plot
 # ============================================================
 
-fig, ax = plt.subplots(figsize=(6, 6))
+fig, ax = plt.subplots(figsize=(6, 4))
 
 # Gap fill
 ax.fill(gap_x, gap_y,
@@ -110,7 +110,7 @@ ax.annotate(
     'Non-convexity',
     xy=(gap_mid_x, gap_mid_y),
     xytext=(0.25, 0.55),
-    fontsize=8.5, color='#8B0000', style='italic',
+    fontsize=10, color='#8B0000', style='italic',
     bbox=dict(boxstyle='round,pad=0.35', facecolor='#FADADD',
               edgecolor='#A32D2D', linewidth=0.8),
     arrowprops=dict(arrowstyle='->', color='#A32D2D', lw=0.9,
@@ -121,15 +121,15 @@ ax.annotate(
 # ── Axes ─────────────────────────────────────────────────────
 ax.set_xlim(0, 1.0)
 ax.set_ylim(0, 1.0)
-ax.set_xlabel('Helpful', fontsize=11)
-ax.set_ylabel('Harmless', fontsize=11)
+ax.set_xlabel('Helpful', fontsize=12)
+ax.set_ylabel('Harmless', fontsize=12)
 ax.spines['top'].set_visible(False)
 ax.spines['right'].set_visible(False)
-ax.tick_params(labelsize=9)
+ax.tick_params(labelsize=10)
 ax.grid(False)
 
 ax.legend(
-    fontsize=9, loc='lower left',
+    fontsize=10, loc='lower left',
     frameon=True, framealpha=0.9,
     edgecolor='#D3D1C7', facecolor='white',
 )

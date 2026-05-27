@@ -1,6 +1,5 @@
-"""evolutionary_soups.py — Evolve GatingNetwork parameters using standard NSGA-based algorithm.
+"""es_train.py — Evolve GatingNetwork parameters using an ES (Evolution Strategy) algorithm.
 
-NSGA-II (Deb et al., 2002).
   - Population of P individuals (flat GatingNetwork parameter vectors).
   - No preference vector during training — purely Pareto-based selection.
   - Each individual is evaluated ONCE to produce an M-dimensional reward vector.
@@ -36,12 +35,11 @@ sys.path.insert(0, str(script_dir))
 from scripts.utils.multi_reward_models import RewardModels
 from scripts.utils.utils import (
     Instructions, Instructions_summary,
-    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_news_summary_ppo,
-    build_dataset_beaver_ppo, build_dataset_steer_ppo, build_dataset_ultrafeedback_ppo,
+    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
     get_clean_data, load_main_tokenizer,
 )
-from nsgaii_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
-from nsgaii_utils import save_gating_network, get_simplex_samples, load_gating_network, load_simple_gating_network, REWARD_PATHS
+from scripts.es.es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from scripts.es.es_utils import save_gating_network, get_simplex_samples, load_gating_network, load_simple_gating_network, REWARD_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +51,7 @@ class ScriptArguments:
     base_model_name:      str       = 'meta-llama/Llama-2-7b-hf'
     expert_model_paths:   List[str] = field(default_factory=list)
     reward_names:         str       = 'harmless,helpful'          # auto-selected from dataset_name if empty
-    dataset_name:         str       = 'Anthropic/hh-rlhf'         # 'Anthropic/hh-rlhf' | 'openai/summarize_from_feedback' | 'argilla/news-summary'
+    dataset_name:         str       = 'Anthropic/hh-rlhf'         # 'Anthropic/hh-rlhf' | 'openai/summarize_from_feedback' | 'PKU-Alignment/PKU-SafeRLHF-10K'
     do_sample:            bool      = False
     num_continuations:    int       = 1
     eval_prompts:         int       = 8192
@@ -62,7 +60,7 @@ class ScriptArguments:
     normalize_rewards:    bool      = False
     warm_start_path:      str       = ''
     # Algorithm selection
-    algorithm:            str       = 'nsga4'   # 'nsgaii' | 'nsgaiii' | 'nsga4'
+    algorithm:            str       = 'greedy_hvc'   # 'nsgaii' | 'nsgaiii' | 'greedy_hvc'
     n_reference_divisions: int      = 12         # Das-Dennis divisions for NSGA-III reference points
 
     # Evolutionary hyper-parameters
@@ -74,10 +72,6 @@ class ScriptArguments:
     sigma_decay:          float     = 0.99
     sigma_min:            float     = 0.03 # sigma floor; sigma_decay=0.97→σ_min@gen50, 0.95→@gen30
 # ---------------------------------------------------------------------------
-    parent_stability_bonus:  float  = 0.01  # per-gen bonus on parent baseline for front2
-                                             # effective = min(gen * bonus, cap)
-    parent_stability_cap:    float  = 0.10  # max bonus (10 %)
-    use_dual_front:          bool   = True  # if False, select solely by raw reward front (_select)
     use_greedy_hvc:          bool   = True  # if False, use _select (crowding distance) instead of greedy HVC fill
     fixed_alpha:          float     = 1.2   # entmax α fixed for all layers (1.0=softmax, 2.0=sparsemax)
     gating_type:          str       = 'per_layer'  # 'per_layer' = GatingNetwork, 'simple' = SimpleGatingNetwork
@@ -364,7 +358,7 @@ def _nsga3_select(rewards: np.ndarray, pop_size: int,
 
 
 # ---------------------------------------------------------------------------
-# NSGA-HVC helpers
+# greedy_hvc helpers
 # ---------------------------------------------------------------------------
 
 from pymoo.indicators.hv import HV as _PymooHV
@@ -392,8 +386,8 @@ def _hypervolume_contribution(candidates: np.ndarray, ref: np.ndarray) -> np.nda
     return hvc
 
 
-def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-    """NSGA-IV selection: non-dominated sorting + sequential greedy HVC on last front.
+def _greedy_hvc_select(rewards: np.ndarray, pop_size: int) -> List[int]:
+    """greedy_hvc selection: non-dominated sorting + sequential greedy HVC on last front.
 
     Complete fronts are accepted whole; the critical overflow front is filled by
     sequential greedy marginal-hypervolume maximisation, seeded with the
@@ -428,10 +422,10 @@ def _nsga4_select(rewards: np.ndarray, pop_size: int) -> List[int]:
 
 
 # ---------------------------------------------------------------------------
-# NSGA evolutionary algorithm class
+# ES evolutionary algorithm class
 # ---------------------------------------------------------------------------
 
-class NSGAII:
+class ES:
     """Evolutionary Algorithm for GatingNetwork evolution.
 
     Population: P flat param vectors (no λ association).
@@ -461,14 +455,9 @@ class NSGAII:
             for _ in range(self.P)
         ]
 
-        # fitness[i]:        raw reward vector from the latest evaluation
-        # parent_baseline[i]: cumulative mean of raw fitness across all generations
-        # parent_eval_count:  number of generations each parent has been evaluated
-        self.fitness          = [np.full(self.M, -np.inf) for _ in range(self.P)]
-        self.parent_baseline  = [np.full(self.M, -np.inf) for _ in range(self.P)]
-        self.parent_eval_count = [0] * self.P
-
-        self.z_star          = np.full(self.M, -np.inf, dtype=np.float32)
+        # fitness[i]: raw reward vector from the latest evaluation
+        self.fitness = [np.full(self.M, -np.inf) for _ in range(self.P)]
+        self.z_star  = np.full(self.M, -np.inf, dtype=np.float32)
 
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
@@ -500,19 +489,17 @@ class NSGAII:
             with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
                 json.dump({'fitness': self.fitness[i].tolist()}, f, indent=2)
         meta = {
-            'generation':       gen,
-            'sigma':            sigma,
-            'z_star':           self.z_star.tolist(),
-            'fitness':          [f.tolist() for f in self.fitness],
-            'parent_baseline':  [b.tolist() for b in self.parent_baseline],
-            'parent_eval_count': self.parent_eval_count,
+            'generation': gen,
+            'sigma':      sigma,
+            'z_star':     self.z_star.tolist(),
+            'fitness':    [f.tolist() for f in self.fitness],
         }
         if bounds and bounds.get('min') is not None:
             meta['bounds'] = {
                 'min':   bounds['min'].tolist(),
                 'range': bounds['range'].tolist(),
             }
-        with open(os.path.join(ckpt_dir, 'nsgaii_state.json'), 'w') as f:
+        with open(os.path.join(ckpt_dir, 'es_state.json'), 'w') as f:
             json.dump(meta, f, indent=2)
         print(f'  Checkpoint saved → {ckpt_dir}', flush=True)
 
@@ -522,7 +509,7 @@ class NSGAII:
         gen_dirs = sorted([
             d for d in os.listdir(output_dir)
             if d.startswith('gen_') and d[4:].isdigit()
-            and os.path.isfile(os.path.join(output_dir, d, 'nsgaii_state.json'))
+            and os.path.isfile(os.path.join(output_dir, d, 'es_state.json'))
         ])
         if not gen_dirs:
             return -1, None
@@ -553,9 +540,6 @@ class NSGAII:
         seed:              int   = 42,
         sigma_min:               float = 0.005,
         convergence_window:      int   = 10,
-        parent_stability_bonus:  float = 0.01,
-        parent_stability_cap:    float = 0.10,
-        use_dual_front:          bool  = True,
         use_greedy_hvc:          bool  = True,
         algorithm:               str   = 'nsgaii',
         n_reference_divisions:   int   = 12,
@@ -569,24 +553,24 @@ class NSGAII:
         is_main = rank == 0
 
         # ── Algorithm-specific setup ──────────────────────────────────────────
-        assert algorithm in ('nsgaii', 'nsgaiii', 'nsga4'), \
-            f"algorithm must be 'nsgaii', 'nsgaiii', or 'nsga4', got {algorithm!r}"
+        assert algorithm in ('nsgaii', 'nsgaiii', 'greedy_hvc'), \
+            f"algorithm must be 'nsgaii', 'nsgaiii', or 'greedy_hvc', got {algorithm!r}"
         if algorithm == 'nsgaiii':
             ref_pts = _generate_reference_points(self.M, n_reference_divisions)
             _select = lambda fit, n: _nsga3_select(fit, n, ref_pts)
             if is_main:
                 print(f'NSGA-III: {len(ref_pts)} reference points '
                       f'(M={self.M}, divisions={n_reference_divisions})')
-        elif algorithm == 'nsga4':
-            _select = _nsga4_select
+        elif algorithm == 'greedy_hvc':
+            _select = _greedy_hvc_select
             if is_main:
-                print(f'NSGA-HVC: Hypervolume Computing utility selection (M={self.M})')
+                print(f'greedy_hvc: Hypervolume Computing utility selection (M={self.M})')
         else:
             _select = _nsga2_select
 
         # use_greedy_hvc forces _select to sequential greedy HVC regardless of algorithm
         if use_greedy_hvc:
-            _select = _nsga4_select
+            _select = _greedy_hvc_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -643,25 +627,12 @@ class NSGAII:
         if resume and is_main:
             resume_gen, ckpt_dir = self._find_latest_checkpoint(resume_dir or output_dir)
             if resume_gen >= 0:
-                state_path = os.path.join(ckpt_dir, 'nsgaii_state.json')
+                state_path = os.path.join(ckpt_dir, 'es_state.json')
                 with open(state_path) as f:
                     state = json.load(f)
 
-                # Prefer live_state.json (written every gen) for mutable training state;
-                # fall back to nsgaii_state.json fields for older checkpoints.
-                live_path = os.path.join(resume_dir or output_dir, 'live_state.json')
+                # Always restore from es_state.json only.
                 live: dict = {}
-                if os.path.exists(live_path):
-                    with open(live_path) as f:
-                        _live_candidate = json.load(f)
-                    live_gen = _live_candidate.get('generation', resume_gen)
-                    if live_gen == resume_gen:
-                        live = _live_candidate
-                        print(f'  live_state.json matches checkpoint (gen={live_gen}) — '
-                              f'using for full state restore', flush=True)
-                    else:
-                        print(f'  live_state.json gen={live_gen} != checkpoint gen={resume_gen} '
-                              f'— ignoring live_state, using nsgaii_state.json only', flush=True)
 
                 # Restore population weights (always from checkpoint dir)
                 for i in range(self.P):
@@ -678,56 +649,7 @@ class NSGAII:
                     self.population[i] = net_to_params(g)
                     self.fitness[i]    = np.array(state['fitness'][i])
 
-                # parent_baseline: live_state > nsgaii_state > population_log > fitness
-                if 'parent_baseline' in live:
-                    for i in range(self.P):
-                        self.parent_baseline[i] = np.array(live['parent_baseline'][i])
-                    print('  parent_baseline restored from live_state.json', flush=True)
-                elif 'parent_baseline' in state:
-                    for i in range(self.P):
-                        self.parent_baseline[i] = np.array(state['parent_baseline'][i])
-                    print('  parent_baseline restored from nsgaii_state.json', flush=True)
-                else:
-                    pop_log_path = os.path.join(
-                        os.path.dirname(ckpt_dir), 'population_log.json')
-                    gen_key = f'gen_{resume_gen:04d}'
-                    if os.path.exists(pop_log_path):
-                        with open(pop_log_path) as f:
-                            pop_log = json.load(f)
-                        if gen_key in pop_log:
-                            ind_labels = sorted(pop_log[gen_key].keys())
-                            for i, lbl in enumerate(ind_labels[:self.P]):
-                                self.parent_baseline[i] = np.array(
-                                    pop_log[gen_key][lbl]['baseline'])
-                            print(f'  parent_baseline restored from population_log '
-                                  f'({gen_key})', flush=True)
-                        else:
-                            for i in range(self.P):
-                                self.parent_baseline[i] = self.fitness[i].copy()
-                            print(f'  parent_baseline fallback to fitness '
-                                  f'(gen_key {gen_key} not in population_log)', flush=True)
-                    else:
-                        for i in range(self.P):
-                            self.parent_baseline[i] = self.fitness[i].copy()
-                        print('  parent_baseline fallback to fitness '
-                              '(no population_log found)', flush=True)
-
-                # parent_eval_count: live_state > nsgaii_state > default 1
-                if 'parent_eval_count' in live:
-                    for i in range(self.P):
-                        self.parent_eval_count[i] = live['parent_eval_count'][i]
-                    print('  parent_eval_count restored from live_state.json', flush=True)
-                elif 'parent_eval_count' in state:
-                    for i in range(self.P):
-                        self.parent_eval_count[i] = state['parent_eval_count'][i]
-                    print('  parent_eval_count restored from nsgaii_state.json', flush=True)
-                else:
-                    for i in range(self.P):
-                        self.parent_eval_count[i] = 1
-                    print('  parent_eval_count not in checkpoint — defaulting to 1 '
-                          '(stability bonus will ramp from 0)', flush=True)
-
-                # z_star / sigma / bounds: live_state > nsgaii_state > bounds.json > defaults
+                # z_star / sigma / bounds restored from es_state (with bounds.json fallback)
                 self.z_star = np.array(live.get('z_star', state['z_star']))
                 sigma       = live.get('sigma', state.get('sigma', mutation_sigma))
                 live_bounds = live.get('bounds', state.get('bounds'))
@@ -745,30 +667,34 @@ class NSGAII:
                     print(f'  reward_min={np.round(bounds["min"], 3)}', flush=True)
                     print(f'  reward_max={np.round(r_max, 3)}', flush=True)
 
-                print(f'Resuming: weights from ckpt, state from live_state — '
+                print(f'Resuming: weights from ckpt, state from es_state — '
                       f'next gen={resume_gen + 1}  '
                       f'(σ={sigma:.5f}, z*={np.round(self.z_star, 3)})', flush=True)
             else:
                 print('No checkpoint found — starting from scratch.', flush=True)
                 resume_gen = -1
 
-        if resume and torch.distributed.is_initialized():
-            # Broadcast resume_gen + actual bounds so all ranks stay in sync
-            device = torch.device(f'cuda:{torch.distributed.get_rank() % torch.cuda.device_count()}')
-            n_obj = len(reward_names)
-            # Pack: [resume_gen, bounds_ready, min×n_obj, range×n_obj]
-            if bounds['min'] is not None:
-                payload = np.array([resume_gen, 1] + bounds['min'].tolist() + bounds['range'].tolist(),
-                                   dtype=np.float64)
-            else:
-                payload = np.array([resume_gen, 0] + [0.0] * n_obj + [1.0] * n_obj, dtype=np.float64)
-            t = torch.tensor(payload, dtype=torch.float64, device=device)
-            torch.distributed.broadcast(t, src=0)
-            arr        = t.cpu().numpy()
-            resume_gen = int(arr[0])
-            if int(arr[1]):
-                bounds['min']   = arr[2:2 + n_obj]
-                bounds['range'] = arr[2 + n_obj:]
+        if resume and not is_main:
+            # Non-main ranks recover resume_gen + bounds from the filesystem rather
+            # than via an NCCL broadcast. The work queue is already entirely
+            # file-based; that broadcast was the program's ONLY NCCL collective and
+            # could hang during NCCL communicator creation on some 4-GPU topologies
+            # (2-GPU worked, 4-GPU hung silently here). Reading the same checkpoint
+            # rank 0 reads keeps every rank in sync with zero collectives. The
+            # subsequent bounds 'done' sentinel acts as the file-based barrier.
+            resume_gen, _ckpt_dir = self._find_latest_checkpoint(resume_dir or output_dir)
+            if normalize_fitness and _ckpt_dir is not None:
+                with open(os.path.join(_ckpt_dir, 'es_state.json')) as f:
+                    st = json.load(f)
+                lb = st.get('bounds')
+                if lb is None:
+                    bounds_path = os.path.join(resume_dir or output_dir, 'bounds.json')
+                    if os.path.exists(bounds_path):
+                        with open(bounds_path) as f:
+                            lb = json.load(f)
+                if lb is not None:
+                    bounds['min']   = np.array(lb['min'])
+                    bounds['range'] = np.array(lb['range'])
 
         # ── Eval helper ───────────────────────────────────────────────────────
         def _eval_individual(params, chunk_idx, label=''):
@@ -827,8 +753,17 @@ class NSGAII:
         # per-objective min/max.  Uses the same task-queue infrastructure as
         # gen 0 so all workers participate in parallel.
         # Skipped on resume if bounds were saved in the checkpoint.
+        # On skip, rank 0 still creates the done sentinel so other ranks don't hang.
+        _BG = -1
+        if normalize_fitness and bounds['min'] is not None:
+            if is_main:
+                os.makedirs(_gen_dir(_BG), exist_ok=True)
+                open(_done_path(_BG), 'w').close()
+            else:
+                while not os.path.exists(_done_path(_BG)):
+                    time.sleep(poll_interval)
+
         if normalize_fitness and bounds['min'] is None:
-            _BG = -1   # bounds gen → directory 'gen_-001'
             if is_main:
                 print(f'Computing expert reward bounds '
                       f'({self.template.num_experts} experts, chunk 0) …', flush=True)
@@ -882,8 +817,6 @@ class NSGAII:
             if is_main:
                 for i in range(self.P):
                     self.fitness[i] = _collect_fitness(gen, i)
-                    self.parent_baseline[i]   = self.fitness[i].copy()
-                    self.parent_eval_count[i] = 1
                 open(_done_path(gen), 'w').close()
                 log(f'gen 0 done, z*={np.round(self.z_star, 3)}')
                 print(f'Gen {gen:4d}/{num_generations}')
@@ -936,17 +869,9 @@ class NSGAII:
             _worker_loop(gen, 0, 2 * self.P, _done_path(gen))
 
             if is_main:
-                # Collect parent results and update cumulative baseline
+                # Collect parent results (re-eval on current chunk)
                 for i in range(self.P):
-                    raw = _collect_fitness(gen, i)
-                    self.fitness[i] = raw
-                    n = self.parent_eval_count[i]
-                    if n == 0 or np.all(self.parent_baseline[i] == -np.inf):
-                        self.parent_baseline[i] = raw.copy()
-                    else:
-                        # cumulative mean: baseline = (baseline * n + raw) / (n + 1)
-                        self.parent_baseline[i] = (self.parent_baseline[i] * n + raw) / (n + 1)
-                    self.parent_eval_count[i] = n + 1
+                    self.fitness[i] = _collect_fitness(gen, i)
 
                 # Collect child results
                 child_fitness = [_collect_fitness(gen, self.P + i) for i in range(self.P)]
@@ -975,87 +900,24 @@ class NSGAII:
                         remaining.remove(best_loc)
                     return result
 
-                def _fill(seed: List[int], pool: List[int], n: int) -> List[int]:
-                    """Fill n slots from pool; greedy HVC if use_greedy_hvc else _select."""
-                    if n <= 0 or not pool:
-                        return []
-                    if use_greedy_hvc:
-                        return _greedy_hvc_fill(seed, pool, n)
-                    sub = merged_fitness[np.array(pool)]
-                    return [pool[i] for i in _select(sub, min(n, len(pool)))]
-
-                if not use_dual_front:
-                    # Single-front: select from full merged pool.
-                    if use_greedy_hvc:
-                        selected = _greedy_hvc_fill([], list(range(len(merged_fitness))), self.P)
-                    else:
-                        selected = _select(merged_fitness, self.P)
-                    n_intersection = len(selected)
+                # Single-front selection from full merged pool.
+                if use_greedy_hvc:
+                    selected = _greedy_hvc_fill([], list(range(len(merged_fitness))), self.P)
                 else:
-                    # Front 1: complete Pareto front on raw fitness (no size cap).
-                    front1_set = set(_non_dominated_sort(merged_fitness)[0])
-
-                    # Front 2: complete Pareto front on parent baseline × (1 + bonus) vs child raw.
-                    # Bonus grows with eval_count so a child must beat the parent's historical
-                    # average by an increasing margin to displace it.
-                    parent_front2 = [
-                        self.parent_baseline[i] * (1.0 + min(self.parent_eval_count[i] * parent_stability_bonus,
-                                                              parent_stability_cap))
-                        for i in range(self.P)
-                    ]
-                    merged_front2 = np.vstack([np.array(parent_front2), np.array(child_fitness)])
-                    front2_fronts = _non_dominated_sort(merged_front2)
-                    front2_set    = set(front2_fronts[0])
-
-                    # Stage 1: intersection of both fronts; trim to P if oversized.
-                    intersection   = [k for k in front2_set if k in front1_set]
-                    n_intersection = len(intersection)
-                    if len(intersection) > self.P:
-                        intersection = _fill([], intersection, self.P)
-
-                    # Stage 2: fill from front2 \ front1 against intersection seed.
-                    selected = intersection + _fill(
-                        intersection,
-                        [k for k in front2_set if k not in front1_set],
-                        self.P - len(intersection),
-                    )
-
-                    # Fallback: if front2's first front is exhausted, pull from deeper fronts.
-                    for deeper_front in front2_fronts[1:]:
-                        if len(selected) >= self.P:
-                            break
-                        pool = [k for k in deeper_front if k not in set(selected)]
-                        selected += _fill(selected, pool, self.P - len(selected))
+                    selected = _select(merged_fitness, self.P)
 
                 ind_labels     = [f'{j+1}-parent{k+1}' if k < self.P else f'{j+1}-child'
                                   for j, k in enumerate(selected)]
                 n_parents_kept = sum(1 for k in selected if k < self.P)
 
-                # Update population; reset baseline/count for newly selected children
-                new_population    = [merged_params[k] for k in selected]
-                new_fitness       = [merged_fitness[k] for k in selected]
-                new_baseline      = []
-                new_eval_count    = []
-                for j, k in enumerate(selected):
-                    if k < self.P:
-                        new_baseline.append(self.parent_baseline[k].copy())
-                        new_eval_count.append(self.parent_eval_count[k])
-                    else:
-                        # Child enters as new parent: baseline starts from its first raw eval
-                        new_baseline.append(merged_fitness[k].copy())
-                        new_eval_count.append(1)
-
-                self.population       = new_population
-                self.fitness          = new_fitness
-                self.parent_baseline  = new_baseline
-                self.parent_eval_count = new_eval_count
+                self.population = [merged_params[k] for k in selected]
+                self.fitness    = [merged_fitness[k] for k in selected]
 
             # ── Post-selection bookkeeping and logging ────────────────────────
             if is_main:
                 sigma = max(sigma_min, sigma * sigma_decay)
 
-                fit_arr     = np.array(self.fitness)          # raw current-gen
-                base_arr    = np.array(self.parent_baseline)  # cumulative mean
+                fit_arr = np.array(self.fitness)          # raw current-gen
 
                 # Append per-individual record to population log
                 log_path = os.path.join(output_dir, 'population_log.json')
@@ -1067,7 +929,7 @@ class NSGAII:
                 alpha_str = f'entmax_α={self.template.fixed_alpha:.3f}(fixed)'
 
                 pop_log[f'gen_{gen:04d}'] = {
-                    label: {'raw': fit_arr[j].tolist(), 'baseline': base_arr[j].tolist()}
+                    label: {'raw': fit_arr[j].tolist()}
                     for j, label in enumerate(ind_labels)
                 }
                 with open(log_path, 'w') as f:
@@ -1075,12 +937,9 @@ class NSGAII:
 
                 # Write live state every generation for crash-safe resume
                 live_state: dict = {
-                    'generation':        gen,
-                    'sigma':             sigma,
-                    'z_star':            self.z_star.tolist(),
-                    'parent_baseline':   [b.tolist() if hasattr(b, 'tolist') else list(b)
-                                          for b in self.parent_baseline],
-                    'parent_eval_count': list(self.parent_eval_count),
+                    'generation': gen,
+                    'sigma':      sigma,
+                    'z_star':     self.z_star.tolist(),
                 }
                 if bounds.get('min') is not None:
                     live_state['bounds'] = {
@@ -1097,8 +956,6 @@ class NSGAII:
                     f'Gen {gen:4d}/{num_generations} | '
                     f'chunk={chunk_idx % _num_chunks} | '
                     f'parents_kept={n_parents_kept}/{self.P} | '
-                    f'intersect={n_intersection}/{self.P} | '
-                    f'bonus={np.mean([min(self.parent_eval_count[i]*parent_stability_bonus, parent_stability_cap) for i in range(self.P)]):.3f} | '
                     f'mean_fit={np.round(fit_arr.mean(axis=0), 3)} | '
                     f'best_fit={np.round(fit_arr.max(axis=0), 3)} | '
                     f'z*={np.round(self.z_star, 3)} | '
@@ -1131,9 +988,11 @@ os.makedirs(output_dir, exist_ok=True)
 set_seed(script_args.seed)
 np.random.seed(script_args.seed)
 
-if 'RANK' in os.environ:
-    torch.distributed.init_process_group(
-        backend='nccl', timeout=datetime.timedelta(minutes=600))
+# NOTE: no explicit torch.distributed.init_process_group / NCCL collectives.
+# All cross-rank coordination is file-based (work queue + done sentinels), and
+# resume state is recovered per-rank from the checkpoint files (see run()).
+# Accelerator still gives us rank/device discovery without us ever issuing an
+# NCCL collective, which avoids the 4-GPU broadcast hang.
 accelerator = Accelerator()
 gpu_id      = (script_args.gpu_id if script_args.gpu_id >= 0
                else accelerator.local_process_index)
@@ -1163,27 +1022,10 @@ elif script_args.dataset_name == 'PKU-Alignment/PKU-SafeRLHF-10K':
         script_args.dataset_name, sft_tokenizer,
         rm_tokenizer=reward_models.rm_tokenizers[0], split='train')
     instructions = Instructions()
-elif script_args.dataset_name in {'nvidia/HelpSteer', 'nvidia/HelpSteer2'}:
-    dataset = build_dataset_steer_ppo(
-        script_args.dataset_name, sft_tokenizer,
-        rm_tokenizer=reward_models.rm_tokenizers[0], split='train')
-    instructions = Instructions()
-elif script_args.dataset_name == 'argilla/news-summary':
-    # argilla/news-summary: train split has only ~1000 samples; test split has ~20k — use test
-    dataset = build_dataset_news_summary_ppo(
-        script_args.dataset_name, sft_tokenizer,
-        reward_models.rm_tokenizers[0], split='test')
-    instructions = Instructions_summary()
-elif script_args.dataset_name == 'openbmb/UltraFeedback':
-    dataset = build_dataset_ultrafeedback_ppo(
-        script_args.dataset_name, sft_tokenizer,
-        rm_tokenizer=reward_models.rm_tokenizers[0], split='train')
-    instructions = Instructions()
 else:
     raise ValueError(f'Unsupported dataset_name: {script_args.dataset_name!r}. '
                      f'Choose from: Anthropic/hh-rlhf, openai/summarize_from_feedback, '
-                     f'argilla/news-summary, PKU-Alignment/PKU-SafeRLHF-10K, '
-                     f'nvidia/HelpSteer, nvidia/HelpSteer2, openbmb/UltraFeedback')
+                     f'PKU-Alignment/PKU-SafeRLHF-10K')
 
 for key in ['key', 'text', 'prompt', 'response', 'query']:
     if key in dataset.column_names:     dataset     = dataset.remove_columns(key)
@@ -1193,7 +1035,7 @@ data_collator = DataCollatorWithPadding(tokenizer=sft_tokenizer)
 print(f'Dataset size: {len(dataset)} | eval_prompts per call: {script_args.eval_prompts}')
 
 _max_new_tokens = (script_args.max_new_tokens if script_args.max_new_tokens > 0
-                   else (128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K', 'nvidia/HelpSteer', 'nvidia/HelpSteer2'} else 48))
+                   else (128 if script_args.dataset_name in {'Anthropic/hh-rlhf', 'PKU-Alignment/PKU-SafeRLHF-10K'} else 48))
 generation_kwargs = {
     'max_new_tokens': _max_new_tokens, 'min_length': -1,
     'top_k': 0, 'top_p': 0.9, 'temperature': 0.7, 'do_sample': script_args.do_sample,
@@ -1205,8 +1047,8 @@ for i, path in enumerate(script_args.expert_model_paths):
     print(f'  Expert {i+1}: {path}')
     base = AutoModelForCausalLM.from_pretrained(
         script_args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
+    base.resize_token_embeddings(len(sft_tokenizer))
     m = PeftModel.from_pretrained(base, path).merge_and_unload()
-    m.resize_token_embeddings(len(sft_tokenizer))
     m.eval()
     for p in m.parameters(): p.requires_grad = False
     expert_models.append(m)
@@ -1241,7 +1083,7 @@ if script_args.warm_start_path:
     wsp_name = os.path.basename(wsp)
     # Case 1: warm_start_path points directly to a gen_XXXX checkpoint directory
     if (wsp_name.startswith('gen_') and wsp_name[4:].isdigit()
-            and os.path.isfile(os.path.join(wsp, 'nsgaii_state.json'))):
+            and os.path.isfile(os.path.join(wsp, 'es_state.json'))):
         _resume     = True
         _resume_dir = os.path.dirname(os.path.abspath(wsp))
         _ckpt_gen   = int(wsp_name[4:])
@@ -1249,7 +1091,7 @@ if script_args.warm_start_path:
               f'resume_dir={_resume_dir}')
     else:
         # Case 2: warm_start_path is the run directory; find latest gen_XXXX inside it
-        _ckpt_gen, _ = NSGAII._find_latest_checkpoint(wsp)
+        _ckpt_gen, _ = ES._find_latest_checkpoint(wsp)
         if _ckpt_gen >= 0:
             _resume     = True
             _resume_dir = wsp
@@ -1277,7 +1119,7 @@ else:
     print(f'MoEForCausalLM: {len(expert_models)} experts × {moe_model.num_layers} layers')
 moe_model.eval()
 
-nsgaii = NSGAII(
+es = ES(
     template_net=template_net,
     num_objectives=n_objectives,
     population_size=script_args.population_size,
@@ -1285,8 +1127,8 @@ nsgaii = NSGAII(
 )
 
 print(f'\nStarting Evolutionary Soups — {script_args.num_generations} generations, '
-      f'P={nsgaii.P}, 1 eval per individual …')
-final_population = nsgaii.run(
+      f'P={es.P}, 1 eval per individual …')
+final_population = es.run(
     dataset=dataset, data_collator=data_collator,
     eval_prompts=script_args.eval_prompts, eval_batch_size=script_args.eval_batch_size,
     moe_model=moe_model, sft_tokenizer=sft_tokenizer,
@@ -1299,9 +1141,6 @@ final_population = nsgaii.run(
     verbose=script_args.verbose, seed=script_args.seed,
     sigma_min=script_args.sigma_min,
     convergence_window=script_args.convergence_window,
-    parent_stability_bonus=script_args.parent_stability_bonus,
-    parent_stability_cap=script_args.parent_stability_cap,
-    use_dual_front=script_args.use_dual_front,
     use_greedy_hvc=script_args.use_greedy_hvc,
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
@@ -1320,18 +1159,18 @@ if is_main:
         net    = params_to_net(params, template_net, 'cpu')
         save_gating_network(net, subdir)
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
-            json.dump({'fitness': nsgaii.fitness[i].tolist()}, f, indent=2)
+            json.dump({'fitness': es.fitness[i].tolist()}, f, indent=2)
 
-    fronts = _non_dominated_sort(np.array(nsgaii.fitness))
-    with open(os.path.join(output_dir, 'nsgaii_meta.json'), 'w') as f:
+    fronts = _non_dominated_sort(np.array(es.fitness))
+    with open(os.path.join(output_dir, 'es_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,
-            'z_star':          nsgaii.z_star.tolist(),
-            'final_fitness':   [f.tolist() for f in nsgaii.fitness],
+            'z_star':          es.z_star.tolist(),
+            'final_fitness':   [f.tolist() for f in es.fitness],
             'num_generations': script_args.num_generations,
-            'population_size': nsgaii.P,
+            'population_size': es.P,
             'lm_hidden_size':  lm_hidden_size,
         }, f, indent=2)
 
-    print(f'\nDone. Non-dominated front: {len(fronts[0])}/{nsgaii.P} individuals')
-    print(f'Final ideal point z* = {np.round(nsgaii.z_star, 4)}')
+    print(f'\nDone. Non-dominated front: {len(fronts[0])}/{es.P} individuals')
+    print(f'Final ideal point z* = {np.round(es.z_star, 4)}')

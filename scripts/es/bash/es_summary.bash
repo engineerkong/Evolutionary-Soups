@@ -1,34 +1,36 @@
+set -e
+
 base_model_name='meta-llama/Llama-2-7b-hf'
-expert_model_paths='./models/ppo/ppo_beaver_reward_2204/best_model ./models/ppo/ppo_beaver_cost_2204/best_model'
-dataset_name='PKU-Alignment/PKU-SafeRLHF-10K'
-reward_names='beaver_reward,beaver_cost'
+expert_model_paths='./models/ppo/ppo_summary_summary_2104/best_model ./models/ppo/ppo_summary_faithful_2104/best_model ./models/ppo/ppo_summary_deberta_2104/best_model'
+dataset_name='openai/summarize_from_feedback'
+reward_names='summary,faithful,deberta'
 eval_prompts=1024
 use_dual_front=false
-use_greedy_hvc=false
+use_greedy_hvc=true
 algorithm='nsgaii'
-population_size=20
+population_size=40
 num_generations=100
-warm_start_path=''    # set to a run directory (e.g. ./models/ES/es_beaver_1105) to resume evolution
+warm_start_path=''
 # --------------------
-parent_stability_bonus=0.01
+parent_stability_bonus=0.005
 parent_stability_cap=0.10
 fixed_alpha=1.2
 gating_type='per_layer'   # 'per_layer' = GatingNetwork | 'simple' = SimpleGatingNetwork
 normalize_fitness=true
 # --------------------
-run_name='es_beaver_abl_neither'
+run_name='es_summary_2205'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-CUDA_VISIBLE_DEVICES=4,5 accelerate launch --main_process_port 29604 \
+CUDA_VISIBLE_DEVICES=1,2,3 accelerate launch --main_process_port 29601 \
     ./scripts/momoe/evolutionary_soups.py \
     --base_model_name "${base_model_name}" \
     --expert_model_paths ${expert_model_paths} \
     --dataset_name "${dataset_name}" \
     --reward_names "${reward_names}" \
     --eval_prompts "${eval_prompts}" \
+    --algorithm "${algorithm}" \
     --use_dual_front "${use_dual_front}" \
     --use_greedy_hvc "${use_greedy_hvc}" \
-    --algorithm "${algorithm}" \
     --population_size "${population_size}" \
     --num_generations "${num_generations}" \
     --warm_start_path "${warm_start_path}" \
