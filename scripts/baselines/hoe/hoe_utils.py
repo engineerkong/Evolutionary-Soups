@@ -90,7 +90,7 @@ def build_hoe_model(
     from src.mola_modeling_llama_hacked import LlamaForCausalLM_d
     from src.mola_mapping_hacked import MODEL_TYPE_TO_PEFT_MODEL_MAPPING
     from src.mola_peft_model_hacked import set_peft_model_state_dict_moe
-    from hoe_architecture import ConditionedMOEModel
+    from scripts.baselines.hoe.hoe_architecture import ConditionedMOEModel
 
     # Derive target modules from expert adapters (must be consistent across experts)
     with open(Path(expert_model_paths[0]) / 'adapter_config.json') as f:

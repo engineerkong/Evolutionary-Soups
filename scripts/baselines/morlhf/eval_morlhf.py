@@ -29,7 +29,7 @@ import pandas as pd
 from torch.utils.data import DataLoader
 
 from peft import PeftModel
-from scripts.utils.utils import (
+from scripts.baselines.utils.utils import (
     load_main_tokenizer,
     Instructions, Instructions_summary,
     build_dataset_eval,
@@ -39,7 +39,7 @@ from scripts.utils.utils import (
     build_dataset_ultrafeedback_eval,
     get_clean_data,
 )
-from scripts.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.multi_reward_models import RewardModels
 
 tqdm.pandas()
 

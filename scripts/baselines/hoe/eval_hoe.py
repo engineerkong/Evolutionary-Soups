@@ -36,7 +36,7 @@ for _p in [str(HoE_ROOT / 'src'), str(HoE_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from hoe_utils import (
+from scripts.baselines.hoe.hoe_utils import (
     build_hoe_model,
     load_hoe_checkpoint,
     load_router_weights,
@@ -44,8 +44,8 @@ from hoe_utils import (
     parse_comma_int_list,
     parse_comma_str_list as _parse_paths,
 )
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
+from scripts.baselines.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.utils import (
     Instructions,
     Instructions_summary,
     build_dataset_eval,

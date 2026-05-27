@@ -42,7 +42,7 @@ from utils import save_configs, map_rewards_from_preference, build_summary_datas
 script_dir = Path(__file__).resolve().parent.parent
 project_root = script_dir.parent.parent       # project/
 sys.path.insert(0, str(project_root))
-from scripts.utils.utils import sample_preferences_uniform
+from scripts.baselines.utils.utils import sample_preferences_uniform
 
 hhrlhf_dataset_path  = 'Anthropic/hh-rlhf'
 summary_dataset_path = 'openai/summarize_from_feedback'

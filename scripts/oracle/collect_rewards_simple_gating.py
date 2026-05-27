@@ -28,18 +28,18 @@ from trl import set_seed
 script_dir   = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(script_dir.parent / 'momoe'))
+sys.path.insert(0, str(script_dir.parent / 'evolutionary'))   # es_architecture / es_utils 
 
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
+from scripts.baselines.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo,
     build_dataset_eval, build_dataset_summary_eval,
     build_dataset_beaver_ppo, build_dataset_beaver_eval,
     get_clean_data, load_main_tokenizer,
 )
-from nsgaii_architecture import SimpleMoEForCausalLM
-from nsgaii_utils import REWARD_PATHS
+from es_architecture import SimpleMoEForCausalLM
+from es_utils import REWARD_PATHS
 from optimal_utils import get_simplex_samples
 
 

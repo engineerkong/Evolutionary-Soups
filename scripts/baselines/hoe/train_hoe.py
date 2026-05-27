@@ -43,8 +43,8 @@ for _p in [str(HoE_ROOT / 'src'), str(HoE_ROOT), str(HoE_ROOT / 'trl_utils')]:
         sys.path.insert(0, _p)
 
 from trl_utils.trainer import PPOConfig
-from hoe_architecture import ConditionedMOEModelWithValueHead, WeightSampler
-from hoe_utils import (
+from scripts.baselines.hoe.hoe_architecture import ConditionedMOEModelWithValueHead, WeightSampler
+from scripts.baselines.hoe.hoe_utils import (
     build_hoe_model,
     clean_response,
     load_router_weights,
@@ -53,8 +53,8 @@ from hoe_utils import (
     parse_comma_str_list,
     parse_comma_str_list as _parse_paths,
 )
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
+from scripts.baselines.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.utils import (
     Instructions,
     Instructions_summary,
     build_dataset_ppo,

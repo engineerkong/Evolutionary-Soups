@@ -44,8 +44,8 @@ for _p in [str(HoE_ROOT / 'src'), str(HoE_ROOT)]:
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from hoe_utils import build_hoe_model, make_number_experts_str, parse_comma_int_list, parse_comma_str_list, save_router_weights
-from scripts.utils.utils import load_main_tokenizer, Instructions_summary
+from scripts.baselines.hoe.hoe_utils import build_hoe_model, make_number_experts_str, parse_comma_int_list, parse_comma_str_list, save_router_weights
+from scripts.baselines.utils.utils import load_main_tokenizer, Instructions_summary
 
 
 # ---------------------------------------------------------------------------

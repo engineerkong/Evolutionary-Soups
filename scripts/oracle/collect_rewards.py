@@ -24,8 +24,8 @@ from trl import set_seed
 script_dir = Path(__file__).resolve().parent
 project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
+from scripts.baselines.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_ppo, build_dataset_summary_ppo,
     build_dataset_eval, build_dataset_summary_eval,

@@ -1,5 +1,0 @@
-CUDA_VISIBLE_DEVICES=2,3 accelerate launch --main_process_port 29601 ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_summary_3001/model/' --dataset_name 'openai/summarize_from_feedback' --reward_name 'summary' --wandb_name 'ppo_summary_summary_2104' 2>&1 | tee ./logs/ppo/ppo_summary_summary_2104.log
-
-CUDA_VISIBLE_DEVICES=2,3 accelerate launch --main_process_port 29601 ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_summary_3001/model/' --dataset_name 'openai/summarize_from_feedback' --reward_name 'faithful' --wandb_name 'ppo_summary_faithful_2104' 2>&1 | tee ./logs/ppo/ppo_summary_faithful_2104.log
-
-CUDA_VISIBLE_DEVICES=2,3 accelerate launch --main_process_port 29601 ./scripts/fine-tuning/ppo.py --sft_model_name './models/sft/sft_summary_3001/model/' --dataset_name 'openai/summarize_from_feedback' --reward_name 'deberta' --wandb_name 'ppo_summary_deberta_2104' 2>&1 | tee ./logs/ppo/ppo_summary_deberta_2104.log

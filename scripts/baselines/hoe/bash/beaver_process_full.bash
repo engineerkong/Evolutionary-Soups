@@ -30,7 +30,7 @@ mkdir -p ./logs
 # CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
 #     --num_processes 2 \
 #     --main_process_port 29700 \
-#     ./scripts/hoe/eval_hoe.py \
+#     ./scripts/baselines/hoe/eval_hoe.py \
 #     --base_model_name "${base_model_name}" \
 #     --expert_model_paths "${expert_model_paths}" \
 #     --dataset_name "${dataset_name}" \
@@ -45,7 +45,7 @@ mkdir -p ./logs
 # CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
 #     --num_processes 2 \
 #     --main_process_port 29701 \
-#     ./scripts/hoe/train_hoe_router.py \
+#     ./scripts/baselines/hoe/train_hoe_router.py \
 #     --base_model_name "${base_model_name}" \
 #     --expert_model_paths "${expert_model_paths}" \
 #     --dataset_name "${dataset_name}" \
@@ -62,7 +62,7 @@ mkdir -p ./logs
 # CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
 #     --num_processes 2 \
 #     --main_process_port 29702 \
-#     ./scripts/hoe/eval_hoe.py \
+#     ./scripts/baselines/hoe/eval_hoe.py \
 #     --base_model_name "${base_model_name}" \
 #     --expert_model_paths "${expert_model_paths}" \
 #     --pretrained_moe_path "${router_checkpoint}" \
@@ -78,7 +78,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --num_processes 2 \
     --main_process_port 29703 \
-    ./scripts/hoe/train_hoe.py \
+    ./scripts/baselines/hoe/train_hoe.py \
     --base_model_name "${base_model_name}" \
     --sft_model_name "${sft_model_name}" \
     --expert_model_paths "${expert_model_paths}" \
@@ -93,7 +93,7 @@ echo "=== Stage 2 Eval: Evaluate final HoE model ==="
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch \
     --num_processes 2 \
     --main_process_port 29704 \
-    ./scripts/hoe/eval_hoe.py \
+    ./scripts/baselines/hoe/eval_hoe.py \
     --base_model_name "${base_model_name}" \
     --expert_model_paths "${expert_model_paths}" \
     --checkpoint_path "${ppo_checkpoint}" \

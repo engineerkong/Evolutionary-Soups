@@ -30,8 +30,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from trl import set_seed
 
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
+from scripts.baselines.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.utils import (
     Instructions, Instructions_summary,
     build_dataset_eval, build_dataset_summary_eval,
     build_dataset_news_summary_ppo,

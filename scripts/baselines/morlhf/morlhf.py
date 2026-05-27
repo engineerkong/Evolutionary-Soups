@@ -52,14 +52,14 @@ import pandas as pd
 from peft import PeftModel, PeftConfig, prepare_model_for_kbit_training
 import matplotlib.pyplot as plt
 
-from scripts.utils.utils import (
+from scripts.baselines.utils.utils import (
     print_trainable_parameters, load_main_tokenizer,
     Instructions, Instructions_summary,
     build_dataset_ppo         as build_dataset,
     build_dataset_summary_ppo as build_dataset_summary,
     build_dataset_beaver_ppo  as build_dataset_beaver,
 )
-from scripts.utils.multi_reward_models import RewardModels
+from scripts.baselines.utils.multi_reward_models import RewardModels
 
 tqdm.pandas()
 
