@@ -14,14 +14,14 @@ reward_names='beaver_reward,beaver_cost'
 # reward_names='summary,faithful,deberta'                                                                                                                                  # summary
 
 population_size=20
-# population_size=80                                                                                                                                                       # assistant / summary
+# population_size=40                                                                                                                                                       # assistant / summary
 # ===========================================================================
 
 fixed_alpha=1.2
 gating_type='per_layer'        # 'per_layer' = GatingNetwork | 'simple' = SimpleGatingNetwork
 seed=8888
 # --------------------
-run_name='dummy_beaver_per_layer'
+run_name='dummy_beaver'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0 accelerate launch --main_process_port 29605 \

@@ -22,14 +22,14 @@ norm_rewards='./results/optimal/optimal_beaver_1205/reward_norm.json'    # '' to
 # ===========================================================================
 
 # Checkpoint(s) to evaluate: a dir with gating_network.pt, or a dir of ind_*/ sub-dirs (e.g. gen_0030/)
-gating_paths='./models/ES/es_beaver_per_layer/gen_0030'
+gating_paths='./models/ES/es_beaver/final'
 eval_prompts=0                 # 0 = all test prompts
 batch_size=128
 do_sample=false
 num_continuations=1
 pref_step=0.1
 # --------------------
-run_name='es_beaver_per_layer_test'
+run_name='es_beaver_test'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29603 \

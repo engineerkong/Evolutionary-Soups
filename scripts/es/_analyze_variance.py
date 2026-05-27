@@ -5,7 +5,7 @@ passes them through both GatingNetwork and SimpleGatingNetwork checkpoints
 to measure how much the output coefficients vary across prompts.
 
 Questions answered:
-  1. Are per-layer mean-pooled hidden states (GatingNetwork input) anisotropic?
+  1. Are per-layer last-token hidden states (GatingNetwork input) anisotropic?
   2. Are last-token hidden states (SimpleGatingNetwork input) anisotropic?
   3. Does each gating checkpoint produce consistent or prompt-varying coefficients?
 
@@ -72,7 +72,12 @@ class ScriptArguments:
 
 def build_per_layer_cache(prompts, expert_model, tokenizer,
                           max_length, batch_size, device):
-    """(N, num_layers, H) float32 CPU — post-attn mean-pooled per layer."""
+    """(N, num_layers, H) float32 CPU — post-attn last real token per layer.
+
+    Matches GatingNetwork.forward, which reduces a (B, seq, H) input to its
+    last position; we gather the last non-padding token so this is correct
+    regardless of the tokenizer's padding side.
+    """
     enc = tokenizer(prompts, max_length=max_length, truncation=True,
                     padding=True, return_tensors='pt')
     ids  = enc['input_ids']
@@ -109,8 +114,10 @@ def build_per_layer_cache(prompts, expert_model, tokenizer,
         for h in handles:
             h.remove()
 
-        stacked = torch.stack([post_attn[l] for l in range(num_layers)], dim=1)  # (B, L, seq, H)
-        all_hidden.append(stacked.mean(dim=2))  # (B, L, H) — mean-pool over seq
+        stacked  = torch.stack([post_attn[l] for l in range(num_layers)], dim=1)  # (B, num_layers, seq, H)
+        last_idx = (b_mask.sum(dim=1) - 1).clamp(min=0).cpu()                     # (B,)
+        idx      = last_idx.view(-1, 1, 1, 1).expand(-1, num_layers, 1, stacked.shape[-1])
+        all_hidden.append(stacked.gather(2, idx).squeeze(2))  # (B, num_layers, H) — last real token
 
     return torch.cat(all_hidden, dim=0)  # (N, num_layers, H)
 
@@ -276,7 +283,7 @@ if __name__ == '__main__':
     per_layer_cache = last_token_cache = None
 
     if need_per_layer:
-        print(f'\nBuilding per-layer hidden cache ({len(prompts)} prompts) …')
+        print(f'\nBuilding last token per-layer hidden cache ({len(prompts)} prompts) …')
         per_layer_cache = build_per_layer_cache(
             prompts, expert0, sft_tokenizer,
             script_args.max_prompt_len, script_args.batch_size, device)
@@ -297,7 +304,7 @@ if __name__ == '__main__':
               f'(>1 = anisotropic)')
 
     if need_simple:
-        print(f'\nBuilding last-token hidden cache ({len(prompts)} prompts) …')
+        print(f'\nBuilding last-token single hidden cache ({len(prompts)} prompts) …')
         last_token_cache = build_last_token_cache(
             prompts, expert0, sft_tokenizer,
             script_args.max_prompt_len, script_args.batch_size, device)
@@ -307,7 +314,7 @@ if __name__ == '__main__':
         mu2     = flat2.mean(dim=0)
         mu2_norm = mu2.norm().item()
         c2_norm  = (flat2 - mu2).norm(dim=-1).mean().item()
-        print(f'  Anisotropy check (last-token):')
+        print(f'  Anisotropy check (single):')
         print(f'    mean vector norm   : {mu2_norm:.2f}')
         print(f'    avg deviation norm : {c2_norm:.2f}')
         print(f'    ratio mu/deviation : {mu2_norm / max(c2_norm, 1e-6):.2f}x')
@@ -318,10 +325,10 @@ if __name__ == '__main__':
 
     all_results = {}
 
-    # ── GatingNetwork (per-layer) checkpoints ────────────────────────────────
+    # ── GatingNetwork checkpoints ────────────────────────────────
     ckpts_per_layer = resolve_ckpts(script_args.gating_paths_per_layer)
     if ckpts_per_layer:
-        print_section(f'GatingNetwork (per-layer)  —  {len(ckpts_per_layer)} checkpoints')
+        print_section(f'GatingNetwork (last-token)  —  {len(ckpts_per_layer)} checkpoints')
         rows = []
         for ckpt in ckpts_per_layer:
             name = os.path.basename(ckpt)

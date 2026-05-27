@@ -13,7 +13,7 @@ reward_names='beaver_reward,beaver_cost'
 # ===========================================================================
 
 # Population to refine (point at a gen_XXXX / final dir containing ind_XXX/ sub-dirs)
-population_dir='./models/ES/es_beaver_per_layer/gen_0030'
+population_dir='./models/ES/es_beaver/final'
 individual_indices=''          # comma-separated, empty = refine every individual
 # --- PPO hyper-parameters ---
 num_iterations=500

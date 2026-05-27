@@ -18,7 +18,7 @@ reward_names='beaver_reward,beaver_cost'
 # reward_names='summary,faithful,deberta'                                                                                                                                  # summary
 
 population_size=20
-# population_size=80                                                                                                                                                       # assistant / summary
+# population_size=40                                                                                                                                                       # assistant / summary
 # ===========================================================================
 
 eval_prompts=1024
@@ -38,10 +38,10 @@ sigma_min=0.03
 # --------------------
 fixed_alpha=1.2
 gating_type='per_layer'        # 'per_layer' = GatingNetwork | 'simple' = SimpleGatingNetwork
-normalize_fitness=true
-normalize_rewards=false
+normalize_fitness=true         # expert min-max; mutually exclusive with normalize_rewards
+normalize_rewards=false        # online z-score (running mean/std computed during the run); set fitness=false to use
 # --------------------
-run_name='es_retention_beaver_per_layer'
+run_name='es_retention_beaver'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29602 \

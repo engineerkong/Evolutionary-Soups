@@ -163,7 +163,7 @@ def eval_configs(configs, loader, tokenizer, reward_models, instructions,
                                    tokenizer, reward_models, instructions,
                                    generation_kwargs, gpu_id, num_continuations,
                                    sample_writer=_writer)
-            batch_rewards.append(r)
+            batch_rewards.append(np.asarray(r).tolist())   # store plain list (JSON-serialisable)
 
             if samples_file is not None:
                 samples_file.flush()    # checkpoint after each batch

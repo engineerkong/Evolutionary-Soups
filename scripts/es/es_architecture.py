@@ -65,9 +65,11 @@ def _apply_entmax(z: torch.Tensor, alpha) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 class GatingNetwork(nn.Module):
-    """Per-layer gating: mean-pool hidden states → expert merging weights.
+    """Per-layer gating: last-token hidden state → expert merging weights.
 
     Input:  (B, seq, lm_hidden_size)  or  (B, lm_hidden_size)
+            A (B, seq, H) input is reduced to its last position (B, H); the
+            tokenizer pads left, so the last position is always a real token.
     Output: (B, num_experts)  — sparse weights via α-entmax (α=1→softmax, α=2→sparsemax)
 
     alpha is a per-layer nn.Parameter (shape [num_layers]) included in the

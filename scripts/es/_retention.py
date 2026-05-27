@@ -64,7 +64,7 @@ class ScriptArguments:
     eval_prompts:         int       = 8192
     eval_batch_size:      int       = 128
     max_new_tokens:       int       = -1
-    normalize_rewards:    bool      = False
+    normalize_rewards:    bool      = False  # online z-score fitness via running mean/std (computed during the run)
     warm_start_path:      str       = ''
 
     # Algorithm selection
@@ -131,9 +131,49 @@ class ES:
         self.parent_eval_count = [0] * self.P
         self.z_star            = np.full(self.M, -np.inf, dtype=np.float32)
 
+        # Online (Welford) running mean/std per objective for normalize_rewards.
+        # Computed DURING the run from observed reward vectors — not given upfront.
+        self._rew_count = 0
+        self._rew_mean  = np.zeros(self.M, dtype=np.float64)
+        self._rew_M2    = np.zeros(self.M, dtype=np.float64)
+
     def _update_z_star(self, r: np.ndarray):
         improved = r > self.z_star
         self.z_star[improved] = r[improved]
+
+    def _running_zscore(self, r: np.ndarray) -> np.ndarray:
+        """Welford online update of per-objective mean/std, then z-score `r`.
+
+        Stats accumulate across every reward vector seen this run (a PPO-style
+        running normalizer), so the normalization baseline shifts as more data
+        arrives. Until variance is defined (count < 2), only centering applies.
+        """
+        self._rew_count += 1
+        delta = r - self._rew_mean
+        self._rew_mean += delta / self._rew_count
+        self._rew_M2   += delta * (r - self._rew_mean)
+        if self._rew_count < 2:
+            return r - self._rew_mean
+        std = np.sqrt(self._rew_M2 / (self._rew_count - 1))
+        std = np.where(std < 1e-6, 1.0, std)
+        return (r - self._rew_mean) / std
+
+    def _reward_stats_dict(self) -> dict:
+        std = (np.sqrt(self._rew_M2 / (self._rew_count - 1))
+               if self._rew_count >= 2 else np.ones(self.M))
+        return {
+            'count': self._rew_count,
+            'mean':  self._rew_mean.tolist(),
+            'M2':    self._rew_M2.tolist(),
+            'std':   np.where(std < 1e-6, 1.0, std).tolist(),
+        }
+
+    def _restore_reward_stats(self, rs: dict) -> None:
+        if not rs:
+            return
+        self._rew_count = int(rs.get('count', 0))
+        self._rew_mean  = np.array(rs.get('mean', np.zeros(self.M)), dtype=np.float64)
+        self._rew_M2    = np.array(rs.get('M2',   np.zeros(self.M)), dtype=np.float64)
 
     @staticmethod
     def _log(rank, msg, verbose=True):
@@ -167,6 +207,7 @@ class ES:
             'fitness':           [f.tolist() for f in self.fitness],
             'parent_baseline':   [b.tolist() for b in self.parent_baseline],
             'parent_eval_count': list(self.parent_eval_count),
+            'reward_stats':      self._reward_stats_dict(),
         }
         if bounds and bounds.get('min') is not None:
             meta['bounds'] = {
@@ -229,6 +270,12 @@ class ES:
         dist_on = torch.distributed.is_initialized()
         rank    = torch.distributed.get_rank() if dist_on else 0
         is_main = rank == 0
+
+        # normalize_rewards (online z-score) and normalize_fitness (expert min-max)
+        # are alternative fitness-normalization schemes; enabling both would
+        # compound them in inconsistent spaces.
+        assert not (normalize_rewards and normalize_fitness), \
+            'normalize_rewards and normalize_fitness are alternative schemes — enable at most one.'
 
         # ── Algorithm-specific setup ──────────────────────────────────────────
         assert algorithm in ('nsgaii', 'nsgaiii', 'greedy_hvc'), \
@@ -345,6 +392,18 @@ class ES:
                     print(f'  reward_min={np.round(bounds["min"], 3)}', flush=True)
                     print(f'  reward_max={np.round(r_max, 3)}', flush=True)
 
+                # Restore online reward-normalizer stats (es_state, then reward_stats.json)
+                rs = state.get('reward_stats')
+                if not rs:
+                    rs_path = os.path.join(resume_dir or output_dir, 'reward_stats.json')
+                    if os.path.exists(rs_path):
+                        with open(rs_path) as f:
+                            rs = json.load(f)
+                self._restore_reward_stats(rs)
+                if normalize_rewards and self._rew_count > 0:
+                    print(f'  reward_stats restored (count={self._rew_count}, '
+                          f'mean={np.round(self._rew_mean, 3)})', flush=True)
+
                 print(f'Resuming: next gen={resume_gen + 1}  '
                       f'(σ={sigma:.5f}, z*={np.round(self.z_star, 3)})', flush=True)
             else:
@@ -375,11 +434,12 @@ class ES:
             moe_model.gating_net = net
             reward_vecs = []
             for batch in loader:
+                # Workers always produce RAW reward vectors; the main rank applies
+                # the online z-score (normalize_rewards) at collection time.
                 r = generate_and_score(
                     moe_model, batch['input_ids'], batch['attention_mask'],
                     sft_tokenizer, reward_models, instructions,
-                    generation_kwargs, gpu_id, num_continuations,
-                    normalize_rewards=normalize_rewards)
+                    generation_kwargs, gpu_id, num_continuations)
                 reward_vecs.append(r)
             return np.mean(reward_vecs, axis=0)
 
@@ -408,9 +468,11 @@ class ES:
 
         def _collect_fitness(gen, task_id) -> np.ndarray:
             with open(_result_path(gen, task_id)) as f:
-                r = np.array(json.load(f)['reward_vec'])
-            if bounds['range'] is not None:
-                r = (r - bounds['min']) / bounds['range']
+                r = np.array(json.load(f)['reward_vec'])      # raw reward vector
+            if normalize_rewards:
+                r = self._running_zscore(r)                   # online z-score (running mean/std)
+            elif bounds['range'] is not None:
+                r = (r - bounds['min']) / bounds['range']     # expert min-max
             self._update_z_star(r)
             return r
 
@@ -645,6 +707,14 @@ class ES:
                 with open(tmp_live, 'w') as f:
                     json.dump(live_state, f)
                 os.replace(tmp_live, live_path)
+
+                # Online reward-normalizer stats every generation (crash-safe resume)
+                if normalize_rewards:
+                    rs_path = os.path.join(output_dir, 'reward_stats.json')
+                    tmp_rs  = rs_path + '.tmp'
+                    with open(tmp_rs, 'w') as f:
+                        json.dump(self._reward_stats_dict(), f)
+                    os.replace(tmp_rs, rs_path)
 
                 alpha_str = f'entmax_α={self.template.fixed_alpha:.3f}(fixed)'
                 front_str = f'intersect={n_intersection}/{self.P} | ' if use_dual_front else ''

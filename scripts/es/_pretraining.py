@@ -81,12 +81,13 @@ def build_hidden_cache(
     batch_size: int,
     device: str,
 ) -> torch.Tensor:
-    """Return (N, num_layers, H) float32 CPU tensor.
+    """Return (N, num_layers, H) float32 CPU tensor of LAST-TOKEN post-attn states.
 
     Captures POST-ATTENTION (pre-FFN) hidden states via forward hooks on each
-    transformer layer's self_attn output.  This matches exactly what MoEForCausalLM
-    feeds to the GatingNetwork at inference time (see _moe_layers: gating is called
-    on `residual + attn_out`, i.e. post-attention before the FFN).
+    transformer layer's self_attn output, then keeps only the last real token
+    per layer. This matches exactly what MoEForCausalLM feeds to the
+    GatingNetwork at inference time (see _moe_layers: gating is called on
+    `residual + attn_out`, and GatingNetwork.forward takes hidden[:, -1, :]).
     """
     enc = tokenizer(
         prompts,
@@ -133,14 +134,16 @@ def build_hidden_cache(
         for h in handles:
             h.remove()
 
-        # Stack: (B, num_layers, L, H) → unweighted mean pool → (B, num_layers, H)
-        # Use plain mean to match GatingNetwork.forward which does hidden_states.mean(dim=1).
+        # Stack → (B, num_layers, L, H), then take the last real token per layer
+        # to match GatingNetwork.forward which does hidden_states[:, -1, :].
         num_layers = len(m.model.layers)
         layer_hidden = torch.stack(
             [post_attn_states[l] for l in range(num_layers)], dim=1
         )  # (B, num_layers, L, H)
-        avg = layer_hidden.mean(dim=2)  # (B, num_layers, H)
-        all_hidden.append(avg)
+        last_idx = (mask.sum(dim=1) - 1).clamp(min=0).cpu()                 # (B,)
+        idx      = last_idx.view(-1, 1, 1, 1).expand(-1, num_layers, 1, layer_hidden.shape[-1])
+        last     = layer_hidden.gather(2, idx).squeeze(2)  # (B, num_layers, H)
+        all_hidden.append(last)
 
         if (start // batch_size + 1) % 5 == 0 or start + batch_size >= N:
             print(f'  hidden cache: {min(start + batch_size, N)}/{N}', flush=True)

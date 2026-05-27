@@ -19,7 +19,7 @@ reward_names='beaver_reward,beaver_cost'
 # ===========================================================================
 
 # Population dir containing ind_XXX/ sub-dirs (each with fitness.json + gating_network.pt)
-es_gating_dir='./models/ES/es_beaver_per_layer/gen_0030'
+es_gating_dir='./models/ES/es_beaver/final'
 es_meta_path=''                # auto-discovered (walks up from es_gating_dir) if blank
 utility='tchebyshev'           # 'linear' | 'tchebyshev'
 eval_prompts=0                 # 0 = all test prompts
@@ -27,7 +27,7 @@ batch_size=128
 num_continuations=1
 pref_step=0.1
 # --------------------
-run_name='es_beaver_per_layer_select'
+run_name='es_beaver_select'
 
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch --main_process_port 29604 \
