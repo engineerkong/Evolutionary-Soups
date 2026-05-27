@@ -1,22 +1,27 @@
-"""es_train.py — Evolve GatingNetwork parameters using an ES (Evolution Strategy) algorithm.
+"""es_train.py — Evolve GatingNetwork parameters with a multi-objective ES.
 
   - Population of P individuals (flat GatingNetwork parameter vectors).
-  - No preference vector during training — purely Pareto-based selection.
-  - Each individual is evaluated ONCE to produce an M-dimensional reward vector.
-  - Selection: non-dominated sort + crowding distance on raw reward vectors.
-  - Parallel evaluation via file-based work queue (same as moead.py).
+  - Each generation: μ+λ crossover + Gaussian mutation; parents re-evaluated
+    on the same chunk as children so the comparison is fair.
+  - Selection (single front over merged 2P pool):
+        algorithm = 'nsgaii'      → non-dominated sort + crowding distance
+        algorithm = 'nsgaiii'     → ND sort + Das–Dennis reference points
+        algorithm = 'greedy_hvc'  → ND sort + sequential greedy HVC (default)
+    `use_greedy_hvc=True` forces greedy HVC regardless of `algorithm`.
+  - Parallel evaluation via a file-based work queue (no NCCL collectives).
   - At inference: given preference λ, select best individual by argmax dot(λ, r_i).
+
+Supported datasets: Anthropic/hh-rlhf, openai/summarize_from_feedback,
+PKU-Alignment/PKU-SafeRLHF-10K.
 """
 
 import copy
 import datetime
-import time
 import json
 import os
 import shutil
-import sys
+import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import List
 
 import numpy as np
@@ -27,19 +32,15 @@ from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
 from trl import set_seed
 
-script_dir   = Path(__file__).resolve().parent
-project_root = script_dir.parent.parent
-sys.path.insert(0, str(project_root))
-sys.path.insert(0, str(script_dir))
-
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
-    Instructions, Instructions_summary,
+from es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from es_utils import (
+    Instructions, Instructions_summary, REWARD_PATHS, RewardModels,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
-    get_clean_data, load_main_tokenizer,
+    generate_and_score, generate_reference_points, greedy_hvc_select, hv,
+    load_gating_network, load_main_tokenizer, load_simple_gating_network,
+    make_onehot_params, net_to_params, non_dominated_sort, nsga2_select,
+    nsga3_select, params_to_net, save_gating_network,
 )
-from scripts.es.es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
-from scripts.es.es_utils import save_gating_network, get_simplex_samples, load_gating_network, load_simple_gating_network, REWARD_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -83,342 +84,6 @@ class ScriptArguments:
     save_every:           int       = 5
     seed:                 int       = 8888
     verbose:              bool      = False
-
-
-# ---------------------------------------------------------------------------
-# Genome ↔ GatingNetwork
-# ---------------------------------------------------------------------------
-
-def net_to_params(net: GatingNetwork) -> np.ndarray:
-    return np.concatenate(
-        [p.detach().cpu().float().numpy().ravel() for p in net.parameters()]
-    )
-
-
-def params_to_net(params: np.ndarray, template: GatingNetwork,
-                  device: str = 'cpu') -> GatingNetwork:
-    net = copy.deepcopy(template).to(device)
-    offset = 0
-    with torch.no_grad():
-        for p in net.parameters():
-            n = p.numel()
-            p.copy_(torch.tensor(params[offset:offset + n].reshape(p.shape),
-                                 dtype=p.dtype, device=device))
-            offset += n
-    return net
-
-
-def _make_onehot_params(template: GatingNetwork, expert_idx: int) -> np.ndarray:
-    """Return params that force gating to output one-hot[expert_idx] for any input.
-
-    Zeroes the last linear weight so only the bias matters, then sets
-    bias[expert_idx]=+100 and all others=-100. Entmax → exactly one-hot.
-    """
-    net = copy.deepcopy(template)
-    with torch.no_grad():
-        last = net.net[-1]          # nn.Linear(hidden_size, num_experts)
-        last.weight.zero_()
-        last.bias.fill_(-100.0)
-        last.bias[expert_idx] = 100.0
-    return net_to_params(net)
-
-
-# ---------------------------------------------------------------------------
-# Reward evaluation
-# ---------------------------------------------------------------------------
-
-def generate_and_score(
-    moe_model, prompt_input_ids, prompt_attention,
-    sft_tokenizer, reward_models, instructions,
-    generation_kwargs, gpu_id, num_continuations=1,
-) -> np.ndarray:
-    accumulated     = None
-    prompts_decoded = sft_tokenizer.batch_decode(prompt_input_ids.cpu())
-
-    for _ in range(num_continuations):
-        outputs = moe_model.generate(
-            prompt_input_ids.to(f'cuda:{gpu_id}'),
-            attention_mask=prompt_attention.to(f'cuda:{gpu_id}'),
-            **generation_kwargs,
-        )
-        responses = sft_tokenizer.batch_decode(outputs.cpu())
-        del outputs
-
-        prompts_clean, responses_clean = get_clean_data(responses, prompts_decoded)
-        pairs = [(instructions.get_input(r), instructions.get_response(r))
-                 for r in responses_clean]
-        if hasattr(instructions, 'get_post'):
-            scores = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post,
-                normalize_rewards=script_args.normalize_rewards, round_digits=None)
-        else:
-            scores = reward_models.get_reward_model_scores(
-                pairs, normalize_rewards=script_args.normalize_rewards, round_digits=None)
-
-        n_prompts, n_rewards = len(prompts_clean), len(scores)
-        if accumulated is None:
-            accumulated = [[[] for _ in range(n_rewards)] for _ in range(n_prompts)]
-        for p in range(n_prompts):
-            for k in range(n_rewards):
-                accumulated[p][k].append(scores[k][p])
-
-    torch.cuda.empty_cache()
-    per_prompt = np.array([[np.mean(accumulated[p][k]) for k in range(n_rewards)]
-                           for p in range(n_prompts)])
-    return per_prompt.mean(axis=0)   # (M,)
-
-
-# ---------------------------------------------------------------------------
-# NSGA-II selection
-# ---------------------------------------------------------------------------
-
-def _dominates(a: np.ndarray, b: np.ndarray) -> bool:
-    return bool(np.all(a >= b) and np.any(a > b))
-
-
-def _non_dominated_sort(rewards: np.ndarray) -> List[List[int]]:
-    P = len(rewards)
-    dom_count = np.zeros(P, dtype=int)
-    dominates = [[] for _ in range(P)]
-    for i in range(P):
-        for j in range(i + 1, P):
-            if _dominates(rewards[i], rewards[j]):
-                dominates[i].append(j); dom_count[j] += 1
-            elif _dominates(rewards[j], rewards[i]):
-                dominates[j].append(i); dom_count[i] += 1
-    fronts = [[i for i in range(P) if dom_count[i] == 0]]
-    k = 0
-    while fronts[k]:
-        nxt = []
-        for i in fronts[k]:
-            for j in dominates[i]:
-                dom_count[j] -= 1
-                if dom_count[j] == 0:
-                    nxt.append(j)
-        k += 1
-        fronts.append(nxt)
-    return [f for f in fronts if f]
-
-
-def _crowding_distance(rewards: np.ndarray, front: List[int]) -> np.ndarray:
-    n = len(front)
-    if n <= 2:
-        return np.full(n, np.inf)
-    dist = np.zeros(n)
-    r    = rewards[front]
-    for m in range(r.shape[1]):
-        order = np.argsort(r[:, m])
-        dist[order[0]] = dist[order[-1]] = np.inf
-        span = r[order[-1], m] - r[order[0], m]
-        if span == 0:
-            continue
-        for idx in range(1, n - 1):
-            dist[order[idx]] += (r[order[idx + 1], m] - r[order[idx - 1], m]) / span
-    return dist
-
-
-def _nsga2_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-    fronts   = _non_dominated_sort(rewards)
-    selected = []
-    for front in fronts:
-        if len(selected) + len(front) <= pop_size:
-            selected.extend(front)
-        else:
-            remaining = pop_size - len(selected)
-            dist      = _crowding_distance(rewards, front)
-            ranked    = [x for _, x in sorted(zip(-dist, front))]
-            selected.extend(ranked[:remaining])
-            break
-    return selected
-
-
-# ---------------------------------------------------------------------------
-# NSGA-III helpers
-# ---------------------------------------------------------------------------
-
-def _generate_reference_points(n_objectives: int, n_divisions: int) -> np.ndarray:
-    """Das-Dennis structured reference points on the unit hyperplane (sum=1, ≥0).
-
-    Returns array of shape (C(n_objectives+n_divisions-1, n_divisions), n_objectives).
-    Typical n_divisions: 12 for M=2 (13 pts), 12 for M=3 (91 pts), 7 for M=4 (120 pts).
-    """
-    def _gen(n_obj: int, n_div: int, cur: list, result: list) -> None:
-        if n_obj == 1:
-            result.append(cur + [n_div])
-        else:
-            for i in range(n_div + 1):
-                _gen(n_obj - 1, n_div - i, cur + [i], result)
-    pts: list = []
-    _gen(n_objectives, n_divisions, [], pts)
-    return np.array(pts, dtype=np.float32) / n_divisions
-
-
-def _nsga3_select(rewards: np.ndarray, pop_size: int,
-                  reference_points: np.ndarray) -> List[int]:
-    """NSGA-III selection: non-dominated sorting + niche-preservation on the last front.
-
-    Core idea (Deb & Jain, 2014):
-      1. Fill selection with complete fronts until the last (critical) front.
-      2. Normalize the combined fitness onto a unit hyperplane using the ideal
-         point and per-objective intercepts.
-      3. Associate every individual to its nearest reference *line* (through the
-         origin) by minimum perpendicular distance.
-      4. Pick n_needed individuals from the last front by iteratively selecting
-         the reference point with the smallest niche count, then choosing the
-         individual closest to that line (first use) or randomly (subsequent uses).
-    """
-    fronts   = _non_dominated_sort(rewards)
-    selected: List[int] = []
-    last_front: List[int] = []
-
-    for front in fronts:
-        if len(selected) + len(front) <= pop_size:
-            selected.extend(front)
-        else:
-            last_front = list(front)
-            break
-
-    n_needed = pop_size - len(selected)
-    if n_needed == 0 or not last_front:
-        return selected[:pop_size]
-
-    # ── Normalize fitness onto unit hyperplane ────────────────────────────────
-    all_idx    = selected + last_front
-    fit_all    = rewards[all_idx]                          # (N_all, M)
-    ideal      = fit_all.min(axis=0)                       # (M,)
-    translated = fit_all - ideal
-
-    # Nadir: per-objective max among already-accepted (non-last-front) individuals;
-    # fall back to max of all if no individuals were accepted yet.
-    if selected:
-        nadir = (rewards[selected] - ideal).max(axis=0)
-    else:
-        nadir = translated.max(axis=0)
-    nadir      = np.where(nadir < 1e-10, 1.0, nadir)
-    normalized = translated / nadir                        # (N_all, M)
-
-    # ── Associate each individual to its nearest reference line ───────────────
-    # Perpendicular distance from point p to line through origin with direction r:
-    #   d_perp² = ||p||² - (p·r̂)²
-    # We compute this for all (individual, ref_point) pairs vectorised.
-    R       = reference_points                             # (R, M)
-    r_norms = np.linalg.norm(R, axis=1, keepdims=True)    # (R, 1)
-    r_norms = np.where(r_norms < 1e-10, 1.0, r_norms)
-    R_hat   = R / r_norms                                  # (R, M) unit reference directions
-
-    dot      = normalized @ R_hat.T                        # (N_all, R)  scalar projections
-    proj     = dot[:, :, None] * R_hat[None, :, :]        # (N_all, R, M) projected vectors
-    diff     = normalized[:, None, :] - proj               # (N_all, R, M) perpendicular components
-    perp_dist = np.sqrt(np.maximum((diff ** 2).sum(axis=2), 0.0))  # (N_all, R)
-
-    assoc_ref  = perp_dist.argmin(axis=1)                  # (N_all,) closest ref index
-    assoc_dist = perp_dist.min(axis=1)                     # (N_all,) perp distance
-
-    # ── Niche counts from already-accepted individuals (before last front) ─────
-    n_sel       = len(selected)
-    niche_count = np.zeros(len(R), dtype=int)
-    for j in range(n_sel):
-        niche_count[assoc_ref[j]] += 1
-
-    # Associations for individuals in last_front (offset n_sel in all_idx)
-    lf_assoc = assoc_ref[n_sel:]                           # (|last_front|,)
-    lf_dist  = assoc_dist[n_sel:]
-
-    # ── Niche-based selection from last_front ─────────────────────────────────
-    remaining        = list(range(len(last_front)))
-    chosen_from_last: List[int] = []
-
-    for _ in range(n_needed):
-        # Map each active reference point to candidate local indices
-        ref_to_cands: dict = {}
-        for loc in remaining:
-            ref_to_cands.setdefault(lf_assoc[loc], []).append(loc)
-
-        if not ref_to_cands:
-            break
-
-        # Reference point with minimum niche count (ties broken randomly)
-        min_nc    = min(niche_count[r] for r in ref_to_cands)
-        min_refs  = [r for r in ref_to_cands if niche_count[r] == min_nc]
-        chosen_r  = min_refs[np.random.randint(len(min_refs))]
-
-        cands = ref_to_cands[chosen_r]
-        if niche_count[chosen_r] == 0:
-            # First occupant of this niche: pick the closest individual to the line
-            loc = cands[int(np.argmin(lf_dist[cands]))]
-        else:
-            # Niche already occupied: pick randomly among candidates
-            loc = cands[np.random.randint(len(cands))]
-
-        chosen_from_last.append(last_front[loc])
-        niche_count[chosen_r] += 1
-        remaining.remove(loc)
-
-    return selected + chosen_from_last
-
-
-# ---------------------------------------------------------------------------
-# greedy_hvc helpers
-# ---------------------------------------------------------------------------
-
-from pymoo.indicators.hv import HV as _PymooHV
-
-
-def _hv(points: np.ndarray, ref: np.ndarray) -> float:
-    """Hypervolume (maximisation) via pymoo.
-
-    pymoo uses minimisation convention: negate both points and ref.
-    """
-    ind = _PymooHV(ref_point=-ref)
-    return float(ind(-points))
-
-
-def _hypervolume_contribution(candidates: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Exclusive hypervolume contribution for each candidate point.
-
-    HVC[i] = HV(candidates) - HV(candidates \\ {i}).
-    """
-    n        = len(candidates)
-    total_hv = _hv(candidates, ref)
-    hvc      = np.zeros(n)
-    for i in range(n):
-        hvc[i] = total_hv - _hv(np.delete(candidates, i, axis=0), ref)
-    return hvc
-
-
-def _greedy_hvc_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-    """greedy_hvc selection: non-dominated sorting + sequential greedy HVC on last front.
-
-    Complete fronts are accepted whole; the critical overflow front is filled by
-    sequential greedy marginal-hypervolume maximisation, seeded with the
-    already-selected individuals.
-    """
-    fronts   = _non_dominated_sort(rewards)
-    selected: List[int] = []
-
-    for front in fronts:
-        if len(selected) + len(front) <= pop_size:
-            selected.extend(front)
-        else:
-            n_needed  = pop_size - len(selected)
-            all_pts   = rewards[np.array(selected + front)] if selected else rewards[np.array(front)]
-            ref       = all_pts.min(axis=0) - 0.1
-            chosen    = [rewards[k] for k in selected]
-            hv_base   = _hv(np.array(chosen), ref) if chosen else 0.0
-            remaining = list(range(len(front)))
-            for _ in range(n_needed):
-                gains    = [_hv(np.array(chosen + [rewards[front[loc]]]), ref) - hv_base
-                            for loc in remaining]
-                best_pos = int(np.argmax(gains))
-                best_loc = remaining[best_pos]
-                hv_base += gains[best_pos]
-                chosen.append(rewards[front[best_loc]])
-                selected.append(front[best_loc])
-                remaining.remove(best_loc)
-            break
-
-    return selected
-
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +209,7 @@ class ES:
         algorithm:               str   = 'nsgaii',
         n_reference_divisions:   int   = 12,
         normalize_fitness:       bool  = False,
+        normalize_rewards:       bool  = False,
         resume:                  bool  = False,
         resume_dir:              str   = None,
     ) -> List[np.ndarray]:
@@ -556,21 +222,21 @@ class ES:
         assert algorithm in ('nsgaii', 'nsgaiii', 'greedy_hvc'), \
             f"algorithm must be 'nsgaii', 'nsgaiii', or 'greedy_hvc', got {algorithm!r}"
         if algorithm == 'nsgaiii':
-            ref_pts = _generate_reference_points(self.M, n_reference_divisions)
-            _select = lambda fit, n: _nsga3_select(fit, n, ref_pts)
+            ref_pts = generate_reference_points(self.M, n_reference_divisions)
+            _select = lambda fit, n: nsga3_select(fit, n, ref_pts)
             if is_main:
                 print(f'NSGA-III: {len(ref_pts)} reference points '
                       f'(M={self.M}, divisions={n_reference_divisions})')
         elif algorithm == 'greedy_hvc':
-            _select = _greedy_hvc_select
+            _select = greedy_hvc_select
             if is_main:
                 print(f'greedy_hvc: Hypervolume Computing utility selection (M={self.M})')
         else:
-            _select = _nsga2_select
+            _select = nsga2_select
 
         # use_greedy_hvc forces _select to sequential greedy HVC regardless of algorithm
         if use_greedy_hvc:
-            _select = _greedy_hvc_select
+            _select = greedy_hvc_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -708,7 +374,8 @@ class ES:
                 r = generate_and_score(
                     moe_model, batch['input_ids'], batch['attention_mask'],
                     sft_tokenizer, reward_models, instructions,
-                    generation_kwargs, gpu_id, num_continuations)
+                    generation_kwargs, gpu_id, num_continuations,
+                    normalize_rewards=normalize_rewards)
                 reward_vecs.append(r)
             return np.mean(reward_vecs, axis=0)
 
@@ -772,7 +439,7 @@ class ES:
                     _write_task(_BG, exp_idx, {
                         'task_id':      exp_idx,
                         'chunk_idx':    0,
-                        'child_params': _make_onehot_params(self.template, exp_idx).tolist(),
+                        'child_params': make_onehot_params(self.template, exp_idx).tolist(),
                     })
 
             _worker_loop(_BG, 0, self.template.num_experts, _done_path(_BG))
@@ -887,10 +554,10 @@ class ES:
                     all_pts = np.array([merged_fitness[k] for k in seed + pool])
                     ref     = all_pts.min(axis=0) - 0.1
                     chosen  = [merged_fitness[k] for k in seed]
-                    hv_base = _hv(np.array(chosen), ref) if chosen else 0.0
+                    hv_base = hv(np.array(chosen), ref) if chosen else 0.0
                     result, remaining = [], list(range(len(pool)))
                     for _ in range(min(n, len(remaining))):
-                        gains    = [_hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
+                        gains    = [hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
                                     for loc in remaining]
                         best_pos = int(np.argmax(gains))
                         best_loc = remaining[best_pos]
@@ -1145,6 +812,7 @@ final_population = es.run(
     algorithm=script_args.algorithm,
     n_reference_divisions=script_args.n_reference_divisions,
     normalize_fitness=script_args.normalize_fitness,
+    normalize_rewards=script_args.normalize_rewards,
     resume=_resume,
     resume_dir=_resume_dir,
 )
@@ -1161,7 +829,7 @@ if is_main:
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
             json.dump({'fitness': es.fitness[i].tolist()}, f, indent=2)
 
-    fronts = _non_dominated_sort(np.array(es.fitness))
+    fronts = non_dominated_sort(np.array(es.fitness))
     with open(os.path.join(output_dir, 'es_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,

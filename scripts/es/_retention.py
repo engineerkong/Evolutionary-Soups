@@ -1,24 +1,31 @@
-"""evolutionary_soups2.py — Fine-tune a single GatingNetwork on last hidden states.
+"""_retention.py — Two-stage GatingNetwork training: SFT pretrain → ES evolution.
 
-The GatingNetwork merges expert models' last hidden states (after all transformer
-layers, before LM head) using a single lightweight MLP:
-  - Input:  mean-pooled last hidden state  (B, lm_hidden_size)  [from first expert]
-  - Output: merging coefficients           (B, num_experts)      via softmax
+Stage 1 (SFT pretrain): a single SimpleGatingNetwork is trained jointly with
+the frozen experts via HuggingFace Trainer on completion-only LM loss, with an
+entropy regulariser on the per-prompt gating distribution to prevent collapse.
+The gating merges expert outputs at the last hidden state (mean-pooled),
+i.e. once per prompt — not per layer.
 
-Only the GatingNetwork is trained; all expert LLMs remain frozen.
-Dataset and tokenizer setup mirrors scripts/fine-tuning/sft.py.
+Stage 2 (ES evolution): the pretrained gating network from Stage 1 (or a
+`warm_start_path` override) seeds a population for multi-objective ES with
+the dual-front mechanism (raw Pareto front ∪ baseline×(1+bonus) Pareto front)
+and `parent_baseline` cumulative-mean tracking. Selection alternates between
+NSGA-II and greedy-HVC. All ES infrastructure (file-based work queue,
+per-individual checkpoints, normalize_fitness bounds) mirrors es_train.py.
+
+Supported datasets: Anthropic/hh-rlhf, openai/summarize_from_feedback,
+PKU-Alignment/PKU-SafeRLHF-10K.
 """
 
-import copy
 import datetime
-import time
 import json
+import os
 import shutil
 import sys
-from pathlib import Path
-import os
+import time
 from dataclasses import dataclass, field
-from typing import Optional, List
+from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import torch
@@ -46,14 +53,16 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
-from scripts.utils.utils import (
-    Instructions, Instructions_summary,
-    build_dataset_sft, build_dataset_summary_sft, build_dataset_beaver_sft,
-    build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
-    get_clean_data, load_main_tokenizer,
+from es_architecture import _sample_token
+from es_utils import (
+    Instructions, Instructions_summary, PYMOO_AVAILABLE, REWARD_PATHS, RewardModels,
+    build_dataset_beaver_ppo, build_dataset_beaver_sft,
+    build_dataset_ppo, build_dataset_sft,
+    build_dataset_summary_ppo, build_dataset_summary_sft,
+    generate_and_score, get_clean_data, greedy_hvc_select, hv,
+    load_main_tokenizer, make_onehot_params, net_to_params,
+    non_dominated_sort, nsga2_select, params_to_net,
 )
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.es.es_utils import REWARD_PATHS
 
 tqdm.pandas()
 
@@ -129,25 +138,6 @@ class SimpleGatingNetwork(nn.Module):
         """
         logits = self.net(pooled.to(self.net[0].weight.dtype))
         return F.softmax(logits.float(), dim=-1).to(logits.dtype)
-
-
-# =========================================================================
-# Token sampling helper (used by generate)
-# =========================================================================
-
-def _sample_token(logits: torch.Tensor, temperature: float,
-                  top_p: float, top_k: int) -> torch.Tensor:
-    logits = logits / max(temperature, 1e-6)
-    if top_k > 0:
-        top_vals, _ = torch.topk(logits, top_k, dim=-1)
-        logits[logits < top_vals[:, -1:]] = float('-inf')
-    if top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-        cumprobs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-        remove   = cumprobs - F.softmax(sorted_logits, dim=-1) > top_p
-        sorted_logits[remove] = float('-inf')
-        logits = torch.zeros_like(logits).scatter_(-1, sorted_idx, sorted_logits)
-    return torch.multinomial(F.softmax(logits, dim=-1), num_samples=1)
 
 
 # =========================================================================
@@ -310,38 +300,8 @@ class MoELastHiddenForCausalLM(nn.Module):
 
 
 # =========================================================================
-# Stage 2 — genome helpers
+# Stage 2 — local gating-network save (this script's SimpleGatingNetwork variant)
 # =========================================================================
-
-def net_to_params(net: SimpleGatingNetwork) -> np.ndarray:
-    return np.concatenate(
-        [p.detach().cpu().float().numpy().ravel() for p in net.parameters()]
-    )
-
-
-def params_to_net(params: np.ndarray, template: SimpleGatingNetwork,
-                  device: str = 'cpu') -> SimpleGatingNetwork:
-    net    = copy.deepcopy(template).to(device)
-    offset = 0
-    with torch.no_grad():
-        for p in net.parameters():
-            n = p.numel()
-            p.copy_(torch.tensor(params[offset:offset + n].reshape(p.shape),
-                                 dtype=p.dtype, device=device))
-            offset += n
-    return net
-
-
-def _make_onehot_params(template: SimpleGatingNetwork, expert_idx: int) -> np.ndarray:
-    """Params that force gating to output one-hot[expert_idx] for any input."""
-    net = copy.deepcopy(template)
-    with torch.no_grad():
-        last = net.net[-1]
-        last.weight.zero_()
-        last.bias.fill_(-100.0)
-        last.bias[expert_idx] = 100.0
-    return net_to_params(net)
-
 
 def _save_simple_gating_network(net: SimpleGatingNetwork, save_path: str) -> None:
     os.makedirs(save_path, exist_ok=True)
@@ -354,153 +314,6 @@ def _save_simple_gating_network(net: SimpleGatingNetwork, save_path: str) -> Non
     }
     with open(os.path.join(save_path, 'gating_config.json'), 'w') as f:
         json.dump(config, f, indent=2)
-
-
-# =========================================================================
-# Stage 2 — reward evaluation
-# =========================================================================
-
-def generate_and_score(
-    moe_model, prompt_input_ids, prompt_attention,
-    sft_tokenizer, reward_models, instructions,
-    generation_kwargs, gpu_id, num_continuations=1,
-    normalize_rewards=False,
-) -> np.ndarray:
-    accumulated     = None
-    prompts_decoded = sft_tokenizer.batch_decode(prompt_input_ids.cpu())
-
-    for _ in range(num_continuations):
-        outputs = moe_model.generate(
-            prompt_input_ids.to(f'cuda:{gpu_id}'),
-            attention_mask=prompt_attention.to(f'cuda:{gpu_id}'),
-            **generation_kwargs,
-        )
-        responses = sft_tokenizer.batch_decode(outputs.cpu())
-        del outputs
-
-        prompts_clean, responses_clean = get_clean_data(responses, prompts_decoded)
-        pairs = [(instructions.get_input(r), instructions.get_response(r))
-                 for r in responses_clean]
-        if hasattr(instructions, 'get_post'):
-            scores = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post,
-                normalize_rewards=normalize_rewards, round_digits=None)
-        else:
-            scores = reward_models.get_reward_model_scores(
-                pairs, normalize_rewards=normalize_rewards, round_digits=None)
-
-        n_prompts, n_rewards = len(prompts_clean), len(scores)
-        if accumulated is None:
-            accumulated = [[[] for _ in range(n_rewards)] for _ in range(n_prompts)]
-        for p in range(n_prompts):
-            for k in range(n_rewards):
-                accumulated[p][k].append(scores[k][p])
-
-    torch.cuda.empty_cache()
-    per_prompt = np.array([[np.mean(accumulated[p][k]) for k in range(n_rewards)]
-                           for p in range(n_prompts)])
-    return per_prompt.mean(axis=0)   # (M,)
-
-
-# =========================================================================
-# Stage 2 — ES selection (NSGA-II / greedy_hvc)
-# =========================================================================
-
-def _dominates(a: np.ndarray, b: np.ndarray) -> bool:
-    return bool(np.all(a >= b) and np.any(a > b))
-
-
-def _non_dominated_sort(rewards: np.ndarray) -> List[List[int]]:
-    P          = len(rewards)
-    dom_count  = np.zeros(P, dtype=int)
-    dominates  = [[] for _ in range(P)]
-    for i in range(P):
-        for j in range(i + 1, P):
-            if _dominates(rewards[i], rewards[j]):
-                dominates[i].append(j); dom_count[j] += 1
-            elif _dominates(rewards[j], rewards[i]):
-                dominates[j].append(i); dom_count[i] += 1
-    fronts = [[i for i in range(P) if dom_count[i] == 0]]
-    k = 0
-    while fronts[k]:
-        nxt = []
-        for i in fronts[k]:
-            for j in dominates[i]:
-                dom_count[j] -= 1
-                if dom_count[j] == 0:
-                    nxt.append(j)
-        k += 1
-        fronts.append(nxt)
-    return [f for f in fronts if f]
-
-
-def _crowding_distance(rewards: np.ndarray, front: List[int]) -> np.ndarray:
-    n = len(front)
-    if n <= 2:
-        return np.full(n, np.inf)
-    dist = np.zeros(n)
-    r    = rewards[front]
-    for m in range(r.shape[1]):
-        order = np.argsort(r[:, m])
-        dist[order[0]] = dist[order[-1]] = np.inf
-        span = r[order[-1], m] - r[order[0], m]
-        if span == 0:
-            continue
-        for idx in range(1, n - 1):
-            dist[order[idx]] += (r[order[idx + 1], m] - r[order[idx - 1], m]) / span
-    return dist
-
-
-def _nsga2_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-    fronts   = _non_dominated_sort(rewards)
-    selected = []
-    for front in fronts:
-        if len(selected) + len(front) <= pop_size:
-            selected.extend(front)
-        else:
-            remaining = pop_size - len(selected)
-            dist      = _crowding_distance(rewards, front)
-            ranked    = [x for _, x in sorted(zip(-dist, front))]
-            selected.extend(ranked[:remaining])
-            break
-    return selected
-
-
-try:
-    from pymoo.indicators.hv import HV as _PymooHV
-
-    def _hv(points: np.ndarray, ref: np.ndarray) -> float:
-        ind = _PymooHV(ref_point=-ref)
-        return float(ind(-points))
-
-    def _hypervolume_contribution(candidates: np.ndarray, ref: np.ndarray) -> np.ndarray:
-        n        = len(candidates)
-        total_hv = _hv(candidates, ref)
-        hvc      = np.zeros(n)
-        for i in range(n):
-            hvc[i] = total_hv - _hv(np.delete(candidates, i, axis=0), ref)
-        return hvc
-
-    def _greedy_hvc_select(rewards: np.ndarray, pop_size: int) -> List[int]:
-        fronts   = _non_dominated_sort(rewards)
-        selected: List[int] = []
-        for front in fronts:
-            if len(selected) + len(front) <= pop_size:
-                selected.extend(front)
-            else:
-                n_needed   = pop_size - len(selected)
-                candidates = np.array([rewards[i] for i in front])
-                all_pts    = np.vstack([rewards[selected], candidates]) if selected else candidates
-                ref        = all_pts.min(axis=0) - 0.1
-                hvc        = _hypervolume_contribution(candidates, ref)
-                ranked     = [x for _, x in sorted(zip(-hvc, front))]
-                selected.extend(ranked[:n_needed])
-                break
-        return selected
-
-    _PYMOO_AVAILABLE = True
-except ImportError:
-    _PYMOO_AVAILABLE = False
 
 
 # =========================================================================
@@ -588,10 +401,10 @@ class ES:
 
         assert algorithm in ('nsgaii', 'greedy_hvc'), \
             f"algorithm must be 'nsgaii' or 'greedy_hvc', got {algorithm!r}"
-        if algorithm == 'greedy_hvc' and not _PYMOO_AVAILABLE:
+        if algorithm == 'greedy_hvc' and not PYMOO_AVAILABLE:
             print('pymoo not available — falling back to nsgaii', flush=True)
             algorithm = 'nsgaii'
-        _select = _greedy_hvc_select if algorithm == 'greedy_hvc' else _nsga2_select
+        _select = greedy_hvc_select if algorithm == 'greedy_hvc' else nsga2_select
 
         def log(msg): self._log(rank, msg, verbose)
 
@@ -695,7 +508,7 @@ class ES:
                     _write_task(_BG, exp_idx, {
                         'task_id':      exp_idx,
                         'chunk_idx':    0,
-                        'child_params': _make_onehot_params(self.template, exp_idx).tolist(),
+                        'child_params': make_onehot_params(self.template, exp_idx).tolist(),
                     })
             n_exp = self.template.net[-1].out_features
             _worker_loop(_BG, 0, n_exp, _done_path(_BG))
@@ -795,14 +608,14 @@ class ES:
                     selected       = _select(merged_fitness, self.P)
                     n_intersection = len(selected)
                 else:
-                    front1_set = set(_non_dominated_sort(merged_fitness)[0])
+                    front1_set = set(non_dominated_sort(merged_fitness)[0])
                     parent_front2 = [
                         self.parent_baseline[i] * (1.0 + min(self.parent_eval_count[i] * parent_stability_bonus,
                                                               parent_stability_cap))
                         for i in range(self.P)
                     ]
                     merged_front2  = np.vstack([np.array(parent_front2), np.array(child_fitness)])
-                    front2_fronts  = _non_dominated_sort(merged_front2)
+                    front2_fronts  = non_dominated_sort(merged_front2)
                     front2_set     = set(front2_fronts[0])
 
                     def _greedy_hvc_fill(seed_set, pool, n):
@@ -810,10 +623,10 @@ class ES:
                         all_pts = np.array([merged_fitness[k] for k in seed_set + pool])
                         ref     = all_pts.min(axis=0) - 0.1
                         chosen  = [merged_fitness[k] for k in seed_set]
-                        hv_base = _hv(np.array(chosen), ref) if chosen else 0.0
+                        hv_base = hv(np.array(chosen), ref) if chosen else 0.0
                         result, remaining = [], list(range(len(pool)))
                         for _ in range(min(n, len(remaining))):
-                            gains    = [_hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
+                            gains    = [hv(np.array(chosen + [merged_fitness[pool[loc]]]), ref) - hv_base
                                         for loc in remaining]
                             best_pos = int(np.argmax(gains))
                             best_loc = remaining[best_pos]
@@ -1196,7 +1009,7 @@ if is_main:
         with open(os.path.join(subdir, 'fitness.json'), 'w') as f:
             json.dump({'fitness': es.fitness[i].tolist()}, f, indent=2)
 
-    fronts = _non_dominated_sort(np.array(es.fitness))
+    fronts = non_dominated_sort(np.array(es.fitness))
     with open(os.path.join(es_output_dir, 'es_meta.json'), 'w') as f:
         json.dump({
             'reward_names':    reward_names,

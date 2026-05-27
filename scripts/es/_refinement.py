@@ -1,24 +1,23 @@
-"""evolutionary_soups_refinement.py — PPO refinement of ES individuals.
+"""_refinement.py — PPO refinement of ES individuals.
 
 For each individual i in the ES final population, compute its **optimal linear
-utility preference** μ_i* — the preference vector for which individual i achieves
-the highest linear utility μ · r among all P population members:
+utility preference** μ_i* — the preference vector under which individual i
+achieves the highest linear utility μ · r among all P population members:
         μ_i*  s.t.  argmax_j μ · fitness_j  =  i
 Then refine the gating network of individual i with PPO using the scalarized
-reward r_scalar = μ_i* · r. Experts remain frozen; only gating parameters are
-updated.
+reward r_scalar = μ_i* · r. Experts remain frozen; only the gating parameters
+are updated.
 
 Beaver task only (PKU-Alignment/PKU-SafeRLHF-10K, M=2 objectives).
 
-Style mirrors evolutionary_soups.py:
+Style mirrors es_train.py:
   - dataclass ScriptArguments + HfArgumentParser.
   - File-based work queue across ranks (no NCCL collectives).
   - Per-individual checkpoint directories.
 
-Work model:
-  Each individual is one "task". Ranks claim tasks from the queue; each rank
-  performs the entire PPO loop for its claimed individual on its own GPU. After
-  all tasks complete, the refined gating networks are saved to <output>/refined/.
+Work model: each individual is one "task". Ranks claim tasks from the queue
+and run the full PPO loop for that individual on their own GPU. After all
+tasks complete, the refined gating networks are saved under <output>/refined/.
 """
 
 import copy
@@ -48,13 +47,12 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
-    Instructions,
-    build_dataset_beaver_ppo, get_clean_data, load_main_tokenizer,
+from es_architecture import GatingNetwork, MoEForCausalLM
+from es_utils import (
+    Instructions, REWARD_PATHS, RewardModels,
+    build_dataset_beaver_ppo, get_clean_data, load_gating_network,
+    load_main_tokenizer, net_to_params, params_to_net, save_gating_network,
 )
-from scripts.es.es_architecture import GatingNetwork, MoEForCausalLM
-from scripts.es.es_utils import save_gating_network, load_gating_network, REWARD_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -182,27 +180,8 @@ def compute_optimal_preferences(fitnesses: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
-# Gating ↔ params
+# Population loader
 # ---------------------------------------------------------------------------
-
-def net_to_params(net: GatingNetwork) -> np.ndarray:
-    return np.concatenate(
-        [p.detach().cpu().float().numpy().ravel() for p in net.parameters()]
-    )
-
-
-def params_to_net(params: np.ndarray, template: GatingNetwork,
-                  device: str = 'cpu') -> GatingNetwork:
-    net = copy.deepcopy(template).to(device)
-    offset = 0
-    with torch.no_grad():
-        for p in net.parameters():
-            n = p.numel()
-            p.copy_(torch.tensor(params[offset:offset + n].reshape(p.shape),
-                                 dtype=p.dtype, device=device))
-            offset += n
-    return net
-
 
 def _load_population(pop_dir: str, template: GatingNetwork,
                      device: str = 'cpu') -> List[Tuple[np.ndarray, np.ndarray]]:

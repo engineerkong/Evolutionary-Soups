@@ -41,14 +41,13 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
-from scripts.utils.multi_reward_models import RewardModels
-from scripts.utils.utils import (
-    Instructions, Instructions_summary,
+from es_architecture import MoEForCausalLM
+from es_utils import (
+    Instructions, Instructions_summary, REWARD_PATHS, RewardModels,
     build_dataset_beaver_eval, build_dataset_eval, build_dataset_summary_eval,
-    get_clean_data, load_main_tokenizer,
+    generate_and_score, get_simplex_samples, load_gating_network,
+    load_main_tokenizer,
 )
-from scripts.es.es_architecture import MoEForCausalLM
-from scripts.es.es_utils import REWARD_PATHS, load_gating_network, get_simplex_samples
 
 
 # ---------------------------------------------------------------------------
@@ -126,39 +125,6 @@ def _select_individual(fitnesses: np.ndarray, lam: np.ndarray,
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
-
-def generate_and_score(model, input_ids, attention_mask, tokenizer,
-                       reward_models, instructions, generation_kwargs,
-                       gpu_id, num_continuations):
-    device      = f'cuda:{gpu_id}'
-    accumulated = None
-    for _ in range(num_continuations):
-        with torch.no_grad():
-            outputs = model.generate(input_ids.to(device),
-                                     attention_mask=attention_mask.to(device),
-                                     **generation_kwargs)
-        responses       = tokenizer.batch_decode(outputs.cpu())
-        prompts_decoded = tokenizer.batch_decode(input_ids.cpu())
-        del outputs
-        prompts_clean, responses_clean = get_clean_data(responses, prompts_decoded)
-        pairs = [(instructions.get_input(r), instructions.get_response(r))
-                 for r in responses_clean]
-        if hasattr(instructions, 'get_post'):
-            scores = reward_models.get_reward_model_scores(
-                pairs, instructions.get_post, normalize_rewards=False)
-        else:
-            scores = reward_models.get_reward_model_scores(pairs, normalize_rewards=False)
-        n_p, n_r = len(prompts_clean), len(scores)
-        if accumulated is None:
-            accumulated = [[[] for _ in range(n_r)] for _ in range(n_p)]
-        for p in range(n_p):
-            for k in range(n_r):
-                accumulated[p][k].append(scores[k][p])
-        torch.cuda.empty_cache()
-    per_prompt = np.array([[np.mean(accumulated[p][k]) for k in range(n_r)]
-                           for p in range(n_p)])
-    return per_prompt.mean(axis=0).tolist()
-
 
 def eval_individual(ind_dir, experts, loader, tokenizer, reward_models,
                     instructions, generation_kwargs, gpu_id, num_continuations,

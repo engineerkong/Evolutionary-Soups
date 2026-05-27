@@ -1,31 +1,29 @@
-"""analyze_hidden_state_variance.py
+"""_analyze_variance.py — Measure hidden-state and gating-coefficient anisotropy.
 
-Captures real LLM hidden states for prompts in the gating dataset, then passes
-them through both GatingNetwork and SimpleGatingNetwork checkpoints to measure
-how much the output coefficients vary across prompts.
+Captures real LLM hidden states for prompts in a gating dataset CSV, then
+passes them through both GatingNetwork and SimpleGatingNetwork checkpoints
+to measure how much the output coefficients vary across prompts.
 
 Questions answered:
   1. Are per-layer mean-pooled hidden states (GatingNetwork input) anisotropic?
   2. Are last-token hidden states (SimpleGatingNetwork input) anisotropic?
   3. Does each gating checkpoint produce consistent or prompt-varying coefficients?
 
-Usage:
-    accelerate launch --num_processes=1 scripts/momoe/analyze_hidden_state_variance.py \
+TO RUN:
+    accelerate launch --num_processes=1 scripts/es/_analyze_variance.py \
         --base_model_name meta-llama/Llama-2-7b-hf \
         --expert_model_paths ./models/ppo/ppo_beaver_reward_2204/best_model \
                              ./models/ppo/ppo_beaver_cost_2204/best_model \
         --gating_dataset_csv ./results/optimal/optimal_beaver_1205/gating_dataset.csv \
         --gating_paths_per_layer ./models/ES/dummy_beaver/final \
         --gating_paths_simple    ./models/gating_pretrain_1205/gating_pretrain_beaver \
-        --max_prompts 200 \
-        --batch_size 16 \
-        --max_prompt_len 256
+        --max_prompts 200 --batch_size 16 --max_prompt_len 256
 """
 
+import datetime
+import json
 import os
 import sys
-import json
-import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
@@ -44,9 +42,8 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
-from scripts.utils.utils import load_main_tokenizer
-from scripts.es.es_architecture import GatingNetwork, SimpleGatingNetwork, _apply_entmax
-from scripts.es.es_utils import load_gating_network, load_simple_gating_network
+from es_architecture import GatingNetwork, SimpleGatingNetwork, _apply_entmax
+from es_utils import load_gating_network, load_main_tokenizer, load_simple_gating_network
 
 
 # ---------------------------------------------------------------------------

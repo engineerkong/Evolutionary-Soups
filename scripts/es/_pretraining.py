@@ -1,24 +1,24 @@
-"""pretraining_opt.py — Supervised pretraining of GatingNetwork from optimal-weight dataset.
+"""_pretraining.py — Supervised pretraining of GatingNetwork from an optimal-weight CSV.
 
-Trains one GatingNetwork per simplex preference point.
-For each preference λ, its gating network is trained with MSE loss:
-    loss = MSE(gating(hidden(prompt)), optimal_w(prompt, λ))
+For each preference λ on the simplex, train one gating network with MSE loss:
+    loss = MSE( gating(hidden(prompt)), optimal_w(prompt, λ) )
+where `optimal_w(prompt, λ)` is read from a per-prompt CSV produced upstream
+and `hidden(prompt)` is taken from the loaded experts.
 
-Efficiency: expert forward passes are run ONCE per prompt (shared across all 11 networks).
-Cached hidden states are kept in CPU memory between preference training runs.
+Efficiency: expert forward passes run ONCE per prompt and the resulting
+hidden-state cache is shared across all per-λ trainings.
 
-Expert loading matches evolutionary_soups.py exactly.
-Each saved gating network is loadable as warm_start_path in evolutionary_soups.py.
+Each saved gating network is loadable as `warm_start_path` in es_train.py.
 """
 
-import os
-import sys
-import json
 import copy
 import datetime
+import json
+import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,9 +35,8 @@ project_root = script_dir.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(script_dir))
 
-from scripts.utils.utils import load_main_tokenizer
-from scripts.es.es_architecture import GatingNetwork, SimpleGatingNetwork
-from scripts.es.es_utils import save_gating_network
+from es_architecture import GatingNetwork, SimpleGatingNetwork
+from es_utils import load_main_tokenizer, save_gating_network
 
 
 # ---------------------------------------------------------------------------

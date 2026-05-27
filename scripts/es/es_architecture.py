@@ -6,18 +6,10 @@ reward vector best matches the desired preference:
     best_i = argmax_i  dot(λ, fitness_i)
 """
 
-import sys
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DynamicCache
-
-script_dir = Path(__file__).resolve().parent
-project_root = script_dir.parent.parent
-sys.path.insert(0, str(project_root))
-from scripts.utils.utils import get_clean_data
 
 
 # ---------------------------------------------------------------------------
