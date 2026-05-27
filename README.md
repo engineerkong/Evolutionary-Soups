@@ -126,7 +126,7 @@ Computes the prompt-adaptive oracle upper bound on the simplex and produces the 
 | Baseline | Directory | Idea |
 |----------|-----------|------|
 | RS | [fine-tuning/eval_ppo_rs.py](scripts/baselines/fine-tuning/eval_ppo_rs.py) | Linear LoRA merging of the PPO experts at the preference vector using Rewarded Soups |
-| HoE | [hoe/](scripts/baselines/hoe) | Hierarchical Mixture-of-Experts (HoE) with a preference-conditioned router trained by PPO under a blended preference reward (reproduce the code form HoE paper) |
+| HoE | [hoe/](scripts/baselines/hoe) | Hierarchical Mixture-of-Experts (HoE) with a preference-conditioned router trained by PPO under a blended preference reward (classes import from https://github.com/lizhuolz/HoE) |
 | MOD | [mod/](scripts/baselines/mod) | Multi-Objective Decoding (MOD), a decoding-time algorithm that outputs the next token from a linear combination of predictions of all base models |
 | MORLHF | [morlhf/](scripts/baselines/morlhf) | Preference-weighted PPO — one model per simplex point. [README](scripts/baselines/morlhf/README.md) |
 | RiC | [ric/](scripts/baselines/ric) | Reward-Conditioned SFT alternating offline SFT and online self-improvement. [README](scripts/baselines/ric/README.md) |
