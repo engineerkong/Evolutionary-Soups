@@ -10,7 +10,7 @@ Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, en
 └── baselines/      # SFT/PPO, RS, HoE, MOD, MORLHF, RiC
 ```
 
-All commands below are run from the repository root (`ES/`). Trained experts are expected under `./models/`, evaluation artifacts go to `./results/`, and logs to `./logs/`.
+All commands below are run from the repository root (`Evolutionary-Soups/`). Trained experts are expected under `./models/`, evaluation artifacts go to `./results/`, and logs to `./logs/`.
 
 ## Tasks and rewards
 
