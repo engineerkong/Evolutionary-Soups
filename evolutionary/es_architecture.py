@@ -6,10 +6,119 @@ reward vector best matches the desired preference:
     best_i = argmax_i  dot(λ, fitness_i)
 """
 
+import copy
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import DynamicCache
+from transformers import AutoModelForCausalLM, DynamicCache
+
+
+# ---------------------------------------------------------------------------
+# Expert loading — one shared trunk, per-expert MLPs
+# ---------------------------------------------------------------------------
+#
+# The SFT/PPO checkpoints are LoRA adapters with
+# ``target_modules = [gate_proj, up_proj, down_proj]``, so after
+# ``merge_and_unload()`` two experts differ ONLY in their per-layer MLP weights;
+# attention, embeddings, lm_head and every LayerNorm are bit-identical copies of
+# the base model (verified: 2.41 B of 6.74 B params, 35.8%, are shared).
+#
+# Both MoE classes here already respect that: everything outside the FFN reads
+# ``self.experts[0]`` and only ``experts[i].model.layers[l].mlp`` is per-expert.
+# Loading E full models therefore wastes (E-1) × 4.82 GB of bf16 weights
+# (9.6 GB at E=3) plus (E-1) full disk reads.
+#
+# ``load_shared_experts`` returns expert 0 as a real model (the trunk) and every
+# other expert as a *view*: the same Python objects for every submodule except
+# ``layers[l].mlp``.  Numerics are unchanged — the merge still runs on the same
+# device in the same dtype, so logits are bit-for-bit identical to the old path.
+
+def _shell(module: nn.Module) -> nn.Module:
+    """Shallow copy of ``module`` with its OWN child dicts.
+
+    ``copy.copy`` shares ``_modules``/``_parameters`` with the original, so
+    swapping a child would mutate the source too.  Re-bind those dicts (their
+    *values* stay shared, which is the whole point).
+    """
+    new = copy.copy(module)
+    new._parameters = OrderedDict(module._parameters)
+    new._buffers    = OrderedDict(module._buffers)
+    new._modules    = OrderedDict(module._modules)
+    return new
+
+
+def _expert_view(trunk, mlps):
+    """A CausalLM-shaped view of ``trunk`` whose per-layer MLPs are ``mlps``."""
+    layers = nn.ModuleList()
+    for layer, mlp in zip(trunk.model.layers, mlps):
+        lv = _shell(layer)
+        lv.mlp = mlp                     # nn.Module.__setattr__ → lv._modules
+        layers.append(lv)
+    inner = _shell(trunk.model)
+    inner.layers = layers
+    view = _shell(trunk)
+    view.model = inner
+    return view
+
+
+def load_shared_experts(base_model_name, adapter_paths, device,
+                        tokenizer=None, dtype=torch.bfloat16,
+                        merge_device=None, verbose=True):
+    """Load LoRA experts that share every weight except the per-layer MLPs.
+
+    Returns a list of ``len(adapter_paths)`` CausalLM-shaped modules, all in
+    ``eval()`` with ``requires_grad=False``.  ``experts[0]`` is a real model;
+    the rest are views onto it.
+
+    ``merge_device`` defaults to ``device``.  Keep it there: peft upcasts the
+    LoRA product to fp32 when merging on CPU but not on CUDA, so a CPU merge is
+    *not* bit-identical to the old GPU path.  Transient peak is
+    ``trunk + one full model + already-kept MLPs``, which is still below the old
+    steady state of ``E × full model`` for every E ≥ 2.
+    """
+    merge_device = merge_device or device
+
+    def _merged(path):
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model_name, torch_dtype=dtype, device_map=merge_device)
+        if tokenizer is not None:
+            # Callers disagreed on resize-before vs resize-after-merge.  It is moot:
+            # the adapters carry no embed/lm_head keys, so merge never touches them,
+            # and for these checkpoints len(tokenizer) == config.vocab_size makes the
+            # resize a no-op.  RNG consumption is identical to the old path either way
+            # (both do one from_pretrained + one PeftModel.from_pretrained per expert).
+            base.resize_token_embeddings(len(tokenizer))
+        from peft import PeftModel                      # local: keep import cheap
+        return PeftModel.from_pretrained(base, path).merge_and_unload()
+
+    if verbose:
+        print(f'Loading {len(adapter_paths)} expert models (shared trunk) …', flush=True)
+        print(f'  Expert 1: {adapter_paths[0]}', flush=True)
+    trunk = _merged(adapter_paths[0]).to(device)
+    experts = [trunk]
+
+    for i, path in enumerate(adapter_paths[1:], start=2):
+        if verbose:
+            print(f'  Expert {i}: {path}  (MLPs only)', flush=True)
+        m = _merged(path)
+        mlps = [m.model.layers[l].mlp.to(device) for l in range(len(m.model.layers))]
+        experts.append(_expert_view(trunk, mlps))
+        del m                            # frees attn / embed / lm_head / norms
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    for e in experts:
+        e.eval()
+        for p in e.parameters():
+            p.requires_grad = False
+    if verbose:
+        shared = sum(p.numel() for p in trunk.parameters()) - sum(
+            p.numel() for l in trunk.model.layers for p in l.mlp.parameters())
+        print(f'  All {len(experts)} experts on {device}; '
+              f'{shared / 1e9:.2f} B params shared across them.', flush=True)
+    return experts
 
 
 # ---------------------------------------------------------------------------

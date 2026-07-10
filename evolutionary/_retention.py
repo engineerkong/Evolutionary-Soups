@@ -33,12 +33,11 @@ from typing import List
 import numpy as np
 import torch
 from accelerate import Accelerator
-from peft import PeftModel
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, DataCollatorWithPadding, HfArgumentParser
+from transformers import DataCollatorWithPadding, HfArgumentParser
 from trl import set_seed
 
-from es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM
+from es_architecture import GatingNetwork, MoEForCausalLM, SimpleGatingNetwork, SimpleMoEForCausalLM, load_shared_experts
 from es_utils import (
     Instructions, Instructions_summary, REWARD_PATHS, RewardModels,
     build_dataset_ppo, build_dataset_summary_ppo, build_dataset_beaver_ppo,
@@ -805,18 +804,9 @@ generation_kwargs = {
     'top_k': 0, 'top_p': 0.9, 'temperature': 0.7, 'do_sample': script_args.do_sample,
 }
 
-print(f'Loading {len(script_args.expert_model_paths)} expert models …')
-expert_models = []
-for i, path in enumerate(script_args.expert_model_paths):
-    print(f'  Expert {i+1}: {path}')
-    base = AutoModelForCausalLM.from_pretrained(
-        script_args.base_model_name, torch_dtype=torch.bfloat16, device_map=device)
-    base.resize_token_embeddings(len(sft_tokenizer))
-    m = PeftModel.from_pretrained(base, path).merge_and_unload()
-    m.eval()
-    for p in m.parameters(): p.requires_grad = False
-    expert_models.append(m)
-print(f'  All {len(expert_models)} experts loaded on {device}.')
+expert_models = load_shared_experts(
+    script_args.base_model_name, script_args.expert_model_paths, device,
+    tokenizer=sft_tokenizer)
 
 lm_hidden_size = expert_models[0].config.hidden_size
 _num_layers    = len(expert_models[0].model.layers)
