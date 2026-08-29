@@ -2,6 +2,8 @@
 
 Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, enabling a lightweight inference-time lookup that satisfies any user preference for controllable multi-objective LLM alignment without retraining.
 
+- **[2026-08]** 🎉 Our paper has been accepted to the **EMNLP 2026 Main Conference**!
+
 ## Repository layout
 
 ```
@@ -68,7 +70,7 @@ Trains the SFT initialization and one PPO LoRA expert per reward dimension. All 
 
 ## 2. Evolutionary Soups ([evolutionary](evolutionary))
 
-Main contribution. A population of GatingNetwork parameter vectors is evolved with a multi-objective ES; at inference a preference λ selects the best individual by `argmax_i λ · fitness_i`.
+**Main contribution**. A population of GatingNetwork parameter vectors is evolved with a multi-objective ES; at inference a preference λ selects the best individual by `argmax_i λ · fitness_i`.
 
 ### Architecture
 
