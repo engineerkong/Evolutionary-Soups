@@ -4,6 +4,8 @@ Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, en
 
 - **[2026-08]** 🎉 Our paper has been accepted to the **EMNLP 2026 Main Conference**!
 
+---
+
 ## Usage
 
 ### Installation
@@ -43,8 +45,6 @@ Beaver requires the PKU safe-rlhf package:
 pip install git+https://github.com/PKU-Alignment/safe-rlhf.git
 ```
 
----
-
 ## 1. Per-objective experts ([baselines/fine-tuning](baselines/fine-tuning))
 
 Trains the SFT initialization and one PPO LoRA expert per reward dimension. All downstream methods (ES, RS, HoE, MOD) consume these checkpoints.
@@ -56,7 +56,6 @@ Trains the SFT initialization and one PPO LoRA expert per reward dimension. All 
 | [eval_sft.py](baselines/fine-tuning/eval_sft.py) | Evaluate the SFT model on the task |
 | [eval_ppo_single.py](baselines/fine-tuning/eval_ppo_single.py) | Evaluate a single PPO expert |
 | [eval_ppo_rs.py](baselines/fine-tuning/eval_ppo_rs.py) | Rewarded soups: linearly merge per-objective LoRAs at the preference vector |
----
 
 ## 2. Evolutionary Soups ([evolutionary](evolutionary))
 
@@ -98,7 +97,6 @@ Parallel evaluation uses a file-based work queue (no NCCL collectives), so any n
 
 [es_utils.py] (evolutionary/es_utils.py) holds the shared evaluation, fitness normalization, and checkpoint I/O.
 
----
 ## 3. Oracle pipeline ([oracle](oracle))
 
 Computes the prompt-adaptive oracle upper bound on the simplex and produces the supervised gating dataset consumed by ES pretraining.
@@ -109,8 +107,6 @@ Computes the prompt-adaptive oracle upper bound on the simplex and produces the 
 | 1b | [collect_rewards_simple_gating.py](oracle/collect_rewards_simple_gating.py) | Same sweep but merges **final hidden states** at inference time (matches `SimpleMoEForCausalLM`) |
 | 2 | [build_dataset.py](oracle/build_dataset.py) | For each (prompt, preference λ) pick argmax of λ·r over the recorded w; emit `gating_dataset.csv` |
 | 3 | [eval_oracle.py](oracle/eval_oracle.py) | Report oracle vs. naive-soup (w = λ) utility gap |
-
----
 
 ## 4. Baselines ([baselines](baselines))
 
@@ -123,5 +119,3 @@ Computes the prompt-adaptive oracle upper bound on the simplex and produces the 
 | RiC | [ric/](baselines/ric) | Reward-Conditioned SFT alternating offline SFT and online self-improvement. [README](baselines/ric/README.md) |
 
 Shared baseline helpers (multi-reward scoring, dataset builders, beaver `Instructions`) live in [baselines/utils](baselines/utils).
-
----
