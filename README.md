@@ -4,30 +4,6 @@ Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, en
 
 - **[2026-08]** 🎉 Our paper has been accepted to the **EMNLP 2026 Main Conference**!
 
-## Repository layout
-
-```
-├── evolutionary/   # Main method: ES over GatingNetwork parameters (+ pretrain/refine/retention)
-├── oracle/         # Per-prompt oracle upper bound + supervised gating dataset
-└── baselines/      # SFT/PPO, RS, HoE, MOD, MORLHF, RiC
-```
-
-All commands below are run from the repository root (`Evolutionary-Soups/`). Trained experts are expected under `./models/`, evaluation artifacts go to `./results/`, and logs to `./logs/`.
-
-## Tasks and rewards
-
-| Task | Dataset | Reward dimensions |
-|------|---------|-------------------|
-| assistant | `Anthropic/hh-rlhf` | `harmless, helpful, humor` |
-| summary | `openai/summarize_from_feedback` | `summary, faithful, deberta` |
-| beaver | `PKU-Alignment/PKU-SafeRLHF-10K` | `beaver_reward, beaver_cost` |
-
-Beaver requires the PKU safe-rlhf package:
-
-```bash
-pip install git+https://github.com/PKU-Alignment/safe-rlhf.git
-```
-
 ## Usage
 
 ### Installation
@@ -51,6 +27,20 @@ bash ./baselines/fine-tuning/bash/ppo_xxx.bash
 
 # 2. Evolutionary Soups: evolve, select per preference, evaluate
 bash ./evolutionary/bash/es_xxx.bash                 
+```
+
+## Tasks and rewards
+
+| Task | Dataset | Reward dimensions |
+|------|---------|-------------------|
+| assistant | `Anthropic/hh-rlhf` | `harmless, helpful, humor` |
+| summary | `openai/summarize_from_feedback` | `summary, faithful, deberta` |
+| beaver | `PKU-Alignment/PKU-SafeRLHF-10K` | `beaver_reward, beaver_cost` |
+
+Beaver requires the PKU safe-rlhf package:
+
+```bash
+pip install git+https://github.com/PKU-Alignment/safe-rlhf.git
 ```
 
 ---
@@ -133,4 +123,5 @@ Computes the prompt-adaptive oracle upper bound on the simplex and produces the 
 | RiC | [ric/](baselines/ric) | Reward-Conditioned SFT alternating offline SFT and online self-improvement. [README](baselines/ric/README.md) |
 
 Shared baseline helpers (multi-reward scoring, dataset builders, beaver `Instructions`) live in [baselines/utils](baselines/utils).
+
 ---
