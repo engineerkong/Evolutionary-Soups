@@ -119,3 +119,16 @@ Computes the prompt-adaptive oracle upper bound on the simplex and produces the 
 | RiC | [ric/](baselines/ric) | Reward-Conditioned SFT alternating offline SFT and online self-improvement. [README](baselines/ric/README.md) |
 
 Shared baseline helpers (multi-reward scoring, dataset builders, beaver `Instructions`) live in [baselines/utils](baselines/utils).
+
+## Citation
+
+If you find our work useful, please cite:
+
+```bibtex
+@article{kong2026evolutionary,
+  title={Evolutionary Soups: Evolving Mixture-of-Experts for Multi-Objective LLM Alignment},
+  author={Kong, Lingxiao and Staab, Steffen and Yang, Cong and Beyan, Oya and Boukhers, Zeyd},
+  journal={arXiv preprint arXiv:2608.29978},
+  year={2026}
+}
+```
