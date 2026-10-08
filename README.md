@@ -1,7 +1,16 @@
 # Evolutionary Soups: Evolving Mixture-of-Experts for Multi-Objective LLM Alignment
 
+<p align="center">
+  <a href="https://arxiv.org/abs/2608.29978"><img src="https://img.shields.io/badge/arXiv-2608.29978-b31b1b.svg?logo=arxiv" alt="Preprint"></a>
+  <a href="assets/poster.pdf"><img src="https://img.shields.io/badge/Poster-PDF-blue.svg" alt="Poster"></a>
+  <a href="assets/slides.pdf"><img src="https://img.shields.io/badge/Slides-PDF-orange.svg" alt="Presentation"></a>
+  <a href="https://www.youtube.com/watch?v=XXXXXXX"><img src="https://img.shields.io/badge/Video-YouTube-red.svg?logo=youtube" alt="Video"></a>
+</p>
+
 Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, enabling a lightweight inference-time lookup that satisfies any user preference for controllable multi-objective LLM alignment without retraining.
 
+## 📰 News
+- **[2026-10]** 📄 Poster, slides and video are now available!
 - **[2026-08]** 🎉 Our paper has been accepted to the **EMNLP 2026 Main Conference**!
 
 ---
