@@ -7,7 +7,7 @@
   <a href="https://www.youtube.com/watch?v=XXXXXXX"><img src="https://img.shields.io/badge/Video-YouTube-red.svg?logo=youtube" alt="Video"></a>
 </p>
 
-Evolutionary Soups evolves MoE gating networks via an evolutionary algorithm, enabling a lightweight inference-time lookup that satisfies any user preference for controllable multi-objective LLM alignment without retraining.
+Users require different helpfulness–harmlessness trade-offs from LLMs. Evolutionary Soups evolves MoE gating networks once via an evolutionary algorithm, so any user preference can be served through a lightweight inference-time lookup without retraining.
 
 ## 📰 News
 - **[2026-10]** 📄 Poster, slides and video are now available!
