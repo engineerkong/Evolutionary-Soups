@@ -4,10 +4,14 @@
   <a href="https://arxiv.org/abs/2608.29978"><img src="https://img.shields.io/badge/arXiv-2608.29978-b31b1b.svg?logo=arxiv" alt="Preprint"></a>
   <a href="assets/poster.pdf"><img src="https://img.shields.io/badge/Poster-PDF-blue.svg" alt="Poster"></a>
   <a href="assets/slides.pdf"><img src="https://img.shields.io/badge/Slides-PDF-orange.svg" alt="Presentation"></a>
-  <a href="https://www.youtube.com/watch?v=XXXXXXX"><img src="https://img.shields.io/badge/Video-YouTube-red.svg?logo=youtube" alt="Video"></a>
+  <a href="https://youtu.be/1iZVYMExyP8"><img src="https://img.shields.io/badge/Video-YouTube-red.svg?logo=youtube" alt="Video"></a>
 </p>
 
 Users require different helpfulness–harmlessness trade-offs from LLMs. Evolutionary Soups evolves MoE gating networks once via an evolutionary algorithm, so any user preference can be served through a lightweight inference-time lookup without retraining.
+
+<p align="center">
+  <img src="assets/framework.png" alt="Overview of Evolutionary Soups" width="100%">
+</p>
 
 ## 📰 News
 - **[2026-10]** 📄 Poster, slides and video are now available!
